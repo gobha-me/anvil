@@ -1,0 +1,66 @@
+# Build trees: anchored to the root, directories only. The old `*build*`
+# matched any file with "build" in its name anywhere (e.g.
+# docs/building-test.md), silently never committing it.
+/build*/
+/Testing*/
+# Vestigial since #27 (version.hpp is generated into the build tree now), but
+# kept: checkouts that predate it still have a stale generated file on disk.
+include/version.hpp
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Core dumps. Deliberately crashing a test binary is a normal part of
+# verifying a [uaf] case (revert the fix, confirm it segfaults), and the
+# dump lands in the repo root — a 10MB blob one `git add -A` away from
+# history. Anchored: an unanchored `core` also matches every *directory*
+# named core (src/lib/core/, include/termforge/core/), which blocks
+# `git add` of tracked files inside them.
+/core
+/core.*
+
+# editor
+*.swp
+*.swo
+
+# screenshots / local artifacts
+remmina_*.png
+*.png.local
+
+# ANVIL runtime state — never commit host keys or a live board database
+/state/
+*.db
+*.db-wal
+*.db-shm
+ssh_host_*_key
+ssh_host_*_key.pub
