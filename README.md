@@ -23,7 +23,7 @@ A BBS in the original sense: asynchronous, text-first, and inhabited. Message
 boards with threads and quote-reply, a one-liner wall, who's-online, a user
 list, a file area, ephemeral user-to-user chat, and pluggable door games.
 
-Two things make it worth building:
+Three things make it worth building:
 
 - **It is the best possible demo of termforge.** A stranger experiences a live
   termforge application in five seconds — no clone, no build, no dependency
@@ -32,6 +32,10 @@ Two things make it worth building:
 - **It is a venue, not an app.** Boards and doors land incrementally into a
   place that already has people in it. The board ships first and stays useful
   even if nothing else ever lands.
+- **It is meant to be extended by other people.** The plugin interface is the
+  point, not an internal convenience that happens to be documented. A handful
+  of first-party plugins exist to prove the interface works and to seed the
+  menu — not to be the catalogue.
 
 ## How it works
 
@@ -67,6 +71,10 @@ boundary.
    operator set their own posture.
 8. **Store nothing you do not need.** What is never written cannot leak, cannot
    be subpoenaed, and cannot be moderated badly.
+9. **The plugin interface is a public contract.** Someone else's code depends
+   on it, built with a toolchain this project does not control, on a schedule
+   it does not set. Breaking it is a release event with a migration note, not
+   a refactor.
 
 ## Capability tiering
 
@@ -83,6 +91,42 @@ The board shell targets tier 1. Capability detection is by active probing with
 hard timeouts, and is **always manually overridable** — probes get it wrong
 often enough that the override is a functional requirement, not politeness.
 
+## Mods
+
+The core is a shell — SSH transport, sessions, storage, users, moderation, and
+the UI chrome. Boards and doors and anything else that is *functionality*
+arrive as plugins loaded at runtime, and **anyone can write one**. First-party
+plugins load through the same manifest, pass the same ABI check, and get the
+same context object as everybody else's; the moment one needs a private hook,
+the public interface has a hole in it.
+
+Two consequences worth knowing before you build against it:
+
+**The boundary is narrow on purpose.** It is a C++ abstract base class — vtable
+layout is fixed by the Itanium ABI, so that part is portable — but only
+Anvil-defined types cross it: PODs, fixed-width enums, `Str`, `Span`, opaque
+handles. No `std::string`, no containers, no smart pointers, because their
+layouts differ between libstdc++ and libc++ and the failure is silent memory
+corruption rather than a link error. A header-only SDK wrapper compiled in your
+translation unit converts back to ordinary modern C++, so you write normal code
+and your mod keeps working across an Anvil toolchain bump.
+
+**A plugin runs in-process with full privilege, and there is no sandbox.** It
+can read the host keys and every live session's memory, and it does not have to
+go through the interface to do it. Installing one is equivalent to running a
+patched server binary from that author — there is no lesser degree of trust
+available, and the design says so plainly rather than shipping an isolation
+story that implies otherwise.
+
+That is the model rather than a stage on the way to something else, and it is
+what every native plugin ecosystem does — Postgres extensions, nginx modules,
+Vim, OBS, VST. It works because the trust question has an answer: **trust here
+is transitive and already spent.** Running Anvil at all means trusting whoever
+built it with your host keys and your user database. A plugin author is the
+same decision about a different person. Operators pin a content hash against a
+named author, every load is audit-logged, and signed releases are the next
+thing on that path.
+
 ## Roadmap
 
 | Milestone | Gate |
@@ -90,18 +134,28 @@ often enough that the override is a functional requirement, not politeness.
 | **M0 — Echo** | Can a stranger ssh in from an untested client and see a working termforge widget that survives a window resize? |
 | **M1 — The board** | Is it pleasant to read and post from a plain 80×24 terminal? |
 | **M2 — Capability tiering** | Does a modern terminal feel meaningfully better without any regression for an old one? |
-| **M3 — Doors** | Door interface, capability gating, replay-verified leaderboards, first door landed. |
-| **M4 — Open** | Fuzzing in CI, 50 concurrent sessions under load, operator docs, announcement. |
+| **M3 — The plugin platform** | Does a plugin built outside the tree, against published headers, with a different compiler than the server's, load and run? |
+| **M4 — Client and leaderboards** | Vendorable client library, replay submission, server-side re-simulation, first external title submitting. |
+| **M5 — Open** | Fuzzing in CI, 50 concurrent sessions under load, operator docs, SDK published with a versioning commitment, announcement. |
 
-Post-MVP, in rough order: uploads with age limits and a scanning hook, ANSI art
-galleries, the Postgres backend and multi-instance deployment, out-of-process
-door isolation and third-party doors.
+A standalone, heavily tested **plugin loader library** is a prerequisite of M3
+and is independent of everything else — it can be finished while the termforge
+work is still being scoped.
+
+Post-MVP, in rough order: signed plugin releases via `ssh-keygen -Y`, plugin
+reload with reference-counted drain, uploads with age limits and a scanning
+hook, ANSI art galleries, the Postgres backend and multi-instance deployment.
 
 ## Explicit non-goals
 
 - **No password authentication.** Public keys only, no exceptions.
 - **No server-side storage of private chat.** Ever — this is a design
   commitment, not a deferral.
+- **No STL across the plugin boundary.** Anvil-defined layouts only. Not
+  negotiable; the SDK wrapper makes it invisible to authors anyway.
+- **No plugin sandbox, and no plugin vetting by this project.** No registry, no
+  review, no signature of approval. Operators make trust decisions about
+  authors; the software makes those decisions explicit, visible, and revocable.
 - **No public web interface.** The HTTP listener is health and metrics only,
   bound privately.
 - **No federation mechanism.** The data model deliberately does not foreclose
@@ -110,7 +164,7 @@ door isolation and third-party doors.
 - **No telemetry, no analytics, no PII.** Handle, public key, and invite edge
   is the entire user record.
 
-The full list, with reasoning, is in §13 of the design doc.
+The full list, with reasoning, is in §14 of the design doc.
 
 ## Running a public board
 
@@ -121,8 +175,18 @@ graph for accountability, versioned TOS gating, a report action on every
 user-generated surface, a moderation queue with an append-only audit log,
 configurable retention, and a hook interface for external scanning.
 
-It does not decide policy, ship a TOS, bundle a scanner, or assume a
-jurisdiction. Get actual legal input before running a public instance.
+It does not decide policy, ship a TOS, bundle a scanner, vet plugins, or assume
+a jurisdiction. Get actual legal input before running a public instance.
+
+One thing is worth saying louder than the rest: **every plugin you enable is
+code you are trusting completely.** Pin its hash, know whose it is, and treat
+the decision the way you would treat granting commit access.
+
+Container egress ships closed and can be opened — metrics scraping, a web UI,
+and sidecar upload scanning all work without it, while push-based metrics need
+it. Closed egress raises the cost of exfiltration rather than preventing it,
+so it is a default worth keeping and not a reason to avoid a deployment shape
+you need.
 
 ## Built on
 
