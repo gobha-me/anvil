@@ -322,6 +322,8 @@ This is the section draft v1 got right for the wrong reasons and draft v2 rewrit
 
 Sizes are fixed-width (`uint32_t`, `int64_t`), structs are `static_assert`ed for size and alignment in both the host build and the SDK, and every struct carries a `uint32_t struct_size` first member so a field added later is detectable rather than misread.
 
+**One deliberate exception:** `AnvilAbiTag` (§7.3.1) puts `magic` ahead of `struct_size`. Both sit at fixed offsets that no interface version may ever move, which is what lets the loader validate a tag of *any* version — including a corrupt or foreign one — before it reads a single field it does not already know the layout of. Every other boundary struct follows the general rule.
+
 **Mod authors do not write against that table.** The SDK ships a header-only C++ wrapper, compiled inside the author's own translation unit, that converts `std::string` to `anvil::Str` and back, adapts ranges to spans, and lets a door be written in ordinary modern C++. The discipline is real but it lives one layer down, and the ergonomics an author experiences are those of their own standard library, whichever one that is.
 
 **Exceptions never cross.** Every boundary method is `noexcept`. The SDK wrapper generates the try/catch that converts an escaping exception into a status code, so the guarantee is structural rather than a rule authors must remember. An exception unwinding through host frames from foreign code is not recoverable in any useful sense.
@@ -414,7 +416,7 @@ struct PluginManifest {          // POD, returned by value into host storage
 struct DoorManifest {
   uint32_t       struct_size;
   CapabilityTier min_tier;       // enum : uint32_t — refuse below this
-  uint8_t        persists_state; // needs door_state storage
+  uint8_t        persists_state; // needs plugin_state storage (§9.2)
   uint8_t        has_leaderboard;
   uint8_t        audio_enhanced; // uses audio if available; never required
 };
@@ -545,7 +547,7 @@ Three kinds of author, one interface, no privilege distinction between them.
 | **Second-party** | A separate repository, same author | No | Dogfood the SDK from outside the tree |
 | **Third-party** | Anywhere | No | The point of the exercise |
 
-**First-party plugins are a demonstration set, not a catalogue.** Enough to make a new board non-empty and to keep the interface honest in CI — one door that needs tier 1 and one that needs tier 3, one board service, one verifier. Every additional first-party plugin is a plugin a community member did not write and a piece of surface this project maintains forever. When in doubt, do not ship it first-party.
+**First-party plugins are a demonstration set, not a catalogue.** Enough to make a new board non-empty and to keep the interface honest in CI — one door that needs tier 1, one that needs tier 3, one verifier, and a board service only if §15b.6 resolves that `BoardService` gets host-side wiring in M3. Every additional first-party plugin is a plugin a community member did not write and a piece of surface this project maintains forever. When in doubt, do not ship it first-party.
 
 **The second-party repository is the SDK's real test.** It builds against published headers only, with no access to Anvil internals, on its own CI, ideally with a different compiler than the server's. If a plugin cannot be built there, it cannot be built by a stranger either — the difference is that a stranger will not file a bug, they will just leave. This makes it a gate rather than a nicety: **a green build in the second-party repository, against a released SDK, is part of the M3 exit criteria.**
 
@@ -752,7 +754,7 @@ Then, in Anvil: the SDK — stable-type boundary, header-only ergonomic wrapper,
 
 **Gates, all three:**
 1. Does a plugin failing — throwing, exceeding limits, failing its ABI check — leave the board fully healthy?
-2. **Does a plugin built outside the tree, against published headers, with a different compiler than the server's, load and run?** This is the milestone. Everything else in M3 is scaffolding for it.
+2. **Does a plugin built outside the tree, against published headers, with a compiler this project did not choose, load and run?** This is the milestone. Everything else in M3 is scaffolding for it. (Whether the second-party repository's *CI* pins a different compiler permanently is §15b.10; the gate is the property, not the job.)
 3. Is the SDK documentation sufficient for someone who has never seen the codebase to write a door?
 
 ### M4 — Client and leaderboards
