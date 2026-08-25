@@ -19,7 +19,21 @@ else()
 endif()
 
 add_executable(anvil_loader_consumer main.cpp)
+set_target_properties(anvil_loader_consumer PROPERTIES ENABLE_EXPORTS ON)
 target_link_libraries(anvil_loader_consumer
   PRIVATE anvil::loader
   PRIVATE anvil::sdk
 )
+
+add_library(anvil_consumer_plugin SHARED plugin.cpp)
+target_link_libraries(anvil_consumer_plugin PRIVATE anvil::sdk)
+set_target_properties(anvil_consumer_plugin PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES
+  PREFIX ""
+)
+
+target_compile_definitions(anvil_loader_consumer PRIVATE
+  ANVIL_CONSUMER_PLUGIN="$<TARGET_FILE:anvil_consumer_plugin>"
+)
+add_dependencies(anvil_loader_consumer anvil_consumer_plugin)

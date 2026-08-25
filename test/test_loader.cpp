@@ -128,7 +128,7 @@ TEST_CASE("an ABI mismatch rejects before any exported entrypoint") {
   CHECK(loaded.error().code == ErrorCode::abi_rejected);
   CHECK(loaded.error().symbol == "anvil_abi_tag");
   CHECK(loaded.error().detail.find(
-            "interface_version: accepted 1.0-1.1, found 2.1") !=
+            "interface_version: accepted 1.0-1.2, found 2.2") !=
         std::string::npos);
   CHECK(events.contents() == "initializer\n");
 }
@@ -254,7 +254,7 @@ TEST_CASE("the Anvil verifier gates compatibility fields only") {
                                                    found, sizeof(found));
   REQUIRE_FALSE(wrong_minor);
   CHECK(wrong_minor.error().find(
-            "interface_version: accepted 1.0-1.1, found 1.2") !=
+            "interface_version: accepted 1.0-1.2, found 1.3") !=
         std::string::npos);
 }
 

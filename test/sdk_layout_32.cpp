@@ -11,6 +11,7 @@ static_assert(sizeof(anvil::Version) == 6);
 static_assert(sizeof(anvil::InterfaceVersion) == 4);
 static_assert(sizeof(anvil::PluginKind) == 4);
 static_assert(sizeof(anvil::CapabilityTier) == 4);
+static_assert(sizeof(anvil::PluginStatus) == 4);
 static_assert(sizeof(anvil::AnvilAbiTag) == 48);
 static_assert(__builtin_offsetof(anvil::AnvilAbiTag, language_standard) == 40);
 static_assert(sizeof(anvil::PluginId) == 12);

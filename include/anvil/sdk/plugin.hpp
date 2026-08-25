@@ -6,6 +6,15 @@
 
 namespace anvil {
 
+enum class PluginStatus : uint32_t {
+  ok = 0,
+  invalid_argument = 1,
+  exception = 2,
+};
+
+static_assert(sizeof(PluginStatus) == sizeof(uint32_t));
+static_assert(alignof(PluginStatus) == alignof(uint32_t));
+
 // Borrowed stable plugin identifier. The host copies value into its own
 // storage before retaining a manifest.
 struct PluginId {
@@ -70,6 +79,36 @@ struct DoorContext {
   IStateStore *state;
   ResourceLimits limits;
 };
+
+#if defined(__GNUC__) || defined(__clang__)
+#define ANVIL_DETAIL_INTERFACE_VISIBILITY __attribute__((visibility("default")))
+#else
+#define ANVIL_DETAIL_INTERFACE_VISIBILITY
+#endif
+
+// The host defines the key destructors. Plugin objects are created and
+// destroyed only through the exported factory and destroy entrypoints.
+class ANVIL_DETAIL_INTERFACE_VISIBILITY IPlugin {
+public:
+  [[nodiscard]] virtual auto manifest(PluginManifest *output) const noexcept
+      -> PluginStatus = 0;
+
+protected:
+  virtual ~IPlugin() noexcept;
+};
+
+class ANVIL_DETAIL_INTERFACE_VISIBILITY IDoor : public IPlugin {
+public:
+  [[nodiscard]] virtual auto door_manifest(DoorManifest *output) const noexcept
+      -> PluginStatus = 0;
+  [[nodiscard]] virtual auto run(const DoorContext *context) noexcept
+      -> PluginStatus = 0;
+
+protected:
+  virtual ~IDoor() noexcept override;
+};
+
+#undef ANVIL_DETAIL_INTERFACE_VISIBILITY
 
 static_assert(__is_trivially_copyable(PluginId));
 static_assert(__is_standard_layout(PluginId));

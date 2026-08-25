@@ -71,6 +71,8 @@ static_assert(
     std::is_same_v<std::underlying_type_t<anvil::PluginKind>, std::uint32_t>);
 static_assert(std::is_same_v<std::underlying_type_t<anvil::CapabilityTier>,
                              std::uint32_t>);
+static_assert(
+    std::is_same_v<std::underlying_type_t<anvil::PluginStatus>, std::uint32_t>);
 
 TEST_CASE("SDK value types cross a shared-library boundary unchanged") {
   constexpr char text[]{"boundary"};
@@ -180,6 +182,10 @@ TEST_CASE("enum wire values are stable") {
   CHECK(static_cast<std::uint32_t>(anvil::CapabilityTier::ansi) == 1);
   CHECK(static_cast<std::uint32_t>(anvil::CapabilityTier::modern) == 2);
   CHECK(static_cast<std::uint32_t>(anvil::CapabilityTier::graphics) == 3);
+
+  CHECK(static_cast<std::uint32_t>(anvil::PluginStatus::ok) == 0);
+  CHECK(static_cast<std::uint32_t>(anvil::PluginStatus::invalid_argument) == 1);
+  CHECK(static_cast<std::uint32_t>(anvil::PluginStatus::exception) == 2);
 
   CHECK(static_cast<std::uint32_t>(anvil::AbiCompiler::unknown) == 0);
   CHECK(static_cast<std::uint32_t>(anvil::AbiCompiler::gcc) == 1);
