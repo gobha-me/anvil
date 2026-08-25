@@ -232,4 +232,13 @@ if(ANVIL_SERVER)
       $<TARGET_FILE:anvil>
   )
   set_tests_properties(ssh_server_end_to_end PROPERTIES TIMEOUT 45)
+
+  add_test(
+    NAME ssh_session_lifecycle
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_ssh_lifecycle.py
+      $<TARGET_FILE:anvil>
+  )
+  set_tests_properties(ssh_session_lifecycle PROPERTIES TIMEOUT 45)
 endif()
