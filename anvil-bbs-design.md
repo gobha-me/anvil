@@ -355,6 +355,12 @@ The distinction matters. The loader `dlsym`s the symbol and reads a POD; a misma
 
 **Sanitizer state is not optional and is not softened by type discipline.** ASan changes allocator behaviour and inserts redzones; an ASan-built plugin in a non-ASan host fails spectacularly regardless of how clean the interface is. Staging builds run ASan and UBSan continuously (§5.3), so this mismatch *will* occur, and it must be a legible refusal rather than a mystery.
 
+Clang exposes all three supported sanitizer modes through `__has_feature`.
+GCC exposes ASan and TSan but has no predefined macro for UBSan, so a GCC
+UBSan build must define `ANVIL_ABI_SANITIZER_UNDEFINED=1`; Anvil's UBSan
+toolchain does this automatically. A build that bypasses the supplied CMake
+target must carry the same definition explicitly.
+
 Compiler and stdlib identity move from gate to *telemetry*: recorded at load, shown in the plugin list, included in any crash report. When a plugin misbehaves, the first question is which toolchain built it, and the answer should already be written down.
 
 A macro in the SDK header populates the whole tag. An author writes `ANVIL_PLUGIN_ABI_TAG();` once and never thinks about it.

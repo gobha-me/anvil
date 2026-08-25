@@ -1,6 +1,7 @@
 set(_fixture_sources
   valid
   mismatched
+  mismatched_sanitizer
   missing_tag
   missing_factory
   missing_destroy
@@ -16,6 +17,7 @@ foreach(_fixture IN LISTS _fixture_sources)
   list(APPEND _fixture_targets fixture_${_fixture})
   target_compile_features(fixture_${_fixture} PRIVATE cxx_std_23)
   target_compile_options(fixture_${_fixture} PRIVATE ${ANVIL_WARNING_FLAGS})
+  target_link_libraries(fixture_${_fixture} PRIVATE anvil::sdk)
   set_target_properties(fixture_${_fixture} PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES
@@ -88,7 +90,7 @@ add_test(
   NAME sdk_boundary_has_no_standard_library_surface
   COMMAND
     ${CMAKE_COMMAND}
-    -DANVIL_SDK_HEADER=${PROJECT_SOURCE_DIR}/include/anvil/sdk/types.hpp
+    -DANVIL_SDK_DIR=${PROJECT_SOURCE_DIR}/include/anvil/sdk
     -P ${PROJECT_SOURCE_DIR}/cmake/verify_sdk_boundary.cmake
 )
 

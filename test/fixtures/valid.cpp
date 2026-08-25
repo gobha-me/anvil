@@ -14,7 +14,7 @@ __attribute__((destructor)) auto on_unload() noexcept -> void {
 
 } // namespace
 
-extern "C" ANVIL_TEST_EXPORT const TestTag anvil_abi_tag = kExpectedTag;
+ANVIL_PLUGIN_ABI_TAG();
 
 extern "C" ANVIL_TEST_EXPORT auto anvil_plugin_create() noexcept
     -> TestPlugin * {

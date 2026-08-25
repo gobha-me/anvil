@@ -1,5 +1,7 @@
 #pragma once
 
+#include <anvil/sdk/abi.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -37,6 +39,10 @@ struct SymbolNames {
 };
 
 using Handle = std::shared_ptr<void>;
+
+[[nodiscard]] auto verify_abi_tag(const AnvilAbiTag &expected,
+                                  const AnvilAbiTag &found)
+    -> std::expected<void, std::string>;
 
 // The instance keeps the DSO mapped independently of the returned handle.
 template <typename Interface> struct Loaded {

@@ -1,3 +1,4 @@
+#include <anvil/sdk/abi.hpp>
 #include <anvil/sdk/types.hpp>
 
 #include <stdint.h>
@@ -8,5 +9,7 @@ static_assert(sizeof(anvil::Span<const uint32_t>) == 12);
 static_assert(sizeof(anvil::Version) == 6);
 static_assert(sizeof(anvil::PluginKind) == 4);
 static_assert(sizeof(anvil::CapabilityTier) == 4);
+static_assert(sizeof(anvil::AnvilAbiTag) == 48);
+static_assert(__builtin_offsetof(anvil::AnvilAbiTag, language_standard) == 40);
 
 auto main() -> int { return 0; }

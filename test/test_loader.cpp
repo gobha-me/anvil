@@ -11,7 +11,6 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <system_error>
 
@@ -24,24 +23,8 @@ namespace {
 using anvil::loader::AbiRequirement;
 using anvil::loader::ErrorCode;
 
-[[nodiscard]] auto verify_tag(const TestTag &expected, const TestTag &found)
-    -> std::expected<void, std::string> {
-  if (found.magic != expected.magic) {
-    std::ostringstream message;
-    message << "magic: expected " << expected.magic << ", found "
-            << found.magic;
-    return std::unexpected(message.str());
-  }
-  if (found.interface_version != expected.interface_version) {
-    std::ostringstream message;
-    message << "interface_version: expected " << expected.interface_version
-            << ", found " << found.interface_version;
-    return std::unexpected(message.str());
-  }
-  return {};
-}
-
-inline constexpr AbiRequirement<TestTag> kRequirement{kExpectedTag, verify_tag};
+inline constexpr AbiRequirement<anvil::AnvilAbiTag> kRequirement{
+    anvil::current_abi_tag, anvil::loader::verify_abi_tag};
 
 class EventFile {
 public:
@@ -94,8 +77,20 @@ TEST_CASE("an ABI mismatch rejects before any exported entrypoint") {
   REQUIRE_FALSE(loaded.has_value());
   CHECK(loaded.error().code == ErrorCode::abi_rejected);
   CHECK(loaded.error().symbol == "anvil_abi_tag");
-  CHECK(loaded.error().detail.find("expected 1, found 2") != std::string::npos);
+  CHECK(loaded.error().detail.find("interface_major: expected 1, found 2") !=
+        std::string::npos);
   CHECK(events.contents() == "initializer\n");
+}
+
+TEST_CASE("a sanitizer mismatch is a hard refusal before entrypoint lookup") {
+  auto loaded = anvil::loader::load<TestPlugin>(
+      ANVIL_FIXTURE_mismatched_sanitizer, kRequirement);
+
+  REQUIRE_FALSE(loaded.has_value());
+  CHECK(loaded.error().code == ErrorCode::abi_rejected);
+  CHECK(loaded.error().symbol == "anvil_abi_tag");
+  CHECK(loaded.error().detail.find("sanitizer_mask: expected ") !=
+        std::string::npos);
 }
 
 TEST_CASE("a missing ABI tag fails before the factory") {
@@ -156,7 +151,41 @@ TEST_CASE("a truncated ABI tag is refused before it is copied") {
   REQUIRE_FALSE(loaded.has_value());
   CHECK(loaded.error().code == ErrorCode::abi_rejected);
   CHECK(loaded.error().symbol == "anvil_abi_tag");
-  CHECK(loaded.error().detail.find("4 bytes; expected at least 8") !=
+  CHECK(loaded.error().detail.find("4 bytes; expected at least 48") !=
+        std::string::npos);
+}
+
+TEST_CASE("the Anvil verifier gates compatibility fields only") {
+  auto found = anvil::current_abi_tag;
+  found.compiler = anvil::AbiCompiler::unknown;
+  found.compiler_major = 99;
+  found.compiler_minor = 98;
+  found.compiler_patch = 97;
+  found.standard_library = anvil::AbiStandardLibrary::unknown;
+  found.standard_library_version = 123;
+  found.language_standard = 1;
+
+  CHECK(anvil::loader::verify_abi_tag(anvil::current_abi_tag, found));
+
+  found.magic = 0;
+  auto bad_magic = anvil::loader::verify_abi_tag(anvil::current_abi_tag, found);
+  REQUIRE_FALSE(bad_magic);
+  CHECK(bad_magic.error().find("magic: expected ") != std::string::npos);
+
+  found = anvil::current_abi_tag;
+  --found.struct_size;
+  auto short_struct =
+      anvil::loader::verify_abi_tag(anvil::current_abi_tag, found);
+  REQUIRE_FALSE(short_struct);
+  CHECK(short_struct.error().find("struct_size: expected 48, found 47") !=
+        std::string::npos);
+
+  found = anvil::current_abi_tag;
+  ++found.interface_minor;
+  auto wrong_minor =
+      anvil::loader::verify_abi_tag(anvil::current_abi_tag, found);
+  REQUIRE_FALSE(wrong_minor);
+  CHECK(wrong_minor.error().find("interface_minor: expected 0, found 1") !=
         std::string::npos);
 }
 
@@ -182,7 +211,8 @@ TEST_CASE("the instance keeps its library mapped and destroys before dlclose") {
 
 TEST_CASE("invalid caller inputs fail without entering the dynamic loader") {
   auto null_verifier = anvil::loader::load<TestPlugin>(
-      ANVIL_FIXTURE_valid, AbiRequirement<TestTag>{kExpectedTag, nullptr});
+      ANVIL_FIXTURE_valid,
+      AbiRequirement<anvil::AnvilAbiTag>{anvil::current_abi_tag, nullptr});
   REQUIRE_FALSE(null_verifier.has_value());
   CHECK(null_verifier.error().code == ErrorCode::invalid_request);
 
