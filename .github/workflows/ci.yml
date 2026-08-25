@@ -30,7 +30,7 @@ jobs:
           - {name: "clang / tsan", cxx: clang++, toolchain: thread.cmake, build_type: RelWithDebInfo}
           - {name: "clang / ubsan", cxx: clang++, toolchain: undefined.cmake, build_type: Debug}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Clang 20
         if: ${{ startsWith(matrix.cxx, 'clang') }}
         env:
@@ -63,7 +63,7 @@ jobs:
           - {compiler: gcc, cxx: g++-13}
           - {compiler: clang, cxx: clang++}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Clang 20
         if: ${{ matrix.compiler == 'clang' }}
         env:
