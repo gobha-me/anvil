@@ -1,15 +1,11 @@
-#include "events.hpp"
 #include "plugin_api.hpp"
 
 namespace {
 
-__attribute__((constructor)) auto on_load() noexcept -> void {
-  append_event("initializer");
-}
-
 constexpr auto mismatched_tag = [] {
   auto tag = anvil::current_abi_tag;
-  ++tag.interface_major;
+  tag.sanitizer_mask ^=
+      static_cast<uint32_t>(anvil::AbiSanitizer::address);
   return tag;
 }();
 

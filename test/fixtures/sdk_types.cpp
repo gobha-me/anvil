@@ -1,3 +1,4 @@
+#include <anvil/sdk/abi.hpp>
 #include <anvil/sdk/types.hpp>
 
 #include <stdint.h>
@@ -7,6 +8,8 @@
 #else
 #define ANVIL_SDK_TEST_EXPORT
 #endif
+
+ANVIL_PLUGIN_ABI_TAG();
 
 extern "C" ANVIL_SDK_TEST_EXPORT auto
 anvil_sdk_str_len(anvil::Str value) noexcept -> uint64_t {

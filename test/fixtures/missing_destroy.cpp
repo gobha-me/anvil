@@ -1,7 +1,7 @@
 #include "events.hpp"
 #include "plugin_api.hpp"
 
-extern "C" ANVIL_TEST_EXPORT const TestTag anvil_abi_tag = kExpectedTag;
+ANVIL_PLUGIN_ABI_TAG();
 
 extern "C" ANVIL_TEST_EXPORT auto anvil_plugin_create() noexcept
     -> TestPlugin * {

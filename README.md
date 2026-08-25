@@ -157,11 +157,31 @@ in `T`. These primitive view/value types have fixed layouts and no member
 functions. Future extensible records such as plugin manifests and contexts put
 `uint32_t struct_size` first so appended fields can be detected safely.
 
-The boundary header deliberately contains no standard-library surface types.
-Its size, alignment, offset, and fixed-width assertions compile in every host
+The boundary headers deliberately contain no standard-library surface types.
+Their size, alignment, offset, and fixed-width assertions compile in every host
 and plugin translation unit, including a dedicated 32-bit CI check. The later
 ergonomic wrapper will convert an author's own standard-library values to these
 raw types without letting those values cross the DSO boundary.
+
+`<anvil/sdk/abi.hpp>` defines the fixed-layout `AnvilAbiTag`. A plugin exports
+the complete tag as data with one global-scope declaration:
+
+```cpp
+#include <anvil/sdk/abi.hpp>
+
+ANVIL_PLUGIN_ABI_TAG();
+```
+
+The host refuses mismatched magic, structure size, plugin-interface version, or
+sanitizer state. Compiler, compiler version, standard-library identity, and
+language-standard fields are retained as diagnostics rather than compatibility
+gates. The current plugin interface is `1.0`; accepted version ranges arrive
+with the interface-versioning work.
+
+Clang exposes ASan, UBSan, and TSan state to the header. GCC exposes ASan and
+TSan but has no UBSan predefined macro, so a GCC UBSan plugin build must define
+`ANVIL_ABI_SANITIZER_UNDEFINED=1`; Anvil's UBSan toolchain does this
+automatically.
 
 ## Plugin loader
 
@@ -173,23 +193,21 @@ object mapped for as long as any instance exists, including when a caller
 retains only the instance's `shared_ptr`.
 
 ```cpp
-struct Tag {
-  std::uint32_t magic;
-  std::uint32_t interface_version;
-};
-
 auto plugin = anvil::loader::load<IPlugin>(
     "/srv/anvil/plugins/example.so",
-    anvil::loader::AbiRequirement<Tag>{expected_tag, verify_tag});
+    anvil::loader::AbiRequirement<anvil::AnvilAbiTag>{
+        anvil::current_abi_tag, anvil::loader::verify_abi_tag});
 if (!plugin) {
   log(plugin.error().message());
 }
 ```
 
-The tag must be a trivially-copyable, standard-layout type. The verifier returns
-`std::expected<void, std::string>` so a refusal can name the mismatched field and
-its expected and observed values. Symbol names are configurable and default to
-`anvil_abi_tag`, `anvil_plugin_create`, and `anvil_plugin_destroy`.
+The loader remains generic: custom tags must be trivially-copyable,
+standard-layout types and custom verifiers return
+`std::expected<void, std::string>`. `verify_abi_tag` supplies the Anvil policy
+and names every mismatched field with its expected and observed values. Symbol
+names are configurable and default to `anvil_abi_tag`,
+`anvil_plugin_create`, and `anvil_plugin_destroy`.
 
 There is one unavoidable ordering boundary: `dlopen()` runs a shared object's
 ELF initializers before returning. An ABI refusal therefore guarantees that no

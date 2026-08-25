@@ -9,6 +9,14 @@
 namespace anvil::loader {
 namespace {
 
+[[nodiscard]] auto mismatch(const char *field, std::uint64_t expected,
+                            std::uint64_t found)
+    -> std::expected<void, std::string> {
+  std::ostringstream message;
+  message << field << ": expected " << expected << ", found " << found;
+  return std::unexpected(message.str());
+}
+
 [[nodiscard]] auto valid_symbol_name(const std::string &symbol) -> bool {
   return !symbol.empty() && symbol.find('\0') == std::string::npos;
 }
@@ -32,6 +40,27 @@ namespace {
 }
 
 } // namespace
+
+auto verify_abi_tag(const AnvilAbiTag &expected, const AnvilAbiTag &found)
+    -> std::expected<void, std::string> {
+  if (found.magic != expected.magic)
+    return mismatch("magic", expected.magic, found.magic);
+  if (found.struct_size < expected.struct_size)
+    return mismatch("struct_size", expected.struct_size, found.struct_size);
+  if (found.interface_major != expected.interface_major) {
+    return mismatch("interface_major", expected.interface_major,
+                    found.interface_major);
+  }
+  if (found.interface_minor != expected.interface_minor) {
+    return mismatch("interface_minor", expected.interface_minor,
+                    found.interface_minor);
+  }
+  if (found.sanitizer_mask != expected.sanitizer_mask) {
+    return mismatch("sanitizer_mask", expected.sanitizer_mask,
+                    found.sanitizer_mask);
+  }
+  return {};
+}
 
 auto Error::message() const -> std::string {
   std::ostringstream out;
