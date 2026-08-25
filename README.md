@@ -11,9 +11,9 @@ games served to anyone with a terminal — built entirely on
 [termforge](https://github.com/gobha-me/termforge), C++23, in a single hardened
 container.
 
-> **Status: design.** Nothing is implemented yet. The design is settled enough
-> to build against — see [`anvil-bbs-design.md`](anvil-bbs-design.md) — and the
-> issue tracker is the work breakdown.
+> **Status: foundations.** The standalone plugin loader is implemented; the BBS
+> server remains in design. See [`anvil-bbs-design.md`](anvil-bbs-design.md)
+> for the architecture and the issue tracker for the work breakdown.
 
 ---
 
@@ -141,6 +141,60 @@ thing on that path.
 A standalone, heavily tested **plugin loader library** is a prerequisite of M3
 and is independent of everything else — it can be finished while the termforge
 work is still being scoped.
+
+## Plugin loader
+
+`anvil::loader` is an installable C++23 library around the Linux ELF/glibc
+dynamic loader. It opens plugins with `RTLD_NOW | RTLD_LOCAL`, resolves an ABI
+tag as a data symbol, validates it, and only then resolves the plugin-owned
+factory and destroy entrypoints. The returned `Loaded<I>` keeps the shared
+object mapped for as long as any instance exists, including when a caller
+retains only the instance's `shared_ptr`.
+
+```cpp
+struct Tag {
+  std::uint32_t magic;
+  std::uint32_t interface_version;
+};
+
+auto plugin = anvil::loader::load<IPlugin>(
+    "/srv/anvil/plugins/example.so",
+    anvil::loader::AbiRequirement<Tag>{expected_tag, verify_tag});
+if (!plugin) {
+  log(plugin.error().message());
+}
+```
+
+The tag must be a trivially-copyable, standard-layout type. The verifier returns
+`std::expected<void, std::string>` so a refusal can name the mismatched field and
+its expected and observed values. Symbol names are configurable and default to
+`anvil_abi_tag`, `anvil_plugin_create`, and `anvil_plugin_destroy`.
+
+There is one unavoidable ordering boundary: `dlopen()` runs a shared object's
+ELF initializers before returning. An ABI refusal therefore guarantees that no
+exported plugin entrypoint was resolved or called, not that no machine code from
+the shared object ran. Admission, provenance, and content-hash checks must happen
+before passing a path to this library. Plugins use hidden visibility with only
+the tag, factory, and destroy symbols exported, and destruction must return to
+the plugin rather than using host-side `delete`.
+
+Build and test with both supported compilers:
+
+```sh
+CXX=g++-13 cmake -S . -B build-gcc \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain/default.cmake
+cmake --build build-gcc --parallel
+ctest --test-dir build-gcc --output-on-failure
+
+CXX=clang++ cmake -S . -B build-clang \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain/default.cmake
+cmake --build build-clang --parallel
+ctest --test-dir build-clang --output-on-failure
+```
+
+The loader intentionally does not provide a plugin registry, double-load
+tracking, live reload, or door/server types. Those policies remain separate
+layers in the roadmap.
 
 Post-MVP, in rough order: signed plugin releases via `ssh-keygen -Y`, plugin
 reload with reference-counted drain, uploads with age limits and a scanning
