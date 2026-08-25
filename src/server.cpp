@@ -2,6 +2,7 @@
 
 #include <libssh/callbacks.h>
 #include <libssh/libssh.h>
+#include <libssh/libssh_version.h>
 #include <libssh/server.h>
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -26,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include <sys/random.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -44,6 +47,16 @@ constexpr std::size_t max_pending_input = 64U * 1024U;
 constexpr auto authentication_timeout = 15s;
 constexpr auto idle_timeout = 5min;
 constexpr auto shutdown_timeout = 5s;
+
+[[noreturn]] void throw_system_error(std::string_view operation);
+
+void clear_secret(char* data, std::size_t size) noexcept {
+  auto* cursor = static_cast<volatile char*>(data);
+  while (size > 0U) {
+    *cursor++ = '\0';
+    --size;
+  }
+}
 
 class FileDescriptor {
  public:
@@ -74,10 +87,46 @@ class FileDescriptor {
   int descriptor_;
 };
 
+class TemporaryDirectoryEntry {
+ public:
+  TemporaryDirectoryEntry(int directory, std::string name)
+      : directory_(directory), name_(std::move(name)) {}
+  ~TemporaryDirectoryEntry() {
+    if (present_) {
+      static_cast<void>(::unlinkat(directory_, name_.c_str(), 0));
+    }
+  }
+
+  TemporaryDirectoryEntry(const TemporaryDirectoryEntry&) = delete;
+  TemporaryDirectoryEntry& operator=(const TemporaryDirectoryEntry&) = delete;
+
+  void remove() {
+    if (::unlinkat(directory_, name_.c_str(), 0) != 0) {
+      throw_system_error("cannot remove temporary host key");
+    }
+    present_ = false;
+  }
+
+ private:
+  int directory_;
+  std::string name_;
+  bool present_{true};
+};
+
 struct KeyDeleter {
   void operator()(ssh_key_struct* key) const noexcept { ssh_key_free(key); }
 };
 using UniqueKey = std::unique_ptr<ssh_key_struct, KeyDeleter>;
+
+struct ExportedKeyDeleter {
+  void operator()(char* key) const noexcept {
+    if (key != nullptr) {
+      clear_secret(key, std::strlen(key));
+      ssh_string_free_char(key);
+    }
+  }
+};
+using UniqueExportedKey = std::unique_ptr<char, ExportedKeyDeleter>;
 
 struct BindDeleter {
   void operator()(ssh_bind_struct* bind) const noexcept { ssh_bind_free(bind); }
@@ -121,13 +170,9 @@ struct SessionState {
   throw std::system_error(errno, std::generic_category(), std::string(operation));
 }
 
-[[nodiscard]] std::string read_key_file(const std::string& path, bool private_key) {
-  const auto descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0) {
-    throw_system_error("cannot open key file '" + path + "'");
-  }
-  FileDescriptor file(descriptor);
-
+[[nodiscard]] std::string read_key_file(FileDescriptor file,
+                                        const std::string& path,
+                                        bool private_key) {
   struct stat metadata {};
   if (::fstat(file.get(), &metadata) != 0) {
     throw_system_error("cannot inspect key file '" + path + "'");
@@ -163,6 +208,165 @@ struct SessionState {
     throw std::runtime_error("key file contains a NUL byte: " + path);
   }
   return contents;
+}
+
+[[nodiscard]] std::string read_key_file(const std::string& path, bool private_key) {
+  const auto descriptor =
+      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) {
+    throw_system_error("cannot open key file '" + path + "'");
+  }
+  return read_key_file(FileDescriptor(descriptor), path, private_key);
+}
+
+[[nodiscard]] std::string read_host_key_at(int directory,
+                                           const std::string& filename,
+                                           const std::string& path) {
+  const auto descriptor =
+      ::openat(directory, filename.c_str(),
+               O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) {
+    throw_system_error("cannot open key file '" + path + "'");
+  }
+  return read_key_file(FileDescriptor(descriptor), path, true);
+}
+
+void write_all(int descriptor, std::string_view contents, std::string_view path) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto count =
+        ::write(descriptor, contents.data() + offset, contents.size() - offset);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      throw_system_error("cannot write host key '" + std::string(path) + "'");
+    }
+    if (count == 0) {
+      throw std::runtime_error("short write while creating host key: " + std::string(path));
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+}
+
+[[nodiscard]] std::string random_suffix() {
+  std::array<unsigned char, 16> bytes{};
+  std::size_t offset = 0;
+  while (offset < bytes.size()) {
+    const auto count = ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      throw_system_error("cannot obtain randomness for temporary host key name");
+    }
+    if (count == 0) {
+      throw std::runtime_error("no randomness returned for temporary host key name");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+
+  constexpr std::string_view digits = "0123456789abcdef";
+  std::string suffix;
+  suffix.reserve(bytes.size() * 2U);
+  for (const auto byte : bytes) {
+    suffix.push_back(digits[byte >> 4U]);
+    suffix.push_back(digits[byte & 0x0fU]);
+  }
+  return suffix;
+}
+
+[[nodiscard]] std::string generate_ed25519_host_key() {
+  ssh_key raw_key = nullptr;
+#if LIBSSH_VERSION_INT >= SSH_VERSION_INT(0, 12, 0)
+  const auto generated = ssh_pki_generate_key(SSH_KEYTYPE_ED25519, nullptr, &raw_key);
+#else
+  const auto generated = ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &raw_key);
+#endif
+  UniqueKey key(raw_key);
+  if (generated != SSH_OK || !key) {
+    throw std::runtime_error("cannot generate Ed25519 host key");
+  }
+
+  char* raw_export = nullptr;
+  if (ssh_pki_export_privkey_base64(key.get(), nullptr, nullptr, nullptr, &raw_export) !=
+          SSH_OK ||
+      raw_export == nullptr) {
+    throw std::runtime_error("cannot export generated Ed25519 host key");
+  }
+  UniqueExportedKey exported(raw_export);
+  return std::string(exported.get());
+}
+
+[[nodiscard]] std::string load_or_create_host_key(const std::string& path) {
+  const std::filesystem::path key_path(path);
+  const auto filename = key_path.filename().string();
+  if (filename.empty() || filename == "." || filename == "..") {
+    throw std::runtime_error("host key path must name a file: " + path);
+  }
+  auto parent = key_path.parent_path();
+  if (parent.empty()) {
+    parent = ".";
+  }
+
+  const auto directory_descriptor =
+      ::open(parent.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+  if (directory_descriptor < 0) {
+    throw_system_error("cannot open host key directory '" + parent.string() + "'");
+  }
+  FileDescriptor directory(directory_descriptor);
+
+  const auto existing =
+      ::openat(directory.get(), filename.c_str(),
+               O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (existing >= 0) {
+    return read_key_file(FileDescriptor(existing), path, true);
+  }
+  if (errno != ENOENT) {
+    throw_system_error("cannot open key file '" + path + "'");
+  }
+
+  auto generated = generate_ed25519_host_key();
+  const auto temporary_name = "." + filename + ".tmp." + random_suffix();
+  const auto temporary_descriptor =
+      ::openat(directory.get(), temporary_name.c_str(),
+               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+               S_IRUSR | S_IWUSR);
+  if (temporary_descriptor < 0) {
+    clear_secret(generated.data(), generated.size());
+    throw_system_error("cannot create temporary host key in '" + parent.string() + "'");
+  }
+  FileDescriptor temporary(temporary_descriptor);
+  TemporaryDirectoryEntry temporary_entry(directory.get(), temporary_name);
+
+  try {
+    if (::fchmod(temporary.get(), S_IRUSR | S_IWUSR) != 0) {
+      throw_system_error("cannot set permissions on temporary host key");
+    }
+    write_all(temporary.get(), generated, path);
+    if (::fsync(temporary.get()) != 0) {
+      throw_system_error("cannot flush temporary host key");
+    }
+
+    if (::linkat(directory.get(), temporary_name.c_str(), directory.get(),
+                 filename.c_str(), 0) != 0) {
+      if (errno != EEXIST) {
+        throw_system_error("cannot publish host key '" + path + "'");
+      }
+      temporary_entry.remove();
+      clear_secret(generated.data(), generated.size());
+      return read_host_key_at(directory.get(), filename, path);
+    }
+
+    temporary_entry.remove();
+    if (::fsync(directory.get()) != 0) {
+      throw_system_error("cannot flush host key directory '" + parent.string() + "'");
+    }
+    return generated;
+  } catch (...) {
+    clear_secret(generated.data(), generated.size());
+    throw;
+  }
 }
 
 [[nodiscard]] std::pair<std::string_view, std::string_view> public_key_tokens(
@@ -657,7 +861,7 @@ int run(const Config& config) {
   for (const auto& specification : config.authorized_keys) {
     authorized_keys.push_back(load_authorized_key(specification));
   }
-  auto host_key = read_key_file(config.host_key_path, true);
+  auto host_key = load_or_create_host_key(config.host_key_path);
 
   UniqueBind bind(ssh_bind_new());
   if (!bind) {
@@ -670,7 +874,7 @@ int run(const Config& config) {
       ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDPORT_STR, port.c_str()) == SSH_OK &&
       ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_IMPORT_KEY_STR,
                            host_key.c_str()) == SSH_OK;
-  std::ranges::fill(host_key, '\0');
+  clear_secret(host_key.data(), host_key.size());
   if (!configured) {
     throw std::runtime_error("cannot configure SSH listener: " +
                              std::string(ssh_get_error(bind.get())));
