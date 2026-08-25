@@ -11,9 +11,10 @@ games served to anyone with a terminal — built entirely on
 [termforge](https://github.com/gobha-me/termforge), C++23, in a single hardened
 container.
 
-> **Status: foundations.** The standalone plugin loader is implemented; the BBS
-> server remains in design. See [`anvil-bbs-design.md`](anvil-bbs-design.md)
-> for the architecture and the issue tracker for the work breakdown.
+> **Status: foundations.** The standalone plugin loader and stable plugin SDK
+> boundary types are implemented; the BBS server remains in design. See
+> [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the
+> issue tracker for the work breakdown.
 
 ---
 
@@ -141,6 +142,26 @@ thing on that path.
 A standalone, heavily tested **plugin loader library** is a prerequisite of M3
 and is independent of everything else — it can be finished while the termforge
 work is still being scoped.
+
+## Plugin SDK boundary
+
+`anvil::sdk` is an installable, header-only C++23 target containing the types
+that may cross the plugin boundary. Include `<anvil/sdk/types.hpp>` to use
+`anvil::Str`, `anvil::Span<T>`, `anvil::Version`, `anvil::PluginKind`, and
+`anvil::CapabilityTier`.
+
+`Str` and `Span<T>` are borrowed views: the owner of `data` must keep it alive
+for the duration specified by the interface carrying the view. `Span<T>` only
+accepts trivially-copyable, standard-layout element types, and constness belongs
+in `T`. These primitive view/value types have fixed layouts and no member
+functions. Future extensible records such as plugin manifests and contexts put
+`uint32_t struct_size` first so appended fields can be detected safely.
+
+The boundary header deliberately contains no standard-library surface types.
+Its size, alignment, offset, and fixed-width assertions compile in every host
+and plugin translation unit, including a dedicated 32-bit CI check. The later
+ergonomic wrapper will convert an author's own standard-library values to these
+raw types without letting those values cross the DSO boundary.
 
 ## Plugin loader
 

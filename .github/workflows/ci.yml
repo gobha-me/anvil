@@ -14,6 +14,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sdk-layout-32:
+    name: sdk layout / 32-bit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install 32-bit GCC support
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes g++-13-multilib
+      - name: Compile SDK layout assertions
+        run: >
+          g++-13 -m32 -std=c++23 -fsyntax-only -Iinclude
+          test/sdk_layout_32.cpp
+
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04

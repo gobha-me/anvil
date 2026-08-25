@@ -19,4 +19,7 @@ else()
 endif()
 
 add_executable(anvil_loader_consumer main.cpp)
-target_link_libraries(anvil_loader_consumer PRIVATE anvil::loader)
+target_link_libraries(anvil_loader_consumer
+  PRIVATE anvil::loader
+  PRIVATE anvil::sdk
+)
