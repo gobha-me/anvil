@@ -14,6 +14,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sdk-abi-history:
+    name: sdk ABI history
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Clang 20
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "$CLANG_VERSION"
+      - name: Verify golden ABI history
+        run: >
+          python3 -B cmake/verify_sdk_abi.py
+          --compiler clang++-20
+          --include-dir include
+          --history cmake/sdk_abi_history.json
+      - name: Exercise ABI history mutation rules
+        run: python3 -B test/test_sdk_abi_history.py
+
   sdk-layout-32:
     name: sdk layout / 32-bit
     runs-on: ubuntu-24.04

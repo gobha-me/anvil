@@ -148,7 +148,8 @@ work is still being scoped.
 `anvil::sdk` is an installable, header-only C++23 target containing the types
 that may cross the plugin boundary. Include `<anvil/sdk/types.hpp>` to use
 `anvil::Str`, `anvil::Span<T>`, `anvil::Version`, `anvil::PluginKind`, and
-`anvil::CapabilityTier`.
+`anvil::CapabilityTier`. `<anvil/sdk/abi.hpp>` additionally publishes
+`anvil::InterfaceVersion` and the ABI tag.
 
 `Str` and `Span<T>` are borrowed views: the owner of `data` must keep it alive
 for the duration specified by the interface carrying the view. `Span<T>` only
@@ -172,11 +173,17 @@ the complete tag as data with one global-scope declaration:
 ANVIL_PLUGIN_ABI_TAG();
 ```
 
-The host refuses mismatched magic, structure size, plugin-interface version, or
-sanitizer state. Compiler, compiler version, standard-library identity, and
-language-standard fields are retained as diagnostics rather than compatibility
-gates. The current plugin interface is `1.0`; accepted version ranges arrive
-with the interface-versioning work.
+The host refuses mismatched magic, an inconsistent structure size, a plugin
+interface outside its accepted ranges, or mismatched sanitizer state. Compiler,
+compiler version, standard-library identity, and language-standard fields are
+retained as diagnostics rather than compatibility gates. The current plugin
+interface and accepted range are both `1.0`.
+
+The tag's fixed 16-byte prefix is sufficient to decide compatibility. An older
+tag may therefore be shorter than the host's `AnvilAbiTag`: the loader copies
+only readable bytes into zero-initialized storage, and the host checks both
+`struct_size` and the ELF symbol's actual size before reading an appended
+field. A tag that claims bytes its symbol does not contain is refused.
 
 Clang exposes ASan, UBSan, and TSan state to the header. GCC exposes ASan and
 TSan but has no UBSan predefined macro, so a GCC UBSan plugin build must define
@@ -196,18 +203,50 @@ retains only the instance's `shared_ptr`.
 auto plugin = anvil::loader::load<IPlugin>(
     "/srv/anvil/plugins/example.so",
     anvil::loader::AbiRequirement<anvil::AnvilAbiTag>{
-        anvil::current_abi_tag, anvil::loader::verify_abi_tag});
+        anvil::current_abi_tag, anvil::loader::verify_abi_tag,
+        anvil::kAbiTagPrefixSize,
+        anvil::loader::abi_tag_declared_size});
 if (!plugin) {
   log(plugin.error().message());
 }
 ```
 
 The loader remains generic: custom tags must be trivially-copyable,
-standard-layout types and custom verifiers return
-`std::expected<void, std::string>`. `verify_abi_tag` supplies the Anvil policy
-and names every mismatched field with its expected and observed values. Symbol
-names are configurable and default to `anvil_abi_tag`,
+standard-layout types and custom verifiers receive the expected tag, the
+zero-filled observed tag, and its logical readable byte size, then return
+`std::expected<void, std::string>`. Each requirement names the minimum readable
+prefix and may provide a logical-size reader for appendable tags; these default
+to the complete custom tag and no reader. The Anvil reader prevents sanitizer
+padding in an ELF data symbol from being mistaken for fields. `verify_abi_tag`
+supplies the Anvil policy and names every mismatch. Symbol names are
+configurable and default to `anvil_abi_tag`,
 `anvil_plugin_create`, and `anvil_plugin_destroy`.
+
+## Version compatibility
+
+Plugin compatibility is stated against the plugin interface, not the server or
+SDK package release. A plugin README should say, for example, "requires Anvil
+plugin interface 1.x, minimum 1.0." The SDK/package follows its own semantic
+version: a wrapper or documentation fix may bump that package without changing
+the interface. When the server exists, its release version will be a third,
+independent stream.
+
+| Anvil SDK/package | Accepted plugin interface |
+|---|---|
+| `0.3.0` | `1.0` |
+| `0.4.0` | `1.0` |
+
+Every release adds its accepted ranges to this table. A future interface-major
+transition includes a migration note and announcement, and defaults to one
+server-release overlap in which both majors load when the layouts can safely
+coexist. Any release that cannot offer that window must say so explicitly.
+
+The ordered fields, enum values, and virtual methods published by the SDK are
+recorded in `cmake/sdk_abi_history.json`. CI derives the live declarations from
+Clang's AST and compares them with the latest snapshot. Within one major,
+existing declarations must remain exact prefixes and every trailing addition
+requires a new minor snapshot; reorder, removal, or signature changes require a
+new major snapshot. This is the gate behind "append, never insert."
 
 There is one unavoidable ordering boundary: `dlopen()` runs a shared object's
 ELF initializers before returning. An ABI refusal therefore guarantees that no

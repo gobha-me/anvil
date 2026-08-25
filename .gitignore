@@ -19,6 +19,8 @@ include/version.hpp
 # Precompiled Headers
 *.gch
 *.pch
+__pycache__/
+*.py[cod]
 
 # Compiled Dynamic libraries
 *.so

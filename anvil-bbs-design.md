@@ -371,10 +371,23 @@ Mismatch is a hard refusal at load with an error naming the plugin, the field, t
 
 Pillar 9 means the interface version is a promise, not a build number.
 
-- **Additive changes** — a new method appended to an interface, a new field appended to a struct after `struct_size` — bump a minor version. Older plugins keep loading; the host checks `struct_size` before reading a field an older plugin will not have set.
+- **Additive changes** — a new method appended to an interface, a new field appended to a struct after `struct_size` — bump a minor version. Older plugins keep loading; the host checks both `struct_size` and the dynamic symbol's readable size before reading a field an older plugin will not have set.
 - **Anything else** — reordering, removing, changing a signature, changing a struct's meaning — bumps the major version and refuses every plugin built against the previous one.
-- The host accepts a **range** of interface versions, and the range is documented per release. A major bump is a release event with a migration note, an announcement, and ideally a deprecation period during which both versions load.
+- The host accepts one or more **ranges** of interface versions, and every range is documented per release. A major bump is a release event with a migration note and an announcement. The default deprecation window is one server release during which both majors load when their layouts can safely coexist; an exception is stated explicitly in that release's notes.
 - Vtable methods are appended, never inserted. Inserting a virtual function in the middle of an interface silently reorders every plugin's vtable, which the tag cannot catch because nothing about the plugin changed.
+
+The committed ABI history is the enforcement mechanism. It records ordered
+fields, enum values, and virtual methods for every published interface version.
+CI derives the current declarations from Clang's AST: a trailing addition needs
+a minor snapshot, while reordering, removal, or a signature change needs a new
+major snapshot.
+
+Plugin authors state compatibility against this interface version — for
+example, "plugin interface 1.x, minimum 1.0." The SDK package has independent
+semver because wrapper and documentation fixes do not change the interface, and
+the server has its own release version because a server release may not touch
+plugins at all. Every server release publishes all three values and its accepted
+interface ranges.
 
 ### 7.4 The handle wrapper
 
@@ -849,6 +862,7 @@ Recorded so they are not relitigated in a later session.
 | **Plugin ABI** | **C++ abstract base class as the handle — vtable layout is fixed by the Itanium ABI. Only Anvil-defined stable types cross it: PODs, fixed-width enums, `Str`, `Span`, opaque handles. No STL, ever. A header-only SDK wrapper restores ordinary C++ ergonomics on the author's side (§7.3).** |
 | **ABI tag** | **Exported as a data symbol, not a function, and verified before the factory is resolved — a mismatch is refused with zero plugin code executed. Gates on interface version and sanitizer state; records compiler and stdlib identity as diagnostics rather than gating on them (§7.3.1).** |
 | **Interface versioning** | **Additive changes bump minor and keep old plugins loading; anything else bumps major and is a release event with a migration note. Vtable methods are appended, never inserted (§7.3.2).** |
+| **SDK compatibility version** | **Plugin authors quote the plugin interface major and minimum minor. The SDK package and server use independent semver; every server release documents all three values and its accepted interface ranges (§7.3.2).** |
 | **Plugin privilege** | **`dlopen`, in-process, full privilege, no sandbox — the model, not a stage. Trust is transitive: an operator already trusts whoever built the server, and a plugin author is the same decision about a different person. Stated plainly in operator docs: installing a plugin equals running a patched server binary from that author (§7.9).** |
 | **Number of SDKs** | **One. The narrow interface is justified by ergonomics, maintainability, and surviving buggy mods — never described as a security boundary, because in-process it is not one (§7.9).** |
 | **Egress** | **Operator knob, default closed, openable and supported (§5.6). Metrics, web UI, and upload scanning do not need it; push metrics and any future federation do. Was wrongly written as an architectural rule in the first v2 pass — pillar 7 applies to this project's own rules.** |
@@ -871,11 +885,10 @@ Recorded so they are not relitigated in a later session.
 5. Whether presence should show *what screen* a user is on, or only that they are online. The former is more alive, the latter is less surveillant.
 6. Are board services (`PluginKind::BoardService`) actually needed in MVP, or does only `Door` ship in M3? The SDK should define the kind either way; the question is whether any host-side wiring exists for it at first release.
 7. **Signed plugin releases** (§7.9) — `ssh-keygen -Y sign` with an allowed-signers file is cheap and fits the project's existing key model. Post-MVP or M3? It is the difference between an operator trusting a *download* and trusting an *author*, and retrofitting it means every existing manifest entry lacks a signature.
-8. **What exactly does the SDK version-lock to?** The server release, the interface major, or its own semver? Affects whether a mod author says "works with Anvil 1.x" or "works with plugin interface 3.x". The second is more honest and more work.
-9. Which plugins make up the first-party demonstration set (§7.10)? The constraint is coverage of the interface — one tier-1 door, one tier-3 door, one verifier, possibly one board service — not entertainment value.
-10. Does the second-party repository build with a *different* compiler than the server's in CI, or the same one? Different is a much stronger test of §7.3 and costs one more CI job.
-11. Should a plugin be able to declare a dependency on another plugin? Almost certainly not in v1 — load-ordering and version-resolution are how plugin systems become package managers — but mod ecosystems generate the request early and it is worth having the answer ready.
-12. Is there a story for a plugin that wants to add a *board*, as opposed to a door? It is the most obvious `BoardService` and it collides with §9.2's no-plugin-tables rule.
+8. Which plugins make up the first-party demonstration set (§7.10)? The constraint is coverage of the interface — one tier-1 door, one tier-3 door, one verifier, possibly one board service — not entertainment value.
+9. Does the second-party repository build with a *different* compiler than the server's in CI, or the same one? Different is a much stronger test of §7.3 and costs one more CI job.
+10. Should a plugin be able to declare a dependency on another plugin? Almost certainly not in v1 — load-ordering and version-resolution are how plugin systems become package managers — but mod ecosystems generate the request early and it is worth having the answer ready.
+11. Is there a story for a plugin that wants to add a *board*, as opposed to a door? It is the most obvious `BoardService` and it collides with §9.2's no-plugin-tables rule.
 
 ---
 
