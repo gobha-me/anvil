@@ -12,9 +12,9 @@ games served to anyone with a terminal — built entirely on
 container.
 
 > **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
-> boundary types, and process-isolated SSH echo transport are implemented. See
-> [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the
-> issue tracker for the work breakdown.
+> boundary types, process-isolated SSH echo transport, and persistent host
+> identity are implemented. See [`anvil-bbs-design.md`](anvil-bbs-design.md)
+> for the architecture and the issue tracker for the work breakdown.
 
 ---
 
@@ -63,21 +63,30 @@ Its temporary M0 shell writes a session greeting and echoes input. SSH `exec`
 and subsystem requests are rejected with exit status 126; no system shell or
 subsystem is reachable.
 
-Build and run it with an unencrypted OpenSSH host key and one or more public
-key mappings:
+Build and run it with a persistent host-key path and one or more public-key
+mappings:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 
-ssh-keygen -t ed25519 -N '' -f host_key
+install -d -m 700 state
 ./build/anvil \
   --bind-address 127.0.0.1 \
   --port 2222 \
   --max-sessions 64 \
-  --host-key host_key \
+  --host-key state/host_key \
   --authorized-key demo="$HOME/.ssh/id_ed25519.pub"
 ```
+
+When the host-key path is absent, Anvil creates one unencrypted Ed25519 key
+with mode `0600`. It publishes the complete key atomically, so concurrent
+instances using one volume converge on the same identity. An existing key is
+used unchanged, including another key type supported by libssh; an unreadable,
+malformed, symlinked, oversized, or over-permissive existing path stops startup
+and is never silently replaced. The parent directory must already exist and be
+writable on first start. In a deployment, mount that directory from persistent
+storage: losing it gives every returning user a host-key warning.
 
 Each authorized-key file must contain exactly one ordinary OpenSSH public-key
 line; repeat `--authorized-key USER=PATH` to allow additional users or keys.
@@ -310,6 +319,7 @@ independent stream.
 | `0.5.0` | `1.0–1.1` |
 | `0.6.0` | `1.0–1.2` |
 | `0.7.0` | `1.0–1.2` |
+| `0.8.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one
