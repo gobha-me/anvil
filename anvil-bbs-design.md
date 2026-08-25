@@ -340,7 +340,9 @@ Exported as a **data symbol, not a function**:
 extern "C" const AnvilAbiTag anvil_abi_tag;
 ```
 
-The distinction matters. The loader `dlsym`s the symbol and reads a POD; a mismatch is rejected with **zero plugin code executed**. A function returning the tag would require calling into the plugin to discover whether calling into the plugin is safe, which is exactly backwards. This is the "fail early, before object creation" instinct taken one step further than the factory.
+The distinction matters. The loader `dlsym`s the symbol and reads a POD; a mismatch is rejected before the factory, destroy function, or any other exported plugin entrypoint is resolved or called. A function returning the tag would require calling into the plugin to discover whether calling into the plugin is safe, which is exactly backwards. This is the "fail early, before object creation" instinct taken one step further than the factory.
+
+`dlopen()` itself necessarily runs ELF initializers before it returns, so this is not a claim that no instruction from the shared object can execute before the tag check. Admission, provenance, and content-hash checks happen before a path reaches the loader; the tag check protects the ABI boundary before Anvil deliberately enters it.
 
 | Field | Source | Refuse on mismatch? |
 |---|---|---|
@@ -391,7 +393,7 @@ Ownership then flows correctly by construction and no caller can invert it. Note
 Three further requirements:
 
 - **Clear `dlerror()` before `dlsym`.** A null return is not the error signal — a symbol may legitimately have a null value. Clear, call, then check `dlerror()`.
-- **Resolve and verify the tag before resolving the factory.** Order is part of the guarantee.
+- **Resolve and verify the tag before resolving the factory or destroy function.** Order is part of the guarantee; ELF initializers remain the unavoidable `dlopen()` boundary described above.
 - Every failure path returns a diagnostic naming the plugin, the symbol, and the `dlerror()` text. Silent load failures are worse than crashes.
 
 **A key function is defined in the host for every abstract interface.** Without it, typeinfo gets vague-linkage-emitted on both sides and `dynamic_cast` across the boundary fails silently under `RTLD_LOCAL`. Type discipline does not remove this: the host still downcasts a generic `IPlugin*` to the kind-specific interface named in the manifest, and that downcast must work. Similarly, unwind tables must not be stripped — exceptions do not cross the boundary (§7.3), but they still unwind *within* the plugin, and a plugin whose internal `try`/`catch` does not work is a plugin that calls `std::terminate` on its first recoverable error.

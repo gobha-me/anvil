@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: "gcc / default", cxx: g++-13, toolchain: default.cmake, build_type: Debug}
+          - {name: "gcc / asan", cxx: g++-13, toolchain: address.cmake, build_type: Debug}
+          - {name: "gcc / tsan", cxx: g++-13, toolchain: thread.cmake, build_type: RelWithDebInfo}
+          - {name: "gcc / ubsan", cxx: g++-13, toolchain: undefined.cmake, build_type: Debug}
+          - {name: "clang / default", cxx: clang++, toolchain: default.cmake, build_type: Debug}
+          - {name: "clang / asan", cxx: clang++, toolchain: address.cmake, build_type: Debug}
+          - {name: "clang / tsan", cxx: clang++, toolchain: thread.cmake, build_type: RelWithDebInfo}
+          - {name: "clang / ubsan", cxx: clang++, toolchain: undefined.cmake, build_type: Debug}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clang 20
+        if: ${{ startsWith(matrix.cxx, 'clang') }}
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "$CLANG_VERSION"
+          sudo ln -sf "/usr/bin/clang-$CLANG_VERSION" /usr/local/bin/clang
+          sudo ln -sf "/usr/bin/clang++-$CLANG_VERSION" /usr/local/bin/clang++
+      - name: Configure
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -S . -B build
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain/${{ matrix.toolchain }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  consumer:
+    name: consumer / ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {compiler: gcc, cxx: g++-13}
+          - {compiler: clang, cxx: clang++}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clang 20
+        if: ${{ matrix.compiler == 'clang' }}
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "$CLANG_VERSION"
+          sudo ln -sf "/usr/bin/clang-$CLANG_VERSION" /usr/local/bin/clang
+          sudo ln -sf "/usr/bin/clang++-$CLANG_VERSION" /usr/local/bin/clang++
+      - name: Verify all consumer modes
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: example/consumer/verify.sh
