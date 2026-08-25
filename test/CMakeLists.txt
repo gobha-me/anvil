@@ -39,6 +39,32 @@ set_target_properties(fixture_sdk_types PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fixtures
 )
 
+add_library(fixture_sdk_wrapper SHARED fixtures/sdk_wrapper.cpp)
+target_compile_features(fixture_sdk_wrapper PRIVATE cxx_std_23)
+target_compile_options(fixture_sdk_wrapper PRIVATE ${ANVIL_WARNING_FLAGS})
+target_link_libraries(fixture_sdk_wrapper PRIVATE anvil::sdk)
+set_target_properties(fixture_sdk_wrapper PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES
+  PREFIX ""
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fixtures
+)
+
+add_library(fixture_sdk_wrapper_throwing_factory SHARED
+  fixtures/sdk_wrapper_throwing_factory.cpp
+)
+target_compile_features(fixture_sdk_wrapper_throwing_factory PRIVATE cxx_std_23)
+target_compile_options(fixture_sdk_wrapper_throwing_factory
+  PRIVATE ${ANVIL_WARNING_FLAGS}
+)
+target_link_libraries(fixture_sdk_wrapper_throwing_factory PRIVATE anvil::sdk)
+set_target_properties(fixture_sdk_wrapper_throwing_factory PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES
+  PREFIX ""
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fixtures
+)
+
 # A successful dlsym with address zero is distinct from a missing symbol. GNU
 # ld and the GNU-compatible linker used by Clang both support an absolute
 # symbol for this adversarial fixture.
@@ -77,6 +103,49 @@ target_link_libraries(anvil_sdk_tests
   PRIVATE Catch2::Catch2WithMain
 )
 
+add_executable(anvil_sdk_wrapper_tests test_sdk_wrapper.cpp)
+set_target_properties(anvil_sdk_wrapper_tests PROPERTIES ENABLE_EXPORTS ON)
+target_compile_features(anvil_sdk_wrapper_tests PRIVATE cxx_std_23)
+target_compile_options(anvil_sdk_wrapper_tests PRIVATE ${ANVIL_WARNING_FLAGS})
+target_compile_definitions(anvil_sdk_wrapper_tests PRIVATE
+  ANVIL_FIXTURE_sdk_wrapper="$<TARGET_FILE:fixture_sdk_wrapper>"
+  ANVIL_FIXTURE_wrapper_throwing_factory="$<TARGET_FILE:fixture_sdk_wrapper_throwing_factory>"
+)
+target_link_libraries(anvil_sdk_wrapper_tests
+  PRIVATE anvil::loader
+  PRIVATE anvil::sdk
+  PRIVATE Catch2::Catch2WithMain
+)
+add_dependencies(anvil_sdk_wrapper_tests
+  fixture_sdk_wrapper
+  fixture_sdk_wrapper_throwing_factory
+)
+
+add_executable(anvil_cross_stdlib_host cross_stdlib_host.cpp)
+set_target_properties(anvil_cross_stdlib_host PROPERTIES ENABLE_EXPORTS ON)
+target_compile_features(anvil_cross_stdlib_host PRIVATE cxx_std_23)
+target_compile_options(anvil_cross_stdlib_host PRIVATE ${ANVIL_WARNING_FLAGS})
+target_link_libraries(anvil_cross_stdlib_host
+  PRIVATE anvil::loader
+  PRIVATE anvil::sdk
+)
+add_dependencies(anvil_cross_stdlib_host fixture_sdk_wrapper)
+
+add_test(
+  NAME sdk_wrapper_host
+  COMMAND anvil_cross_stdlib_host $<TARGET_FILE:fixture_sdk_wrapper>
+)
+
+add_test(
+  NAME sdk_wrapper_fixture_contract
+  COMMAND
+    ${CMAKE_COMMAND}
+    -DANVIL_FIXTURE_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/sdk_wrapper.cpp
+    -DANVIL_FIXTURE_LIBRARY=$<TARGET_FILE:fixture_sdk_wrapper>
+    -DANVIL_NM=${CMAKE_NM}
+    -P ${PROJECT_SOURCE_DIR}/cmake/verify_sdk_wrapper_fixture.cmake
+)
+
 add_test(
   NAME sdk_non_pod_span_rejected
   COMMAND
@@ -87,6 +156,28 @@ add_test(
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/non_pod_span.cpp
 )
 set_tests_properties(sdk_non_pod_span_rejected PROPERTIES WILL_FAIL TRUE)
+
+add_test(
+  NAME sdk_temporary_string_rejected
+  COMMAND
+    ${CMAKE_CXX_COMPILER}
+    -std=c++23
+    -fsyntax-only
+    -I${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/temporary_string.cpp
+)
+set_tests_properties(sdk_temporary_string_rejected PROPERTIES WILL_FAIL TRUE)
+
+add_test(
+  NAME sdk_temporary_range_rejected
+  COMMAND
+    ${CMAKE_CXX_COMPILER}
+    -std=c++23
+    -fsyntax-only
+    -I${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/temporary_range.cpp
+)
+set_tests_properties(sdk_temporary_range_rejected PROPERTIES WILL_FAIL TRUE)
 
 add_test(
   NAME sdk_boundary_has_no_standard_library_surface
@@ -121,3 +212,4 @@ endif()
 include(Catch)
 catch_discover_tests(anvil_loader_tests)
 catch_discover_tests(anvil_sdk_tests)
+catch_discover_tests(anvil_sdk_wrapper_tests)

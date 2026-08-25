@@ -150,7 +150,9 @@ that may cross the plugin boundary. Include `<anvil/sdk/types.hpp>` to use
 `anvil::Str`, `anvil::Span<T>`, `anvil::Version`, `anvil::PluginKind`, and
 `anvil::CapabilityTier`. `<anvil/sdk/abi.hpp>` additionally publishes
 `anvil::InterfaceVersion` and the ABI tag. `<anvil/sdk/plugin.hpp>` publishes
-the raw plugin manifest and door-context contract.
+the raw plugin manifest, door context, and `IPlugin` / `IDoor` vtables. Plugin
+authors normally include `<anvil/sdk.hpp>` instead; it is the standard-library
+friendly layer compiled entirely in the plugin's own translation unit.
 
 `Str` and `Span<T>` are borrowed views: the owner of `data` must keep it alive
 for the duration specified by the interface carrying the view. `Span<T>` only
@@ -165,13 +167,41 @@ and its state, leaderboard, and optional-audio traits. `DoorContext` carries an
 opaque `UserId`, session capabilities and dimensions, per-session resource
 limits, and pointers to the session and state-store services. Those service
 interfaces remain opaque until their callable contracts land; no unfinished
-vtable is frozen into plugin interface 1.1.
+service vtable is frozen into plugin interface 1.2.
 
 The boundary headers deliberately contain no standard-library surface types.
 Their size, alignment, offset, and fixed-width assertions compile in every host
-and plugin translation unit, including a dedicated 32-bit CI check. The later
-ergonomic wrapper will convert an author's own standard-library values to these
-raw types without letting those values cross the DSO boundary.
+and plugin translation unit, including a dedicated 32-bit CI check.
+
+The wrapper converts `std::string`, `std::string_view`, C strings, and
+contiguous ranges to borrowed raw views. Conversions from temporary strings and
+ranges are deleted, so the common dangling-borrow mistake does not compile.
+`anvil::sdk::Door<Impl>` owns its manifest strings for the plugin instance's
+lifetime and turns every exception escaping `Impl::run_door(DoorContext)` into
+`PluginStatus::exception` before control returns to the host. A complete plugin
+exports its ABI tag, factory, and plugin-owned destroy function with one macro:
+
+```cpp
+#include <anvil/sdk.hpp>
+
+class ClockDoor final : public anvil::sdk::Door<ClockDoor> {
+public:
+  ClockDoor()
+      : Door({"org.example.clock", "Clock", "A quiet clock", "Example",
+              {1, 0, 0}, anvil::PluginKind::door},
+             {anvil::CapabilityTier::ansi, false, false, false}) {}
+
+  void run_door(anvil::sdk::DoorContext context) {
+    // Ordinary C++ is safe here. Exceptions become a boundary status.
+  }
+};
+
+ANVIL_PLUGIN(ClockDoor);
+```
+
+`Str` returned by the adapter remains valid for the plugin instance's lifetime,
+but the host still copies manifest text before retaining it. Raw contexts and
+views are borrows for the duration of the call only.
 
 `<anvil/sdk/abi.hpp>` defines the fixed-layout `AnvilAbiTag`. A plugin exports
 the complete tag as data with one global-scope declaration:
@@ -186,7 +216,7 @@ The host refuses mismatched magic, an inconsistent structure size, a plugin
 interface outside its accepted ranges, or mismatched sanitizer state. Compiler,
 compiler version, standard-library identity, and language-standard fields are
 retained as diagnostics rather than compatibility gates. The current plugin
-interface is `1.1`; the accepted range is `1.0` through `1.1`.
+interface is `1.2`; the accepted range is `1.0` through `1.2`.
 
 The tag's fixed 16-byte prefix is sufficient to decide compatibility. An older
 tag may therefore be shorter than the host's `AnvilAbiTag`: the loader copies
@@ -245,6 +275,7 @@ independent stream.
 | `0.3.0` | `1.0` |
 | `0.4.0` | `1.0` |
 | `0.5.0` | `1.0–1.1` |
+| `0.6.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one

@@ -1,43 +1,40 @@
 #include <anvil/loader.hpp>
-#include <anvil/sdk/abi.hpp>
-#include <anvil/sdk/plugin.hpp>
-#include <anvil/sdk/types.hpp>
+#include <anvil/sdk.hpp>
 
-#include <cstdint>
-namespace {
+#include <string>
+#include <vector>
 
-struct Plugin {
-  virtual ~Plugin() = default;
-};
+namespace anvil {
 
-} // namespace
+IPlugin::~IPlugin() noexcept = default;
+IDoor::~IDoor() noexcept = default;
+
+} // namespace anvil
 
 auto main() -> int {
-  const auto text = anvil::Str{"external consumer", 17};
-  const auto version = anvil::Version{0, 5, 0};
-  const auto manifest = anvil::PluginManifest{
-      sizeof(anvil::PluginManifest),
-      anvil::PluginId{anvil::Str{"org.example.consumer", 20}},
-      anvil::Str{"Consumer", 8},
-      anvil::Str{"Installed SDK contract check", 28},
-      anvil::Str{"Anvil", 5},
-      version,
-      anvil::PluginKind::door,
-  };
-  if (text.len != 17 || version.minor != 5 ||
-      manifest.struct_size != sizeof(anvil::PluginManifest) ||
-      manifest.id.value.len != 20 ||
-      anvil::PluginKind::door == anvil::PluginKind::verifier) {
+  const std::string text{"external consumer"};
+  const auto borrowed = anvil::sdk::as_str(text);
+  std::vector<unsigned int> values{1, 2, 3};
+  const auto range = anvil::sdk::as_span(values);
+  if (anvil::sdk::as_string_view(borrowed) != text || range.len != 3) {
     return 1;
   }
 
-  const auto result = anvil::loader::load<Plugin>(
-      "/anvil/consumer/this-plugin-does-not-exist.so",
+  auto result = anvil::loader::load<anvil::IPlugin>(
+      ANVIL_CONSUMER_PLUGIN,
       anvil::loader::AbiRequirement<anvil::AnvilAbiTag>{
           anvil::current_abi_tag, anvil::loader::verify_abi_tag,
           anvil::kAbiTagPrefixSize, anvil::loader::abi_tag_declared_size});
+  if (!result) {
+    return 1;
+  }
 
-  return !result && result.error().code == anvil::loader::ErrorCode::open_failed
-             ? 0
-             : 1;
+  anvil::PluginManifest manifest{};
+  if (result->instance->manifest(&manifest) != anvil::PluginStatus::ok ||
+      anvil::sdk::as_string_view(manifest.id.value) != "org.example.consumer") {
+    return 1;
+  }
+
+  auto *door = dynamic_cast<anvil::IDoor *>(result->instance.get());
+  return door == nullptr ? 1 : 0;
 }

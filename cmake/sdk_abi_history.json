@@ -321,6 +321,479 @@
           "methods": []
         }
       ]
+    },
+    {
+      "interface": "1.2",
+      "declarations": [
+        {
+          "kind": "enum",
+          "name": "anvil::AbiCompiler",
+          "underlying_type": "uint32_t",
+          "values": [
+            {
+              "name": "unknown",
+              "value": "0"
+            },
+            {
+              "name": "gcc",
+              "value": "1"
+            },
+            {
+              "name": "clang",
+              "value": "2"
+            }
+          ]
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::AbiSanitizer",
+          "underlying_type": "uint32_t",
+          "values": [
+            {
+              "name": "address",
+              "value": "1"
+            },
+            {
+              "name": "undefined",
+              "value": "2"
+            },
+            {
+              "name": "thread",
+              "value": "4"
+            }
+          ]
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::AbiStandardLibrary",
+          "underlying_type": "uint32_t",
+          "values": [
+            {
+              "name": "unknown",
+              "value": "0"
+            },
+            {
+              "name": "libstdcxx",
+              "value": "1"
+            },
+            {
+              "name": "libcxx",
+              "value": "2"
+            }
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::AnvilAbiTag",
+          "extensible": true,
+          "fields": [
+            {
+              "name": "magic",
+              "type": "uint32_t"
+            },
+            {
+              "name": "struct_size",
+              "type": "uint32_t"
+            },
+            {
+              "name": "interface_major",
+              "type": "uint16_t"
+            },
+            {
+              "name": "interface_minor",
+              "type": "uint16_t"
+            },
+            {
+              "name": "sanitizer_mask",
+              "type": "uint32_t"
+            },
+            {
+              "name": "compiler",
+              "type": "AbiCompiler"
+            },
+            {
+              "name": "compiler_major",
+              "type": "uint32_t"
+            },
+            {
+              "name": "compiler_minor",
+              "type": "uint32_t"
+            },
+            {
+              "name": "compiler_patch",
+              "type": "uint32_t"
+            },
+            {
+              "name": "standard_library",
+              "type": "AbiStandardLibrary"
+            },
+            {
+              "name": "standard_library_version",
+              "type": "uint32_t"
+            },
+            {
+              "name": "language_standard",
+              "type": "uint64_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::Capabilities",
+          "extensible": true,
+          "fields": [
+            {
+              "name": "struct_size",
+              "type": "uint32_t"
+            },
+            {
+              "name": "tier",
+              "type": "CapabilityTier"
+            },
+            {
+              "name": "columns",
+              "type": "uint32_t"
+            },
+            {
+              "name": "rows",
+              "type": "uint32_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::CapabilityTier",
+          "underlying_type": "uint32_t",
+          "values": [
+            {
+              "name": "teletype",
+              "value": "0"
+            },
+            {
+              "name": "ansi",
+              "value": "1"
+            },
+            {
+              "name": "modern",
+              "value": "2"
+            },
+            {
+              "name": "graphics",
+              "value": "3"
+            }
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::DoorContext",
+          "extensible": true,
+          "fields": [
+            {
+              "name": "struct_size",
+              "type": "uint32_t"
+            },
+            {
+              "name": "user",
+              "type": "UserId"
+            },
+            {
+              "name": "session",
+              "type": "ISession *"
+            },
+            {
+              "name": "caps",
+              "type": "Capabilities"
+            },
+            {
+              "name": "state",
+              "type": "IStateStore *"
+            },
+            {
+              "name": "limits",
+              "type": "ResourceLimits"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::DoorManifest",
+          "extensible": true,
+          "fields": [
+            {
+              "name": "struct_size",
+              "type": "uint32_t"
+            },
+            {
+              "name": "min_tier",
+              "type": "CapabilityTier"
+            },
+            {
+              "name": "persists_state",
+              "type": "uint8_t"
+            },
+            {
+              "name": "has_leaderboard",
+              "type": "uint8_t"
+            },
+            {
+              "name": "audio_enhanced",
+              "type": "uint8_t"
+            },
+            {
+              "name": "reserved",
+              "type": "uint8_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "interface",
+          "name": "anvil::IDoor",
+          "extensible": false,
+          "fields": [],
+          "methods": [
+            {
+              "name": "door_manifest",
+              "type": "auto (DoorManifest *) const noexcept -> PluginStatus",
+              "virtual": true,
+              "pure": true
+            },
+            {
+              "name": "run",
+              "type": "auto (const DoorContext *) noexcept -> PluginStatus",
+              "virtual": true,
+              "pure": true
+            },
+            {
+              "name": "~IDoor",
+              "type": "void () noexcept",
+              "virtual": true,
+              "pure": false
+            }
+          ]
+        },
+        {
+          "kind": "interface",
+          "name": "anvil::IPlugin",
+          "extensible": false,
+          "fields": [],
+          "methods": [
+            {
+              "name": "manifest",
+              "type": "auto (PluginManifest *) const noexcept -> PluginStatus",
+              "virtual": true,
+              "pure": true
+            },
+            {
+              "name": "~IPlugin",
+              "type": "void () noexcept",
+              "virtual": true,
+              "pure": false
+            }
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::InterfaceVersion",
+          "extensible": false,
+          "fields": [
+            {
+              "name": "major",
+              "type": "uint16_t"
+            },
+            {
+              "name": "minor",
+              "type": "uint16_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::PluginId",
+          "extensible": false,
+          "fields": [
+            {
+              "name": "value",
+              "type": "Str"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::PluginKind",
+          "underlying_type": "uint32_t",
+          "values": [
+            {
+              "name": "door",
+              "value": "0"
+            },
+            {
+              "name": "board_service",
+              "value": "1"
+            },
+            {
+              "name": "verifier",
+              "value": "2"
+            }
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::PluginManifest",
+          "extensible": true,
+          "fields": [
+            {
+              "name": "struct_size",
+              "type": "uint32_t"
+            },
+            {
+              "name": "id",
+              "type": "PluginId"
+            },
+            {
+              "name": "name",
+              "type": "Str"
+            },
+            {
+              "name": "description",
+              "type": "Str"
+            },
+            {
+              "name": "author",
+              "type": "Str"
+            },
+            {
+              "name": "version",
+              "type": "Version"
+            },
+            {
+              "name": "kind",
+              "type": "PluginKind"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::PluginStatus",
+          "underlying_type": "uint32_t",
+          "values": [
+            {
+              "name": "ok",
+              "value": "0"
+            },
+            {
+              "name": "invalid_argument",
+              "value": "1"
+            },
+            {
+              "name": "exception",
+              "value": "2"
+            }
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::ResourceLimits",
+          "extensible": true,
+          "fields": [
+            {
+              "name": "struct_size",
+              "type": "uint32_t"
+            },
+            {
+              "name": "memory_bytes",
+              "type": "uint64_t"
+            },
+            {
+              "name": "cpu_time_ns",
+              "type": "uint64_t"
+            },
+            {
+              "name": "output_bytes_per_second",
+              "type": "uint64_t"
+            },
+            {
+              "name": "image_bytes",
+              "type": "uint64_t"
+            },
+            {
+              "name": "duration_ns",
+              "type": "uint64_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::Span",
+          "extensible": false,
+          "fields": [
+            {
+              "name": "data",
+              "type": "T *"
+            },
+            {
+              "name": "len",
+              "type": "uint64_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::Str",
+          "extensible": false,
+          "fields": [
+            {
+              "name": "data",
+              "type": "const char *"
+            },
+            {
+              "name": "len",
+              "type": "uint64_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::UserId",
+          "extensible": false,
+          "fields": [
+            {
+              "name": "value",
+              "type": "uint64_t"
+            }
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::Version",
+          "extensible": false,
+          "fields": [
+            {
+              "name": "major",
+              "type": "uint16_t"
+            },
+            {
+              "name": "minor",
+              "type": "uint16_t"
+            },
+            {
+              "name": "patch",
+              "type": "uint16_t"
+            }
+          ],
+          "methods": []
+        }
+      ]
     }
   ]
 }

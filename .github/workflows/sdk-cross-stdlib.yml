@@ -1,0 +1,57 @@
+name: SDK cross-stdlib
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sdk-cross-stdlib.yml"
+      - "CMakeLists.txt"
+      - "cmake/sdk_abi_history.json"
+      - "cmake/verify_sdk_abi.py"
+      - "include/anvil/loader.hpp"
+      - "include/anvil/sdk.hpp"
+      - "include/anvil/sdk/**"
+      - "src/loader.cpp"
+      - "test/**"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gcc-host-clang-libcxx-plugin:
+    name: GCC host / Clang libc++ plugin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Clang 20 and libc++
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "$CLANG_VERSION"
+          sudo apt-get install --yes libc++-20-dev libc++abi-20-dev
+      - name: Build the libstdc++ host
+        env:
+          CXX: g++-13
+        run: |
+          cmake -S . -B build-cross -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build-cross --target anvil_cross_stdlib_host --parallel
+      - name: Build the libc++ plugin
+        run: |
+          mkdir -p build-cross/foreign
+          clang++-20 -std=c++23 -stdlib=libc++ -fPIC -shared \
+            -fvisibility=hidden -fvisibility-inlines-hidden \
+            -Iinclude test/fixtures/sdk_wrapper.cpp \
+            -o build-cross/foreign/fixture_sdk_wrapper.so
+          ldd build-cross/foreign/fixture_sdk_wrapper.so | grep 'libc++.so'
+      - name: Exercise every plugin boundary method
+        run: >
+          build-cross/test/anvil_cross_stdlib_host
+          build-cross/foreign/fixture_sdk_wrapper.so
