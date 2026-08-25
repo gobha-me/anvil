@@ -424,6 +424,30 @@ Three further requirements:
 Illustrative, in SDK types. The ergonomic wrapper an author actually writes against is a layer above this.
 
 ```cpp
+struct PluginId {                // borrowed textual identifier; copied by host
+  Str value;
+};
+
+struct UserId {                  // opaque host identity
+  uint64_t value;
+};
+
+struct Capabilities {
+  uint32_t       struct_size;
+  CapabilityTier tier;
+  uint32_t       columns;
+  uint32_t       rows;
+};
+
+struct ResourceLimits {
+  uint32_t struct_size;
+  uint64_t memory_bytes;
+  uint64_t cpu_time_ns;
+  uint64_t output_bytes_per_second;
+  uint64_t image_bytes;
+  uint64_t duration_ns;
+};
+
 struct PluginManifest {          // POD, returned by value into host storage
   uint32_t       struct_size;
   PluginId       id;
@@ -440,6 +464,7 @@ struct DoorManifest {
   uint8_t        persists_state; // needs plugin_state storage (§9.2)
   uint8_t        has_leaderboard;
   uint8_t        audio_enhanced; // uses audio if available; never required
+  uint8_t        reserved;       // explicit zero instead of implicit padding
 };
 
 struct DoorContext {
@@ -451,6 +476,10 @@ struct DoorContext {
   ResourceLimits limits;
 };
 ```
+
+`ISession` and `IStateStore` are opaque pointers in this first raw contract.
+Their callable vtables land with the behavior that owns them; this avoids
+publishing placeholder methods that would immediately become permanent ABI.
 
 A door is entered, runs its own loop against the session, and returns an exit status. The board reclaims the screen on return regardless of how the door exits.
 

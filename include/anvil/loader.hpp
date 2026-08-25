@@ -50,7 +50,7 @@ struct InterfaceVersionRange {
 
 inline constexpr std::array<InterfaceVersionRange, 1>
     kAcceptedPluginInterfaceVersions{InterfaceVersionRange{
-        kPluginInterfaceVersion, kPluginInterfaceVersion}};
+        InterfaceVersion{kPluginInterfaceMajor, 0}, kPluginInterfaceVersion}};
 
 [[nodiscard]] auto supports_interface_version(
     InterfaceVersion version,

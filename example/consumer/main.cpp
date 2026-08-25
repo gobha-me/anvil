@@ -1,5 +1,6 @@
 #include <anvil/loader.hpp>
 #include <anvil/sdk/abi.hpp>
+#include <anvil/sdk/plugin.hpp>
 #include <anvil/sdk/types.hpp>
 
 #include <cstdint>
@@ -13,8 +14,19 @@ struct Plugin {
 
 auto main() -> int {
   const auto text = anvil::Str{"external consumer", 17};
-  const auto version = anvil::Version{0, 4, 0};
-  if (text.len != 17 || version.minor != 4 ||
+  const auto version = anvil::Version{0, 5, 0};
+  const auto manifest = anvil::PluginManifest{
+      sizeof(anvil::PluginManifest),
+      anvil::PluginId{anvil::Str{"org.example.consumer", 20}},
+      anvil::Str{"Consumer", 8},
+      anvil::Str{"Installed SDK contract check", 28},
+      anvil::Str{"Anvil", 5},
+      version,
+      anvil::PluginKind::door,
+  };
+  if (text.len != 17 || version.minor != 5 ||
+      manifest.struct_size != sizeof(anvil::PluginManifest) ||
+      manifest.id.value.len != 20 ||
       anvil::PluginKind::door == anvil::PluginKind::verifier) {
     return 1;
   }

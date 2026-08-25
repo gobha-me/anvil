@@ -33,6 +33,16 @@ def interface(methods: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def record(name: str, fields: list[dict[str, str]]) -> dict[str, object]:
+    return {
+        "kind": "record",
+        "name": name,
+        "extensible": True,
+        "fields": fields,
+        "methods": [],
+    }
+
+
 def history(*snapshots: tuple[str, list[dict[str, object]]]) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -74,6 +84,52 @@ class AbiHistoryTests(unittest.TestCase):
         changed = interface([method("replacement")])
 
         verify_sdk_abi.validate_history(history(("1.0", [old]), ("2.0", [changed])))
+
+    def test_adding_a_record_with_a_minor_bump_is_allowed(self) -> None:
+        added = record(
+            "anvil::Manifest",
+            [
+                {"name": "struct_size", "type": "uint32_t"},
+                {"name": "id", "type": "uint64_t"},
+            ],
+        )
+
+        verify_sdk_abi.validate_history(history(("1.0", []), ("1.1", [added])))
+
+    def test_adding_a_record_without_a_version_bump_is_rejected(self) -> None:
+        added = record(
+            "anvil::Manifest",
+            [{"name": "struct_size", "type": "uint32_t"}],
+        )
+        golden = history(("1.0", []))
+
+        with self.assertRaisesRegex(
+            verify_sdk_abi.AbiHistoryError, "without a new interface snapshot"
+        ):
+            verify_sdk_abi.validate_current(golden, (1, 0), [added])
+
+    def test_reordering_record_fields_with_a_minor_bump_is_rejected(self) -> None:
+        old = record(
+            "anvil::Manifest",
+            [
+                {"name": "struct_size", "type": "uint32_t"},
+                {"name": "id", "type": "uint64_t"},
+            ],
+        )
+        reordered = record(
+            "anvil::Manifest",
+            [
+                {"name": "id", "type": "uint64_t"},
+                {"name": "struct_size", "type": "uint32_t"},
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            verify_sdk_abi.AbiHistoryError, "require a major version"
+        ):
+            verify_sdk_abi.validate_history(
+                history(("1.0", [old]), ("1.1", [reordered]))
+            )
 
 
 if __name__ == "__main__":
