@@ -45,7 +45,7 @@ def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
 
 def start_session(port: int, client_key: pathlib.Path) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
-        ssh_command(port, client_key) + ["-T"],
+        ssh_command(port, client_key) + ["-tt"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -124,7 +124,7 @@ def main() -> int:
             assert idle_session.stdin is not None
             idle_session.stdin.write(b"awake\n")
             idle_session.stdin.flush()
-            read_until(idle_session, b"awake\n", 2)
+            read_until(idle_session, b"awake", 2)
             read_until(idle_session, b"idle session will close in 2 seconds", 3)
             output, error = wait_for_session_message(
                 idle_session, b"session closed after the idle timeout", 4
@@ -145,7 +145,7 @@ def main() -> int:
             wait_for_no_children(idle_server)
             normal = shell_session(ssh_command(idle_port, client_key), b"still-alive\n")
             assert normal.returncode == 0, normal
-            assert b"still-alive\n" in normal.stdout, normal.stdout
+            assert b"still-alive" in normal.stdout, normal.stdout
         finally:
             for session in sessions:
                 stop_session(session)
