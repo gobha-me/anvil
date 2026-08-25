@@ -41,7 +41,7 @@ jobs:
         env:
           CXX: g++-13
         run: |
-          cmake -S . -B build-cross -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build-cross -DCMAKE_BUILD_TYPE=Debug -DANVIL_SERVER=OFF
           cmake --build build-cross --target anvil_cross_stdlib_host --parallel
       - name: Build the libc++ plugin
         run: |

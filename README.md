@@ -11,8 +11,8 @@ games served to anyone with a terminal — built entirely on
 [termforge](https://github.com/gobha-me/termforge), C++23, in a single hardened
 container.
 
-> **Status: foundations.** The standalone plugin loader and stable plugin SDK
-> boundary types are implemented; the BBS server remains in design. See
+> **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
+> boundary types, and process-isolated SSH echo transport are implemented. See
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the
 > issue tracker for the work breakdown.
 
@@ -46,13 +46,46 @@ shell, so there is nothing to escape to. Docker is packaging, not a security
 boundary.
 
 ```
-  SSH clients ──▶ libssh server (accept + auth)
+  SSH clients ──▶ libssh supervisor (accept + auth)
                         │
                         ▼
-                 Session coroutine ──▶ Shared services ──▶ SQLite
-                 (one per connection)   (boards, doors,     (volume)
-                                         users)
+                 Session worker ──────▶ Shared services ──▶ SQLite
+                 (process-isolated M0;   (boards, doors,     (volume)
+                  pooled coroutines      users)
+                  remain the target)
 ```
+
+## M0 SSH transport
+
+The `anvil` executable listens on one address and port, accepts public-key
+authentication only, and starts one isolated worker process per connection.
+Its temporary M0 shell writes a session greeting and echoes input. SSH `exec`
+and subsystem requests are rejected with exit status 126; no system shell or
+subsystem is reachable.
+
+Build and run it with an unencrypted OpenSSH host key and one or more public
+key mappings:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+
+ssh-keygen -t ed25519 -N '' -f host_key
+./build/anvil \
+  --bind-address 127.0.0.1 \
+  --port 2222 \
+  --max-sessions 64 \
+  --host-key host_key \
+  --authorized-key demo="$HOME/.ssh/id_ed25519.pub"
+```
+
+Each authorized-key file must contain exactly one ordinary OpenSSH public-key
+line; repeat `--authorized-key USER=PATH` to allow additional users or keys.
+The server refuses symlinked key files, oversized or malformed key material,
+and host private keys accessible by group or others. Send `SIGINT` or `SIGTERM`
+to stop accepting connections and terminate/reap the remaining workers. The
+session limit bounds concurrent workers; excess connections remain in the
+kernel listen backlog until capacity becomes available.
 
 ## Design pillars
 
@@ -276,6 +309,7 @@ independent stream.
 | `0.4.0` | `1.0` |
 | `0.5.0` | `1.0–1.1` |
 | `0.6.0` | `1.0–1.2` |
+| `0.7.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one

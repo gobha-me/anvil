@@ -213,3 +213,23 @@ include(Catch)
 catch_discover_tests(anvil_loader_tests)
 catch_discover_tests(anvil_sdk_tests)
 catch_discover_tests(anvil_sdk_wrapper_tests)
+
+if(ANVIL_SERVER)
+  add_executable(anvil_server_tests test_server.cpp)
+  target_compile_features(anvil_server_tests PRIVATE cxx_std_23)
+  target_compile_options(anvil_server_tests PRIVATE ${ANVIL_WARNING_FLAGS})
+  target_link_libraries(anvil_server_tests
+    PRIVATE anvil_server
+    PRIVATE Catch2::Catch2WithMain
+  )
+  catch_discover_tests(anvil_server_tests)
+
+  add_test(
+    NAME ssh_server_end_to_end
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_ssh_server.py
+      $<TARGET_FILE:anvil>
+  )
+  set_tests_properties(ssh_server_end_to_end PROPERTIES TIMEOUT 45)
+endif()
