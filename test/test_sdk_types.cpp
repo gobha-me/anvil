@@ -30,6 +30,9 @@ static_assert(std::is_standard_layout_v<anvil::Version>);
 static_assert(std::is_aggregate_v<anvil::AnvilAbiTag>);
 static_assert(std::is_trivially_copyable_v<anvil::AnvilAbiTag>);
 static_assert(std::is_standard_layout_v<anvil::AnvilAbiTag>);
+static_assert(std::is_aggregate_v<anvil::InterfaceVersion>);
+static_assert(std::is_trivially_copyable_v<anvil::InterfaceVersion>);
+static_assert(std::is_standard_layout_v<anvil::InterfaceVersion>);
 static_assert(
     std::is_same_v<std::underlying_type_t<anvil::AbiCompiler>, std::uint32_t>);
 static_assert(std::is_same_v<std::underlying_type_t<anvil::AbiStandardLibrary>,
@@ -108,6 +111,13 @@ TEST_CASE("the SDK macro exports the translation unit's complete ABI tag") {
         anvil::current_abi_tag.standard_library_version);
   CHECK(anvil_abi_tag.language_standard ==
         anvil::current_abi_tag.language_standard);
+}
+
+TEST_CASE("the published interface version matches the ABI tag") {
+  CHECK(anvil::kPluginInterfaceVersion.major ==
+        anvil::current_abi_tag.interface_major);
+  CHECK(anvil::kPluginInterfaceVersion.minor ==
+        anvil::current_abi_tag.interface_minor);
 }
 
 TEST_CASE("the current ABI tag describes its build toolchain") {

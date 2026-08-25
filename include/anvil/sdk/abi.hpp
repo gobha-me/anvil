@@ -9,6 +9,14 @@ inline constexpr uint32_t kAbiMagic{0x414E564CUL};
 inline constexpr uint16_t kPluginInterfaceMajor{1};
 inline constexpr uint16_t kPluginInterfaceMinor{0};
 
+struct InterfaceVersion {
+  uint16_t major;
+  uint16_t minor;
+};
+
+inline constexpr InterfaceVersion kPluginInterfaceVersion{
+    kPluginInterfaceMajor, kPluginInterfaceMinor};
+
 enum class AbiCompiler : uint32_t {
   unknown = 0,
   gcc = 1,
@@ -46,6 +54,12 @@ struct AnvilAbiTag {
 
 static_assert(__is_trivially_copyable(AnvilAbiTag));
 static_assert(__is_standard_layout(AnvilAbiTag));
+static_assert(__is_trivially_copyable(InterfaceVersion));
+static_assert(__is_standard_layout(InterfaceVersion));
+static_assert(__builtin_offsetof(InterfaceVersion, major) == 0);
+static_assert(__builtin_offsetof(InterfaceVersion, minor) == 2);
+static_assert(sizeof(InterfaceVersion) == 4);
+static_assert(alignof(InterfaceVersion) == alignof(uint16_t));
 static_assert(__builtin_offsetof(AnvilAbiTag, magic) == 0);
 static_assert(__builtin_offsetof(AnvilAbiTag, struct_size) == 4);
 static_assert(__builtin_offsetof(AnvilAbiTag, interface_major) == 8);
@@ -56,14 +70,21 @@ static_assert(__builtin_offsetof(AnvilAbiTag, compiler_major) == 20);
 static_assert(__builtin_offsetof(AnvilAbiTag, compiler_minor) == 24);
 static_assert(__builtin_offsetof(AnvilAbiTag, compiler_patch) == 28);
 static_assert(__builtin_offsetof(AnvilAbiTag, standard_library) == 32);
-static_assert(
-    __builtin_offsetof(AnvilAbiTag, standard_library_version) == 36);
+static_assert(__builtin_offsetof(AnvilAbiTag, standard_library_version) == 36);
 static_assert(__builtin_offsetof(AnvilAbiTag, language_standard) == 40);
 static_assert(sizeof(AnvilAbiTag) == 48);
 static_assert(alignof(AnvilAbiTag) == alignof(uint64_t));
 static_assert(sizeof(AbiCompiler) == sizeof(uint32_t));
 static_assert(sizeof(AbiStandardLibrary) == sizeof(uint32_t));
 static_assert(sizeof(AbiSanitizer) == sizeof(uint32_t));
+
+// Every supported tag version preserves this prefix. Later fields may be
+// appended, but a loader must not read them unless both the declaration and
+// the ELF symbol contain the complete field.
+inline constexpr uint32_t kAbiTagPrefixSize{
+    __builtin_offsetof(AnvilAbiTag, sanitizer_mask) +
+    sizeof(AnvilAbiTag::sanitizer_mask)};
+static_assert(kAbiTagPrefixSize == 16);
 
 } // namespace anvil
 
@@ -110,8 +131,7 @@ static_assert(sizeof(AbiSanitizer) == sizeof(uint32_t));
 #if defined(__SANITIZE_ADDRESS__) && !defined(ANVIL_DETAIL_ADDRESS_SANITIZER)
 #define ANVIL_DETAIL_ADDRESS_SANITIZER (1U << 0U)
 #endif
-#if defined(ANVIL_ABI_SANITIZER_UNDEFINED) &&                             \
-    ANVIL_ABI_SANITIZER_UNDEFINED &&                                     \
+#if defined(ANVIL_ABI_SANITIZER_UNDEFINED) && ANVIL_ABI_SANITIZER_UNDEFINED && \
     !defined(ANVIL_DETAIL_UNDEFINED_SANITIZER)
 #define ANVIL_DETAIL_UNDEFINED_SANITIZER (1U << 1U)
 #endif
@@ -153,12 +173,13 @@ constexpr AnvilAbiTag current_abi_tag{
 
 // Invoke once at global scope in the plugin translation unit.
 #if defined(__GNUC__) || defined(__clang__)
-#define ANVIL_PLUGIN_ABI_TAG()                                              \
-  extern "C" __attribute__((visibility("default"))) constinit const       \
-      ::anvil::AnvilAbiTag anvil_abi_tag = ::anvil::current_abi_tag
+#define ANVIL_PLUGIN_ABI_TAG()                                                 \
+  extern "C" __attribute__((visibility(                                        \
+      "default"))) constinit const ::anvil::AnvilAbiTag anvil_abi_tag =        \
+      ::anvil::current_abi_tag
 #else
-#define ANVIL_PLUGIN_ABI_TAG()                                              \
-  extern "C" constinit const ::anvil::AnvilAbiTag anvil_abi_tag =          \
+#define ANVIL_PLUGIN_ABI_TAG()                                                 \
+  extern "C" constinit const ::anvil::AnvilAbiTag anvil_abi_tag =              \
       ::anvil::current_abi_tag
 #endif
 

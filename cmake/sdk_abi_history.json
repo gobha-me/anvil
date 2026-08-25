@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "snapshots": [
+    {
+      "interface": "1.0",
+      "declarations": [
+        {
+          "kind": "enum",
+          "name": "anvil::AbiCompiler",
+          "underlying_type": "uint32_t",
+          "values": [
+            {"name": "unknown", "value": "0"},
+            {"name": "gcc", "value": "1"},
+            {"name": "clang", "value": "2"}
+          ]
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::AbiSanitizer",
+          "underlying_type": "uint32_t",
+          "values": [
+            {"name": "address", "value": "1"},
+            {"name": "undefined", "value": "2"},
+            {"name": "thread", "value": "4"}
+          ]
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::AbiStandardLibrary",
+          "underlying_type": "uint32_t",
+          "values": [
+            {"name": "unknown", "value": "0"},
+            {"name": "libstdcxx", "value": "1"},
+            {"name": "libcxx", "value": "2"}
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::AnvilAbiTag",
+          "extensible": true,
+          "fields": [
+            {"name": "magic", "type": "uint32_t"},
+            {"name": "struct_size", "type": "uint32_t"},
+            {"name": "interface_major", "type": "uint16_t"},
+            {"name": "interface_minor", "type": "uint16_t"},
+            {"name": "sanitizer_mask", "type": "uint32_t"},
+            {"name": "compiler", "type": "AbiCompiler"},
+            {"name": "compiler_major", "type": "uint32_t"},
+            {"name": "compiler_minor", "type": "uint32_t"},
+            {"name": "compiler_patch", "type": "uint32_t"},
+            {"name": "standard_library", "type": "AbiStandardLibrary"},
+            {"name": "standard_library_version", "type": "uint32_t"},
+            {"name": "language_standard", "type": "uint64_t"}
+          ],
+          "methods": []
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::CapabilityTier",
+          "underlying_type": "uint32_t",
+          "values": [
+            {"name": "teletype", "value": "0"},
+            {"name": "ansi", "value": "1"},
+            {"name": "modern", "value": "2"},
+            {"name": "graphics", "value": "3"}
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::InterfaceVersion",
+          "extensible": false,
+          "fields": [
+            {"name": "major", "type": "uint16_t"},
+            {"name": "minor", "type": "uint16_t"}
+          ],
+          "methods": []
+        },
+        {
+          "kind": "enum",
+          "name": "anvil::PluginKind",
+          "underlying_type": "uint32_t",
+          "values": [
+            {"name": "door", "value": "0"},
+            {"name": "board_service", "value": "1"},
+            {"name": "verifier", "value": "2"}
+          ]
+        },
+        {
+          "kind": "record",
+          "name": "anvil::Span",
+          "extensible": false,
+          "fields": [
+            {"name": "data", "type": "T *"},
+            {"name": "len", "type": "uint64_t"}
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::Str",
+          "extensible": false,
+          "fields": [
+            {"name": "data", "type": "const char *"},
+            {"name": "len", "type": "uint64_t"}
+          ],
+          "methods": []
+        },
+        {
+          "kind": "record",
+          "name": "anvil::Version",
+          "extensible": false,
+          "fields": [
+            {"name": "major", "type": "uint16_t"},
+            {"name": "minor", "type": "uint16_t"},
+            {"name": "patch", "type": "uint16_t"}
+          ],
+          "methods": []
+        }
+      ]
+    }
+  ]
+}

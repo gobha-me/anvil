@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <link.h>
 
+#include <algorithm>
 #include <sstream>
 #include <utility>
 
@@ -15,6 +16,26 @@ namespace {
   std::ostringstream message;
   message << field << ": expected " << expected << ", found " << found;
   return std::unexpected(message.str());
+}
+
+[[nodiscard]] auto version_text(InterfaceVersion version) -> std::string {
+  return std::to_string(version.major) + "." + std::to_string(version.minor);
+}
+
+[[nodiscard]] auto
+accepted_versions_text(std::span<const InterfaceVersionRange> accepted)
+    -> std::string {
+  std::ostringstream out;
+  for (std::size_t index{}; index < accepted.size(); ++index) {
+    if (index != 0)
+      out << ", ";
+    out << version_text(accepted[index].minimum);
+    if (accepted[index].minimum.major != accepted[index].maximum.major ||
+        accepted[index].minimum.minor != accepted[index].maximum.minor) {
+      out << '-' << version_text(accepted[index].maximum);
+    }
+  }
+  return out.str();
 }
 
 [[nodiscard]] auto valid_symbol_name(const std::string &symbol) -> bool {
@@ -41,19 +62,48 @@ namespace {
 
 } // namespace
 
-auto verify_abi_tag(const AnvilAbiTag &expected, const AnvilAbiTag &found)
+auto supports_interface_version(
+    InterfaceVersion version,
+    std::span<const InterfaceVersionRange> accepted) noexcept -> bool {
+  return std::ranges::any_of(accepted, [version](const auto &range) {
+    return range.minimum.major == range.maximum.major &&
+           version.major == range.minimum.major &&
+           range.minimum.minor <= range.maximum.minor &&
+           version.minor >= range.minimum.minor &&
+           version.minor <= range.maximum.minor;
+  });
+}
+
+auto verify_abi_tag(const AnvilAbiTag &expected, const AnvilAbiTag &found,
+                    std::size_t readable_size)
     -> std::expected<void, std::string> {
+  if (readable_size < kAbiTagPrefixSize) {
+    return mismatch("storage_size", kAbiTagPrefixSize, readable_size);
+  }
   if (found.magic != expected.magic)
     return mismatch("magic", expected.magic, found.magic);
-  if (found.struct_size < expected.struct_size)
-    return mismatch("struct_size", expected.struct_size, found.struct_size);
-  if (found.interface_major != expected.interface_major) {
-    return mismatch("interface_major", expected.interface_major,
-                    found.interface_major);
+  if (found.struct_size < kAbiTagPrefixSize) {
+    return mismatch("struct_size", kAbiTagPrefixSize, found.struct_size);
   }
-  if (found.interface_minor != expected.interface_minor) {
-    return mismatch("interface_minor", expected.interface_minor,
-                    found.interface_minor);
+  if (found.struct_size > readable_size) {
+    return std::unexpected(
+        "struct_size: declared " + std::to_string(found.struct_size) +
+        " bytes, readable storage contains " + std::to_string(readable_size));
+  }
+  if (!abi_tag_field_available(found, readable_size,
+                               __builtin_offsetof(AnvilAbiTag, sanitizer_mask),
+                               sizeof(found.sanitizer_mask))) {
+    return std::unexpected("sanitizer_mask: field is not present");
+  }
+
+  const auto found_version =
+      InterfaceVersion{found.interface_major, found.interface_minor};
+  if (!supports_interface_version(found_version,
+                                  kAcceptedPluginInterfaceVersions)) {
+    return std::unexpected(
+        "interface_version: accepted " +
+        accepted_versions_text(kAcceptedPluginInterfaceVersions) + ", found " +
+        version_text(found_version));
   }
   if (found.sanitizer_mask != expected.sanitizer_mask) {
     return mismatch("sanitizer_mask", expected.sanitizer_mask,

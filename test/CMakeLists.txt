@@ -1,5 +1,7 @@
 set(_fixture_sources
   valid
+  compatible_short
+  lying_size
   mismatched
   mismatched_sanitizer
   missing_tag
@@ -93,6 +95,28 @@ add_test(
     -DANVIL_SDK_DIR=${PROJECT_SOURCE_DIR}/include/anvil/sdk
     -P ${PROJECT_SOURCE_DIR}/cmake/verify_sdk_boundary.cmake
 )
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(
+  NAME sdk_abi_history_rules
+  COMMAND
+    ${Python3_EXECUTABLE} -B
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_sdk_abi_history.py
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 20)
+  add_test(
+    NAME sdk_abi_history_matches_headers
+    COMMAND
+      ${Python3_EXECUTABLE}
+      -B
+      ${PROJECT_SOURCE_DIR}/cmake/verify_sdk_abi.py
+      --compiler ${CMAKE_CXX_COMPILER}
+      --include-dir ${PROJECT_SOURCE_DIR}/include
+      --history ${PROJECT_SOURCE_DIR}/cmake/sdk_abi_history.json
+  )
+endif()
 
 include(Catch)
 catch_discover_tests(anvil_loader_tests)
