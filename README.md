@@ -12,8 +12,9 @@ games served to anyone with a terminal — built entirely on
 container.
 
 > **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
-> boundary types, process-isolated SSH echo transport, persistent host identity,
-> and bounded session lifecycles are implemented. See
+> boundary types, process-isolated TermForge SSH session, persistent host
+> identity, live remote resize handling, and bounded session lifecycles are
+> implemented. See
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
 > tracker for the work breakdown.
 
@@ -60,9 +61,12 @@ boundary.
 
 The `anvil` executable listens on one address and port, accepts public-key
 authentication only, and starts one isolated worker process per connection.
-Its temporary M0 shell writes a session greeting and echoes input. SSH `exec`
-and subsystem requests are rejected with exit status 126; no system shell or
-subsystem is reachable.
+Its temporary M0 shell is a demand-rendered TermForge screen that reports the
+remote dimensions and echoes input. The initial size and every SSH
+`window-change` are bounded before reaching the renderer; invalid changes keep
+the last valid size. An interactive PTY is required. SSH sessions started with
+`-T`, `exec`, and subsystem requests are rejected with exit status 126; no
+system shell or subsystem is reachable.
 
 Build and run it with a persistent host-key path and one or more public-key
 mappings:
@@ -108,6 +112,9 @@ count as activity. A separate 24-hour cap applies even to active sessions.
 Operators can set all three positive durations in whole seconds with
 `--idle-timeout-seconds`, `--idle-warning-seconds`, and
 `--session-cap-seconds`; the warning must remain shorter than the idle timeout.
+Each completed shell logs its rendered-frame count, accepted frames, byte
+breakdown, and channel-open-to-first-frame latency. These are the internal M0
+measurements that the future metrics endpoint will expose.
 
 ## Design pillars
 

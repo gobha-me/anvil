@@ -241,4 +241,13 @@ if(ANVIL_SERVER)
       $<TARGET_FILE:anvil>
   )
   set_tests_properties(ssh_session_lifecycle PROPERTIES TIMEOUT 45)
+
+  add_test(
+    NAME ssh_pty_resize
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_ssh_resize.py
+      $<TARGET_FILE:anvil>
+  )
+  set_tests_properties(ssh_pty_resize PROPERTIES TIMEOUT 45)
 endif()

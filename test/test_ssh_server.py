@@ -119,17 +119,17 @@ def ssh_command(port: int, identity: pathlib.Path, user: str = "tester") -> list
 
 
 def shell_session(base: list[str], payload: bytes) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(base + ["-T"], input=payload, capture_output=True,
+    return subprocess.run(base + ["-tt"], input=payload, capture_output=True,
                           timeout=15, check=False)
 
 
 def assert_shell(result: subprocess.CompletedProcess[bytes], own: bytes,
                  foreign: bytes | None = None) -> int:
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
-    assert own in result.stdout, result.stdout
+    assert own.rstrip(b"\n") in result.stdout, result.stdout
     if foreign is not None:
         assert foreign not in result.stdout, result.stdout
-    match = re.search(rb"Anvil M0 echo session ([0-9]+)\r?\n", result.stdout)
+    match = re.search(rb"Anvil M0 echo session ([0-9]+)", result.stdout)
     assert match is not None, result.stdout
     return int(match.group(1))
 
@@ -245,6 +245,11 @@ def main() -> int:
             first_host_key = scanned_host_key(port)
             assert first_host_key[0] == b"ssh-ed25519"
             base = ssh_command(port, client_key)
+
+            no_pty = subprocess.run(base + ["-T"], input=b"ignored\n",
+                                    capture_output=True, timeout=15, check=False)
+            assert no_pty.returncode != 0, no_pty
+            assert b"requires an interactive PTY" in no_pty.stderr, no_pty.stderr
 
             first = shell_session(base, b"first-session\n")
             assert_shell(first, b"first-session\n")

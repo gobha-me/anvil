@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.9.0 LANGUAGES CXX)
+project(anvil VERSION 0.10.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -57,14 +57,19 @@ target_link_libraries(anvil_loader PRIVATE ${CMAKE_DL_LIBS})
 if(ANVIL_SERVER)
   enable_language(C)
   include(cmake/deps/libssh.cmake)
+  include(cmake/deps/termforge.cmake)
 
   add_library(anvil_server STATIC
     src/server.cpp
+    src/terminal_session.cpp
   )
   target_compile_features(anvil_server PUBLIC cxx_std_23)
   target_compile_options(anvil_server PRIVATE ${ANVIL_WARNING_FLAGS})
   target_include_directories(anvil_server PUBLIC ${PROJECT_SOURCE_DIR}/src)
-  target_link_libraries(anvil_server PUBLIC ${ANVIL_LIBSSH_TARGET})
+  target_link_libraries(anvil_server
+    PUBLIC ${ANVIL_LIBSSH_TARGET}
+    PRIVATE termforge::lib
+  )
 
   add_executable(anvil src/main.cpp)
   target_compile_features(anvil PRIVATE cxx_std_23)
