@@ -12,9 +12,10 @@ games served to anyone with a terminal — built entirely on
 container.
 
 > **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
-> boundary types, process-isolated SSH echo transport, and persistent host
-> identity are implemented. See [`anvil-bbs-design.md`](anvil-bbs-design.md)
-> for the architecture and the issue tracker for the work breakdown.
+> boundary types, process-isolated SSH echo transport, persistent host identity,
+> and bounded session lifecycles are implemented. See
+> [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
+> tracker for the work breakdown.
 
 ---
 
@@ -75,6 +76,9 @@ install -d -m 700 state
   --bind-address 127.0.0.1 \
   --port 2222 \
   --max-sessions 64 \
+  --idle-timeout-seconds 300 \
+  --idle-warning-seconds 30 \
+  --session-cap-seconds 86400 \
   --host-key state/host_key \
   --authorized-key demo="$HOME/.ssh/id_ed25519.pub"
 ```
@@ -92,9 +96,18 @@ Each authorized-key file must contain exactly one ordinary OpenSSH public-key
 line; repeat `--authorized-key USER=PATH` to allow additional users or keys.
 The server refuses symlinked key files, oversized or malformed key material,
 and host private keys accessible by group or others. Send `SIGINT` or `SIGTERM`
-to stop accepting connections and terminate/reap the remaining workers. The
-session limit bounds concurrent workers; excess connections remain in the
-kernel listen backlog until capacity becomes available.
+to stop accepting connections. Active shells receive a shutdown message and
+are closed before their workers are reaped; a worker that does not drain within
+five seconds is killed. The session limit bounds concurrent workers; excess
+connections remain in the kernel listen backlog until capacity becomes
+available.
+
+An authenticated session is warned 30 seconds before the default five-minute
+idle timeout. Any input resets and re-arms that warning; server output does not
+count as activity. A separate 24-hour cap applies even to active sessions.
+Operators can set all three positive durations in whole seconds with
+`--idle-timeout-seconds`, `--idle-warning-seconds`, and
+`--session-cap-seconds`; the warning must remain shorter than the idle timeout.
 
 ## Design pillars
 

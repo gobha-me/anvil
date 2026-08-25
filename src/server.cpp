@@ -45,7 +45,6 @@ using namespace std::chrono_literals;
 constexpr std::size_t max_key_file_size = 64U * 1024U;
 constexpr std::size_t max_pending_input = 64U * 1024U;
 constexpr auto authentication_timeout = 15s;
-constexpr auto idle_timeout = 5min;
 constexpr auto shutdown_timeout = 5s;
 
 [[noreturn]] void throw_system_error(std::string_view operation);
@@ -164,6 +163,8 @@ struct SessionState {
   RequestedOperation operation{RequestedOperation::none};
   std::vector<std::byte> pending_input;
   Clock::time_point last_activity{Clock::now()};
+  Clock::time_point authenticated_at{};
+  bool idle_warning_sent{};
 };
 
 [[noreturn]] void throw_system_error(std::string_view operation) {
@@ -441,7 +442,8 @@ int authenticate_public_key(ssh_session,
   }
   if (signature_state == SSH_PUBLICKEY_STATE_VALID && authorized) {
     state.authenticated = true;
-    state.last_activity = Clock::now();
+    state.authenticated_at = Clock::now();
+    state.last_activity = state.authenticated_at;
     return SSH_AUTH_SUCCESS;
   }
   ++state.auth_attempts;
@@ -492,6 +494,7 @@ int request_shell(ssh_session, ssh_channel, void* userdata) {
   }
   state.operation = RequestedOperation::shell;
   state.last_activity = Clock::now();
+  state.idle_warning_sent = false;
   return SSH_OK;
 }
 
@@ -536,6 +539,7 @@ int receive_data(ssh_session,
   const auto* first = static_cast<const std::byte*>(data);
   state.pending_input.insert(state.pending_input.end(), first, first + length);
   state.last_activity = Clock::now();
+  state.idle_warning_sent = false;
   return static_cast<int>(length);
 }
 
@@ -576,7 +580,32 @@ void close_channel(ssh_channel channel, int status) {
   static_cast<void>(ssh_channel_close(channel));
 }
 
-int run_session(ssh_session session, const std::vector<AuthorizedKey>& authorized_keys) {
+[[nodiscard]] bool worker_shutdown_requested(int signal_descriptor) {
+  bool requested = false;
+  for (;;) {
+    signalfd_siginfo signal_info{};
+    const auto count = ::read(signal_descriptor, &signal_info, sizeof(signal_info));
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return requested;
+    }
+    if (count != static_cast<ssize_t>(sizeof(signal_info))) {
+      return true;
+    }
+    if (signal_info.ssi_signo == SIGINT || signal_info.ssi_signo == SIGTERM) {
+      requested = true;
+    }
+  }
+}
+
+enum class SessionEnd { normal, idle_timeout, session_cap, shutdown };
+
+int run_session(ssh_session session,
+                const std::vector<AuthorizedKey>& authorized_keys,
+                const Config& config,
+                int signal_descriptor) {
   SessionState state;
   state.authorized_keys = &authorized_keys;
   state.pending_input.reserve(4096);
@@ -624,9 +653,14 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey>& authorize
   const auto authentication_deadline = Clock::now() + authentication_timeout;
   bool greeting_sent = false;
   bool denial_sent = false;
+  auto session_end = SessionEnd::normal;
 
   while (ssh_is_connected(session) != 0 && !state.close_requested) {
     if (ssh_event_dopoll(event.get(), 100) == SSH_ERROR) {
+      break;
+    }
+    if (worker_shutdown_requested(signal_descriptor)) {
+      session_end = SessionEnd::shutdown;
       break;
     }
     const auto now = Clock::now();
@@ -634,8 +668,15 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey>& authorize
         (state.auth_attempts >= 6U || now >= authentication_deadline)) {
       break;
     }
-    if (state.authenticated && now - state.last_activity >= idle_timeout) {
-      break;
+    if (state.authenticated) {
+      if (now - state.authenticated_at >= config.session_cap) {
+        session_end = SessionEnd::session_cap;
+        break;
+      }
+      if (now - state.last_activity >= config.idle_timeout) {
+        session_end = SessionEnd::idle_timeout;
+        break;
+      }
     }
 
     if (state.channel != nullptr && !state.channel_callbacks_installed) {
@@ -666,14 +707,23 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey>& authorize
         break;
       }
       greeting_sent = true;
-      state.last_activity = now;
     }
     if (!state.pending_input.empty()) {
       if (!write_channel(state.channel, state.pending_input.data(), state.pending_input.size())) {
         break;
       }
       state.pending_input.clear();
-      state.last_activity = now;
+    }
+    if (state.operation == RequestedOperation::shell && !state.idle_warning_sent &&
+        now - state.last_activity >= config.idle_timeout - config.idle_warning) {
+      const auto seconds = config.idle_warning.count();
+      const auto warning = "Anvil: idle session will close in " +
+                           std::to_string(seconds) +
+                           " seconds. Press any key to continue.\r\n";
+      if (!write_channel(state.channel, warning.data(), warning.size())) {
+        break;
+      }
+      state.idle_warning_sent = true;
     }
     if (state.operation == RequestedOperation::shell &&
         (state.input_eof || ssh_channel_is_eof(state.channel) != 0)) {
@@ -686,7 +736,28 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey>& authorize
   }
 
   if (state.channel != nullptr && ssh_channel_is_open(state.channel) != 0) {
-    close_channel(state.channel, state.close_requested ? 1 : 0);
+    std::string_view message;
+    int status = 0;
+    switch (session_end) {
+      case SessionEnd::idle_timeout:
+        message = "Anvil: session closed after the idle timeout.\r\n";
+        status = 124;
+        break;
+      case SessionEnd::session_cap:
+        message = "Anvil: maximum session duration reached; closing.\r\n";
+        status = 124;
+        break;
+      case SessionEnd::shutdown:
+        message = "Anvil: server is shutting down; closing this session.\r\n";
+        break;
+      case SessionEnd::normal:
+        status = state.close_requested ? 1 : 0;
+        break;
+    }
+    if (!message.empty()) {
+      static_cast<void>(write_channel(state.channel, message.data(), message.size()));
+    }
+    close_channel(state.channel, status);
   }
   static_cast<void>(ssh_event_remove_session(event.get(), session));
   if (state.channel != nullptr) {
@@ -728,7 +799,10 @@ void await_children(std::unordered_set<pid_t>& children, int signal_descriptor) 
     static_cast<void>(::poll(&descriptor, 1, 100));
     if ((descriptor.revents & POLLIN) != 0) {
       signalfd_siginfo signal_info{};
-      static_cast<void>(::read(signal_descriptor, &signal_info, sizeof(signal_info)));
+      const auto count = ::read(signal_descriptor, &signal_info, sizeof(signal_info));
+      if (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+        std::cerr << "anvil: cannot read child signal: " << std::strerror(errno) << '\n';
+      }
     }
     reap_children(children);
   }
@@ -785,6 +859,27 @@ void await_children(std::unordered_set<pid_t>& children, int signal_descriptor) 
   return static_cast<std::uint32_t>(value);
 }
 
+[[nodiscard]] std::chrono::seconds parse_duration(std::string_view text,
+                                                  std::string_view name) {
+  if (text.empty()) {
+    throw std::runtime_error(std::string(name) + " must not be empty");
+  }
+  std::uint64_t value = 0;
+  for (const char character : text) {
+    if (character < '0' || character > '9') {
+      throw std::runtime_error(std::string(name) + " must be a decimal number of seconds");
+    }
+    value = value * 10U + static_cast<std::uint64_t>(character - '0');
+    if (value > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(std::string(name) + " is too large");
+    }
+  }
+  if (value == 0U) {
+    throw std::runtime_error(std::string(name) + " must be positive");
+  }
+  return std::chrono::seconds(value);
+}
+
 }  // namespace
 
 std::string_view usage() noexcept {
@@ -794,6 +889,11 @@ std::string_view usage() noexcept {
          "  --bind-address ADDRESS   address to listen on (default 127.0.0.1)\n"
          "  --port PORT             TCP port to listen on (default 2222)\n"
          "  --max-sessions COUNT    concurrent worker limit (default 64)\n"
+         "  --idle-timeout-seconds S\n"
+         "                          idle limit in seconds (default 300)\n"
+         "  --idle-warning-seconds S\n"
+         "                          warning lead time in seconds (default 30)\n"
+         "  --session-cap-seconds S absolute session limit in seconds (default 86400)\n"
          "  --host-key PATH         unencrypted OpenSSH private host key\n"
          "  --authorized-key U=P    authorize public key file P for user U; repeatable\n"
          "  --help                  show this help\n";
@@ -809,6 +909,9 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
     if (argument != "--bind-address" && argument != "--port" &&
         argument != "--max-sessions" &&
+        argument != "--idle-timeout-seconds" &&
+        argument != "--idle-warning-seconds" &&
+        argument != "--session-cap-seconds" &&
         argument != "--host-key" && argument != "--authorized-key") {
       throw std::runtime_error("unknown option: " + std::string(argument));
     }
@@ -825,6 +928,12 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       result.config.port = parse_port(value);
     } else if (argument == "--max-sessions") {
       result.config.max_sessions = parse_session_limit(value);
+    } else if (argument == "--idle-timeout-seconds") {
+      result.config.idle_timeout = parse_duration(value, "idle timeout");
+    } else if (argument == "--idle-warning-seconds") {
+      result.config.idle_warning = parse_duration(value, "idle warning");
+    } else if (argument == "--session-cap-seconds") {
+      result.config.session_cap = parse_duration(value, "session cap");
     } else if (argument == "--host-key") {
       result.config.host_key_path = value;
     } else {
@@ -838,6 +947,9 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
   }
   if (!result.show_help) {
+    if (result.config.idle_warning >= result.config.idle_timeout) {
+      throw std::runtime_error("idle warning must be shorter than idle timeout");
+    }
     if (result.config.host_key_path.empty()) {
       throw std::runtime_error("--host-key is required");
     }
@@ -958,10 +1070,21 @@ int run(const Config& config) {
     if (child == 0) {
       static_cast<void>(::close(signal_descriptor.get()));
       bind.reset();
-      sigset_t empty_mask;
-      static_cast<void>(::sigemptyset(&empty_mask));
-      static_cast<void>(::sigprocmask(SIG_SETMASK, &empty_mask, nullptr));
-      const auto exit_status = run_session(session.get(), authorized_keys);
+      sigset_t worker_mask;
+      if (::sigemptyset(&worker_mask) != 0 || ::sigaddset(&worker_mask, SIGINT) != 0 ||
+          ::sigaddset(&worker_mask, SIGTERM) != 0 ||
+          ::sigprocmask(SIG_SETMASK, &worker_mask, nullptr) != 0) {
+        std::cerr << "anvil: cannot configure worker signals\n";
+        std::_Exit(1);
+      }
+      FileDescriptor worker_signal_descriptor(
+          ::signalfd(-1, &worker_mask, SFD_CLOEXEC | SFD_NONBLOCK));
+      if (worker_signal_descriptor.get() < 0) {
+        std::cerr << "anvil: cannot create worker signal descriptor\n";
+        std::_Exit(1);
+      }
+      const auto exit_status = run_session(session.get(), authorized_keys, config,
+                                           worker_signal_descriptor.get());
       ssh_disconnect(session.get());
       session.reset();
       std::_Exit(exit_status);
