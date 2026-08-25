@@ -23,7 +23,7 @@ extern "C" ANVIL_TEST_EXPORT const PrefixAbiTag anvil_abi_tag{
     anvil::kAbiMagic,
     sizeof(PrefixAbiTag),
     anvil::kPluginInterfaceMajor,
-    anvil::kPluginInterfaceMinor,
+    0,
     anvil::current_abi_tag.sanitizer_mask,
 };
 

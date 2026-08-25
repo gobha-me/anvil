@@ -149,14 +149,23 @@ work is still being scoped.
 that may cross the plugin boundary. Include `<anvil/sdk/types.hpp>` to use
 `anvil::Str`, `anvil::Span<T>`, `anvil::Version`, `anvil::PluginKind`, and
 `anvil::CapabilityTier`. `<anvil/sdk/abi.hpp>` additionally publishes
-`anvil::InterfaceVersion` and the ABI tag.
+`anvil::InterfaceVersion` and the ABI tag. `<anvil/sdk/plugin.hpp>` publishes
+the raw plugin manifest and door-context contract.
 
 `Str` and `Span<T>` are borrowed views: the owner of `data` must keep it alive
 for the duration specified by the interface carrying the view. `Span<T>` only
 accepts trivially-copyable, standard-layout element types, and constness belongs
 in `T`. These primitive view/value types have fixed layouts and no member
-functions. Future extensible records such as plugin manifests and contexts put
+functions. Extensible plugin manifests, capabilities, limits, and contexts put
 `uint32_t struct_size` first so appended fields can be detected safely.
+
+`PluginManifest` carries a borrowed textual `PluginId`, display strings,
+author, version, and kind. `DoorManifest` declares the minimum terminal tier
+and its state, leaderboard, and optional-audio traits. `DoorContext` carries an
+opaque `UserId`, session capabilities and dimensions, per-session resource
+limits, and pointers to the session and state-store services. Those service
+interfaces remain opaque until their callable contracts land; no unfinished
+vtable is frozen into plugin interface 1.1.
 
 The boundary headers deliberately contain no standard-library surface types.
 Their size, alignment, offset, and fixed-width assertions compile in every host
@@ -177,7 +186,7 @@ The host refuses mismatched magic, an inconsistent structure size, a plugin
 interface outside its accepted ranges, or mismatched sanitizer state. Compiler,
 compiler version, standard-library identity, and language-standard fields are
 retained as diagnostics rather than compatibility gates. The current plugin
-interface and accepted range are both `1.0`.
+interface is `1.1`; the accepted range is `1.0` through `1.1`.
 
 The tag's fixed 16-byte prefix is sufficient to decide compatibility. An older
 tag may therefore be shorter than the host's `AnvilAbiTag`: the loader copies
@@ -235,6 +244,7 @@ independent stream.
 |---|---|
 | `0.3.0` | `1.0` |
 | `0.4.0` | `1.0` |
+| `0.5.0` | `1.0–1.1` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one

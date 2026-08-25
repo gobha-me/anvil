@@ -1,4 +1,5 @@
 #include <anvil/sdk/abi.hpp>
+#include <anvil/sdk/plugin.hpp>
 #include <anvil/sdk/types.hpp>
 
 #include <stdint.h>
@@ -37,5 +38,23 @@ anvil_sdk_plugin_kind(anvil::PluginKind value) noexcept -> anvil::PluginKind {
 extern "C" ANVIL_SDK_TEST_EXPORT auto
 anvil_sdk_capability_tier(anvil::CapabilityTier value) noexcept
     -> anvil::CapabilityTier {
+  return value;
+}
+
+extern "C" ANVIL_SDK_TEST_EXPORT auto
+anvil_sdk_plugin_manifest(anvil::PluginManifest value) noexcept
+    -> anvil::PluginManifest {
+  return value;
+}
+
+extern "C" ANVIL_SDK_TEST_EXPORT auto
+anvil_sdk_door_manifest(anvil::DoorManifest value) noexcept
+    -> anvil::DoorManifest {
+  return value;
+}
+
+extern "C" ANVIL_SDK_TEST_EXPORT auto
+anvil_sdk_door_context(anvil::DoorContext value) noexcept
+    -> anvil::DoorContext {
   return value;
 }

@@ -7,7 +7,7 @@ namespace anvil {
 
 inline constexpr uint32_t kAbiMagic{0x414E564CUL};
 inline constexpr uint16_t kPluginInterfaceMajor{1};
-inline constexpr uint16_t kPluginInterfaceMinor{0};
+inline constexpr uint16_t kPluginInterfaceMinor{1};
 
 struct InterfaceVersion {
   uint16_t major;

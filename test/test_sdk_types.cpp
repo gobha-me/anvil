@@ -1,4 +1,5 @@
 #include <anvil/sdk/abi.hpp>
+#include <anvil/sdk/plugin.hpp>
 #include <anvil/sdk/types.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -16,6 +17,12 @@ extern "C" auto anvil_sdk_plugin_kind(anvil::PluginKind value) noexcept
     -> anvil::PluginKind;
 extern "C" auto anvil_sdk_capability_tier(anvil::CapabilityTier value) noexcept
     -> anvil::CapabilityTier;
+extern "C" auto anvil_sdk_plugin_manifest(anvil::PluginManifest value) noexcept
+    -> anvil::PluginManifest;
+extern "C" auto anvil_sdk_door_manifest(anvil::DoorManifest value) noexcept
+    -> anvil::DoorManifest;
+extern "C" auto anvil_sdk_door_context(anvil::DoorContext value) noexcept
+    -> anvil::DoorContext;
 extern "C" const anvil::AnvilAbiTag anvil_abi_tag;
 
 static_assert(std::is_aggregate_v<anvil::Str>);
@@ -33,6 +40,27 @@ static_assert(std::is_standard_layout_v<anvil::AnvilAbiTag>);
 static_assert(std::is_aggregate_v<anvil::InterfaceVersion>);
 static_assert(std::is_trivially_copyable_v<anvil::InterfaceVersion>);
 static_assert(std::is_standard_layout_v<anvil::InterfaceVersion>);
+static_assert(std::is_aggregate_v<anvil::PluginId>);
+static_assert(std::is_trivially_copyable_v<anvil::PluginId>);
+static_assert(std::is_standard_layout_v<anvil::PluginId>);
+static_assert(std::is_aggregate_v<anvil::UserId>);
+static_assert(std::is_trivially_copyable_v<anvil::UserId>);
+static_assert(std::is_standard_layout_v<anvil::UserId>);
+static_assert(std::is_aggregate_v<anvil::Capabilities>);
+static_assert(std::is_trivially_copyable_v<anvil::Capabilities>);
+static_assert(std::is_standard_layout_v<anvil::Capabilities>);
+static_assert(std::is_aggregate_v<anvil::ResourceLimits>);
+static_assert(std::is_trivially_copyable_v<anvil::ResourceLimits>);
+static_assert(std::is_standard_layout_v<anvil::ResourceLimits>);
+static_assert(std::is_aggregate_v<anvil::PluginManifest>);
+static_assert(std::is_trivially_copyable_v<anvil::PluginManifest>);
+static_assert(std::is_standard_layout_v<anvil::PluginManifest>);
+static_assert(std::is_aggregate_v<anvil::DoorManifest>);
+static_assert(std::is_trivially_copyable_v<anvil::DoorManifest>);
+static_assert(std::is_standard_layout_v<anvil::DoorManifest>);
+static_assert(std::is_aggregate_v<anvil::DoorContext>);
+static_assert(std::is_trivially_copyable_v<anvil::DoorContext>);
+static_assert(std::is_standard_layout_v<anvil::DoorContext>);
 static_assert(
     std::is_same_v<std::underlying_type_t<anvil::AbiCompiler>, std::uint32_t>);
 static_assert(std::is_same_v<std::underlying_type_t<anvil::AbiStandardLibrary>,
@@ -61,6 +89,75 @@ TEST_CASE("SDK value types cross a shared-library boundary unchanged") {
         anvil::PluginKind::door);
   CHECK(anvil_sdk_capability_tier(anvil::CapabilityTier::graphics) ==
         anvil::CapabilityTier::graphics);
+}
+
+TEST_CASE("plugin contract records cross a shared-library boundary unchanged") {
+  constexpr char id[]{"org.example.clock"};
+  constexpr char name[]{"Clock"};
+  constexpr char description[]{"A quiet clock door"};
+  constexpr char author[]{"Example Author"};
+
+  const auto plugin = anvil_sdk_plugin_manifest(anvil::PluginManifest{
+      sizeof(anvil::PluginManifest),
+      anvil::PluginId{anvil::Str{id, sizeof(id) - 1}},
+      anvil::Str{name, sizeof(name) - 1},
+      anvil::Str{description, sizeof(description) - 1},
+      anvil::Str{author, sizeof(author) - 1},
+      anvil::Version{2, 3, 4},
+      anvil::PluginKind::door,
+  });
+
+  CHECK(plugin.struct_size == sizeof(anvil::PluginManifest));
+  CHECK(plugin.id.value.data == id);
+  CHECK(plugin.id.value.len == sizeof(id) - 1);
+  CHECK(plugin.name.data == name);
+  CHECK(plugin.name.len == sizeof(name) - 1);
+  CHECK(plugin.description.data == description);
+  CHECK(plugin.author.data == author);
+  CHECK(plugin.version.major == 2);
+  CHECK(plugin.version.minor == 3);
+  CHECK(plugin.version.patch == 4);
+  CHECK(plugin.kind == anvil::PluginKind::door);
+
+  const auto door = anvil_sdk_door_manifest(anvil::DoorManifest{
+      sizeof(anvil::DoorManifest), anvil::CapabilityTier::modern, 1, 0, 1, 0});
+  CHECK(door.struct_size == sizeof(anvil::DoorManifest));
+  CHECK(door.min_tier == anvil::CapabilityTier::modern);
+  CHECK(door.persists_state == 1);
+  CHECK(door.has_leaderboard == 0);
+  CHECK(door.audio_enhanced == 1);
+  CHECK(door.reserved == 0);
+}
+
+TEST_CASE("door context preserves opaque services, capabilities, and limits") {
+  auto *const session = reinterpret_cast<anvil::ISession *>(0x1000U);
+  auto *const state = reinterpret_cast<anvil::IStateStore *>(0x2000U);
+  const auto context = anvil_sdk_door_context(anvil::DoorContext{
+      sizeof(anvil::DoorContext),
+      anvil::UserId{42},
+      session,
+      anvil::Capabilities{sizeof(anvil::Capabilities),
+                          anvil::CapabilityTier::graphics, 120, 40},
+      state,
+      anvil::ResourceLimits{sizeof(anvil::ResourceLimits), 64U << 20U,
+                            5'000'000, 1'000'000, 32U << 20U,
+                            3'600'000'000'000},
+  });
+
+  CHECK(context.struct_size == sizeof(anvil::DoorContext));
+  CHECK(context.user.value == 42);
+  CHECK(context.session == session);
+  CHECK(context.caps.struct_size == sizeof(anvil::Capabilities));
+  CHECK(context.caps.tier == anvil::CapabilityTier::graphics);
+  CHECK(context.caps.columns == 120);
+  CHECK(context.caps.rows == 40);
+  CHECK(context.state == state);
+  CHECK(context.limits.struct_size == sizeof(anvil::ResourceLimits));
+  CHECK(context.limits.memory_bytes == (64U << 20U));
+  CHECK(context.limits.cpu_time_ns == 5'000'000);
+  CHECK(context.limits.output_bytes_per_second == 1'000'000);
+  CHECK(context.limits.image_bytes == (32U << 20U));
+  CHECK(context.limits.duration_ns == 3'600'000'000'000);
 }
 
 TEST_CASE("Span expresses mutability through its element type") {
