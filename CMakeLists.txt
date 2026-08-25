@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.6.0 LANGUAGES CXX)
+project(anvil VERSION 0.7.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -10,6 +10,7 @@ include(GNUInstallDirs)
 
 option(ANVIL_TESTS "Build and register the Anvil test suite" ${PROJECT_IS_TOP_LEVEL})
 option(ANVIL_INSTALL "Generate Anvil install and package-config rules" ${PROJECT_IS_TOP_LEVEL})
+option(ANVIL_SERVER "Build the Anvil SSH server" ${PROJECT_IS_TOP_LEVEL})
 
 set(ANVIL_WARNING_FLAGS
   -Wall
@@ -53,6 +54,24 @@ target_include_directories(anvil_loader
 )
 target_link_libraries(anvil_loader PRIVATE ${CMAKE_DL_LIBS})
 
+if(ANVIL_SERVER)
+  enable_language(C)
+  include(cmake/deps/libssh.cmake)
+
+  add_library(anvil_server STATIC
+    src/server.cpp
+  )
+  target_compile_features(anvil_server PUBLIC cxx_std_23)
+  target_compile_options(anvil_server PRIVATE ${ANVIL_WARNING_FLAGS})
+  target_include_directories(anvil_server PUBLIC ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(anvil_server PUBLIC ${ANVIL_LIBSSH_TARGET})
+
+  add_executable(anvil src/main.cpp)
+  target_compile_features(anvil PRIVATE cxx_std_23)
+  target_compile_options(anvil PRIVATE ${ANVIL_WARNING_FLAGS})
+  target_link_libraries(anvil PRIVATE anvil_server)
+endif()
+
 if(ANVIL_TESTS)
   include(CTest)
   enable_testing()
@@ -80,6 +99,9 @@ if(ANVIL_INSTALL)
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   )
+  if(ANVIL_SERVER)
+    install(TARGETS anvil RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
   install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(EXPORT anvilTargets
     FILE anvilTargets.cmake

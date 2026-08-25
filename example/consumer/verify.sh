@@ -36,7 +36,7 @@ run_mode fetchcontent \
 
 PREFIX="${WORK}/prefix"
 cmake -S "${REPO_ROOT}" -B "${WORK}/build-install" \
-  -DANVIL_TESTS=OFF -DCMAKE_INSTALL_PREFIX="${PREFIX}"
+  -DANVIL_SERVER=OFF -DANVIL_TESTS=OFF -DCMAKE_INSTALL_PREFIX="${PREFIX}"
 cmake --build "${WORK}/build-install" --parallel
 cmake --install "${WORK}/build-install"
 run_mode find_package -DCMAKE_PREFIX_PATH="${PREFIX}"
