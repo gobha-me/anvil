@@ -24,6 +24,17 @@ foreach(_fixture IN LISTS _fixture_sources)
   )
 endforeach()
 
+add_library(fixture_sdk_types SHARED fixtures/sdk_types.cpp)
+target_compile_features(fixture_sdk_types PRIVATE cxx_std_23)
+target_compile_options(fixture_sdk_types PRIVATE ${ANVIL_WARNING_FLAGS})
+target_link_libraries(fixture_sdk_types PRIVATE anvil::sdk)
+set_target_properties(fixture_sdk_types PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES
+  PREFIX ""
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fixtures
+)
+
 # A successful dlsym with address zero is distinct from a missing symbol. GNU
 # ld and the GNU-compatible linker used by Clang both support an absolute
 # symbol for this adversarial fixture.
@@ -53,5 +64,34 @@ foreach(_fixture IN LISTS _fixture_sources)
   )
 endforeach()
 
+add_executable(anvil_sdk_tests test_sdk_types.cpp)
+target_compile_features(anvil_sdk_tests PRIVATE cxx_std_23)
+target_compile_options(anvil_sdk_tests PRIVATE ${ANVIL_WARNING_FLAGS})
+target_link_libraries(anvil_sdk_tests
+  PRIVATE anvil::sdk
+  PRIVATE fixture_sdk_types
+  PRIVATE Catch2::Catch2WithMain
+)
+
+add_test(
+  NAME sdk_non_pod_span_rejected
+  COMMAND
+    ${CMAKE_CXX_COMPILER}
+    -std=c++23
+    -fsyntax-only
+    -I${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/non_pod_span.cpp
+)
+set_tests_properties(sdk_non_pod_span_rejected PROPERTIES WILL_FAIL TRUE)
+
+add_test(
+  NAME sdk_boundary_has_no_standard_library_surface
+  COMMAND
+    ${CMAKE_COMMAND}
+    -DANVIL_SDK_HEADER=${PROJECT_SOURCE_DIR}/include/anvil/sdk/types.hpp
+    -P ${PROJECT_SOURCE_DIR}/cmake/verify_sdk_boundary.cmake
+)
+
 include(Catch)
 catch_discover_tests(anvil_loader_tests)
+catch_discover_tests(anvil_sdk_tests)

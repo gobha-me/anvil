@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.1.0 LANGUAGES CXX)
+project(anvil VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -17,6 +17,20 @@ set(ANVIL_WARNING_FLAGS
   -Wpedantic
   -Wconversion
   -Wsign-conversion
+)
+
+add_library(anvil_sdk INTERFACE)
+add_library(anvil::sdk ALIAS anvil_sdk)
+
+set_target_properties(anvil_sdk PROPERTIES
+  EXPORT_NAME sdk
+)
+
+target_compile_features(anvil_sdk INTERFACE cxx_std_23)
+target_include_directories(anvil_sdk
+  INTERFACE
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 add_library(anvil_loader STATIC
@@ -60,7 +74,7 @@ endif()
 if(ANVIL_INSTALL)
   include(CMakePackageConfigHelpers)
 
-  install(TARGETS anvil_loader
+  install(TARGETS anvil_loader anvil_sdk
     EXPORT anvilTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
