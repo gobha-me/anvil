@@ -1,0 +1,5 @@
+services:
+  anvil:
+    image: anvil:${ANVIL_STAGING_IMAGE_TAG:-staging}
+    build:
+      target: staging

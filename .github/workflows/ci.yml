@@ -57,11 +57,15 @@ jobs:
       matrix:
         include:
           - {name: "gcc / default", cc: gcc-13, cxx: g++-13, toolchain: default.cmake, build_type: Debug}
+          - {name: "gcc / hardened", cc: gcc-13, cxx: g++-13, toolchain: hardened.cmake, build_type: Release, verify_hardening: true}
           - {name: "gcc / asan", cc: gcc-13, cxx: g++-13, toolchain: address.cmake, build_type: Debug}
+          - {name: "gcc / asan+ubsan", cc: gcc-13, cxx: g++-13, toolchain: address-undefined.cmake, build_type: RelWithDebInfo}
           - {name: "gcc / tsan", cc: gcc-13, cxx: g++-13, toolchain: thread.cmake, build_type: RelWithDebInfo}
           - {name: "gcc / ubsan", cc: gcc-13, cxx: g++-13, toolchain: undefined.cmake, build_type: Debug}
           - {name: "clang / default", cc: clang, cxx: clang++, toolchain: default.cmake, build_type: Debug}
+          - {name: "clang / hardened", cc: clang, cxx: clang++, toolchain: hardened.cmake, build_type: Release, verify_hardening: true}
           - {name: "clang / asan", cc: clang, cxx: clang++, toolchain: address.cmake, build_type: Debug}
+          - {name: "clang / asan+ubsan", cc: clang, cxx: clang++, toolchain: address-undefined.cmake, build_type: RelWithDebInfo}
           - {name: "clang / tsan", cc: clang, cxx: clang++, toolchain: thread.cmake, build_type: RelWithDebInfo}
           - {name: "clang / ubsan", cc: clang, cxx: clang++, toolchain: undefined.cmake, build_type: Debug}
     steps:
@@ -88,6 +92,9 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
       - name: Build
         run: cmake --build build --parallel
+      - name: Verify hardened ELF
+        if: ${{ matrix.verify_hardening == true }}
+        run: python3 -B cmake/verify_elf_hardening.py build/anvil
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
@@ -118,9 +125,11 @@ jobs:
         run: example/consumer/verify.sh
 
   container:
-    name: hardened container
+    name: production and staging containers
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: Build and verify the hardened deployment
         run: python3 test/test_container.py
+      - name: Build and verify the ASan+UBSan staging deployment
+        run: python3 test/test_container.py --runtime-target staging

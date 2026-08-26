@@ -195,6 +195,13 @@ add_test(
     ${CMAKE_CURRENT_SOURCE_DIR}/test_sdk_abi_history.py
 )
 
+add_test(
+  NAME elf_hardening_verifier_rules
+  COMMAND
+    ${Python3_EXECUTABLE} -B
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_elf_hardening.py
+)
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
    CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 20)
   add_test(

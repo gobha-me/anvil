@@ -73,7 +73,9 @@ Build and run it with a persistent host-key path and one or more public-key
 mappings:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain/hardened.cmake
 cmake --build build --parallel
 
 install -d -m 700 state
@@ -173,6 +175,25 @@ Opening egress is an operator choice, not an unsupported posture. It permits
 push metrics and future network-using plugins, and correspondingly reduces the
 cost imposed on data exfiltration. Metrics scraping, health checks, and local
 sidecar scanning do not need the override.
+
+The production image is compiled with `_FORTIFY_SOURCE=3`, libstdc++ bounds
+assertions, stack and stack-clash protection, zero initialization of trivial
+automatic variables, PIE, full RELRO, immediate binding, and a non-executable
+stack. On x86 it also enables CET indirect-branch and shadow-stack metadata.
+CI inspects the final ELF for those properties instead of trusting the command
+line used to build it.
+
+For continuous staging, use the dedicated ASan+UBSan image. It keeps debug
+symbols, stops on the first sanitizer finding, and otherwise runs with the same
+container and network posture:
+
+```sh
+docker compose -f compose.yaml -f compose.staging.yaml up --build --detach
+```
+
+The staging image is diagnostic and must not be promoted as the production
+artifact. Issue #23 will drive this image through the concurrent-session load
+test when that test lands.
 
 ## Design pillars
 
@@ -432,6 +453,13 @@ CXX=clang++ cmake -S . -B build-clang \
 cmake --build build-clang --parallel
 ctest --test-dir build-clang --output-on-failure
 ```
+
+Use `cmake/toolchain/hardened.cmake` with `Release` or `RelWithDebInfo` for a
+production ELF. Configuration fails for an unoptimized build so fortification
+cannot silently become a no-op. Use
+`cmake/toolchain/address-undefined.cmake` for the combined staging sanitizer
+posture; the individual ASan, UBSan, and TSan profiles remain available for
+diagnosis.
 
 The loader intentionally does not provide a plugin registry, double-load
 tracking, live reload, or door/server types. Those policies remain separate

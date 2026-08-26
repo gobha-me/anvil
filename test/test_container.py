@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pathlib
@@ -209,8 +210,11 @@ def assert_egress(identifier: str, allowed: bool) -> None:
         raise AssertionError("default non-masquerading network allowed egress")
 
 
-def main() -> int:
-    run(["docker", "build", "--target", "runtime", "--tag", RUNTIME_IMAGE, "."], timeout=900)
+def main(runtime_target: str = "runtime") -> int:
+    run(
+        ["docker", "build", "--target", runtime_target, "--tag", RUNTIME_IMAGE, "."],
+        timeout=900,
+    )
     run(["docker", "build", "--target", "container-test", "--tag", PROBE_IMAGE, "."],
         timeout=900)
     run(["docker", "build", "--target", "ssh-test-client", "--tag", SSH_CLIENT_BASE_IMAGE,
@@ -329,8 +333,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--runtime-target", choices=("runtime", "staging"), default="runtime"
+    )
+    arguments = parser.parse_args()
     try:
-        raise SystemExit(main())
+        raise SystemExit(main(arguments.runtime_target))
     except subprocess.CalledProcessError as error:
         sys.stderr.buffer.write(error.stdout or b"")
         sys.stderr.buffer.write(error.stderr or b"")
