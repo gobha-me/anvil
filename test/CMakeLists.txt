@@ -215,7 +215,7 @@ catch_discover_tests(anvil_sdk_tests)
 catch_discover_tests(anvil_sdk_wrapper_tests)
 
 if(ANVIL_SERVER)
-  add_executable(anvil_server_tests test_server.cpp)
+  add_executable(anvil_server_tests test_admission.cpp test_server.cpp)
   target_compile_features(anvil_server_tests PRIVATE cxx_std_23)
   target_compile_options(anvil_server_tests PRIVATE ${ANVIL_WARNING_FLAGS})
   target_link_libraries(anvil_server_tests
@@ -250,4 +250,13 @@ if(ANVIL_SERVER)
       $<TARGET_FILE:anvil>
   )
   set_tests_properties(ssh_pty_resize PROPERTIES TIMEOUT 45)
+
+  add_test(
+    NAME ssh_admission_limits
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_ssh_admission.py
+      $<TARGET_FILE:anvil>
+  )
+  set_tests_properties(ssh_admission_limits PROPERTIES TIMEOUT 60)
 endif()

@@ -13,8 +13,8 @@ container.
 
 > **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
 > boundary types, process-isolated TermForge SSH session, persistent host
-> identity, live remote resize handling, and bounded session lifecycles are
-> implemented. See
+> identity, live remote resize handling, bounded session lifecycles, and
+> supervisor-enforced per-IP admission limits are implemented. See
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
 > tracker for the work breakdown.
 
@@ -80,6 +80,11 @@ install -d -m 700 state
   --bind-address 127.0.0.1 \
   --port 2222 \
   --max-sessions 64 \
+  --max-sessions-per-ip 4 \
+  --connection-rate-limit 10/10 \
+  --auth-attempt-rate-limit 6/60 \
+  --max-auth-attempts-per-session 6 \
+  --max-tracked-ips 4096 \
   --idle-timeout-seconds 300 \
   --idle-warning-seconds 30 \
   --session-cap-seconds 86400 \
@@ -103,8 +108,20 @@ and host private keys accessible by group or others. Send `SIGINT` or `SIGTERM`
 to stop accepting connections. Active shells receive a shutdown message and
 are closed before their workers are reaped; a worker that does not drain within
 five seconds is killed. The session limit bounds concurrent workers; excess
-connections remain in the kernel listen backlog until capacity becomes
-available.
+connections are closed before libssh allocates a session, performs key
+exchange, or forks a worker. The default per-IP concurrent limit is four.
+
+The supervisor also applies two per-IP token buckets before key exchange.
+`--connection-rate-limit COUNT/PERIOD_SECONDS` counts every accepted TCP
+connection and defaults to a burst of 10 replenished uniformly over 10
+seconds. `--auth-attempt-rate-limit` counts denied public-key requests and
+defaults to 6 over 60 seconds; workers report denials to the supervisor so the
+next connection is refused before it can make key exchange expensive. A
+single connection is closed after six denials by default, configurable with
+`--max-auth-attempts-per-session`. Limiter state is capped at 4096 IPs by
+default and idle, fully replenished entries are evicted. All counters are
+per-instance. Without PROXY-protocol support, a TCP proxy's address is the
+client IP seen by these limits.
 
 An authenticated session is warned 30 seconds before the default five-minute
 idle timeout. Any input resets and re-arms that warning; server output does not

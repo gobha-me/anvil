@@ -19,6 +19,16 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"22022"},
       std::string_view{"--max-sessions"},
       std::string_view{"12"},
+      std::string_view{"--max-sessions-per-ip"},
+      std::string_view{"3"},
+      std::string_view{"--connection-rate-limit"},
+      std::string_view{"20/30"},
+      std::string_view{"--auth-attempt-rate-limit"},
+      std::string_view{"4/120"},
+      std::string_view{"--max-auth-attempts-per-session"},
+      std::string_view{"2"},
+      std::string_view{"--max-tracked-ips"},
+      std::string_view{"100"},
       std::string_view{"--idle-timeout-seconds"},
       std::string_view{"600"},
       std::string_view{"--idle-warning-seconds"},
@@ -39,6 +49,13 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.bind_address == "::1");
   CHECK(parsed.config.port == 22022);
   CHECK(parsed.config.max_sessions == 12);
+  CHECK(parsed.config.max_sessions_per_ip == 3);
+  CHECK(parsed.config.connection_rate.count == 20);
+  CHECK(parsed.config.connection_rate.period.count() == 30);
+  CHECK(parsed.config.auth_attempt_rate.count == 4);
+  CHECK(parsed.config.auth_attempt_rate.period.count() == 120);
+  CHECK(parsed.config.max_auth_attempts_per_session == 2);
+  CHECK(parsed.config.max_tracked_ips == 100);
   CHECK(parsed.config.idle_timeout.count() == 600);
   CHECK(parsed.config.idle_warning.count() == 45);
   CHECK(parsed.config.session_cap.count() == 7200);
@@ -66,6 +83,16 @@ TEST_CASE("server CLI rejects malformed hostile values") {
   CHECK_THROWS_AS(parse("--port", "22x"), std::runtime_error);
   CHECK_THROWS_AS(parse("--max-sessions", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--max-sessions", "4097"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--max-sessions-per-ip", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--connection-rate-limit", "10"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--connection-rate-limit", "0/10"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--connection-rate-limit", "10/0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--auth-attempt-rate-limit", "1/2/3"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--max-auth-attempts-per-session", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--max-tracked-ips", "65537"), std::runtime_error);
+  CHECK_THROWS_AS(
+      parse("--max-tracked-ips", "18446744073709551616000000000000000000"),
+      std::runtime_error);
   CHECK_THROWS_AS(parse("--idle-timeout-seconds", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--idle-timeout-seconds", "1x"), std::runtime_error);
   CHECK_THROWS_AS(parse("--idle-timeout-seconds", "4294967296"), std::runtime_error);
@@ -87,6 +114,14 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.idle_timeout.count() == 300);
   CHECK(parsed.config.idle_warning.count() == 30);
   CHECK(parsed.config.session_cap.count() == 86'400);
+  CHECK(parsed.config.max_sessions == 64);
+  CHECK(parsed.config.max_sessions_per_ip == 4);
+  CHECK(parsed.config.connection_rate.count == 10);
+  CHECK(parsed.config.connection_rate.period.count() == 10);
+  CHECK(parsed.config.auth_attempt_rate.count == 6);
+  CHECK(parsed.config.auth_attempt_rate.period.count() == 60);
+  CHECK(parsed.config.max_auth_attempts_per_session == 6);
+  CHECK(parsed.config.max_tracked_ips == 4096);
 
   const std::array invalid{
       std::string_view{"--host-key"},
@@ -99,6 +134,18 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
       std::string_view{"30"},
   };
   CHECK_THROWS_AS(anvil::server::parse_arguments(invalid), std::runtime_error);
+
+  const std::array invalid_cross_field{
+      std::string_view{"--host-key"},
+      std::string_view{"host_key"},
+      std::string_view{"--authorized-key"},
+      std::string_view{"user=key.pub"},
+      std::string_view{"--max-sessions"},
+      std::string_view{"2"},
+      std::string_view{"--max-sessions-per-ip"},
+      std::string_view{"3"},
+  };
+  CHECK_THROWS_AS(anvil::server::parse_arguments(invalid_cross_field), std::runtime_error);
 }
 
 TEST_CASE("server CLI help does not require operational arguments") {
