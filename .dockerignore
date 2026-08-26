@@ -1,0 +1,10 @@
+.git
+.github
+build
+build-*
+cmake-build-*
+out
+out-*
+**/__pycache__
+**/*.pyc
+**/*.pyo
