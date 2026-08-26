@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.12.0 LANGUAGES CXX)
+project(anvil VERSION 0.13.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -11,6 +11,13 @@ include(GNUInstallDirs)
 option(ANVIL_TESTS "Build and register the Anvil test suite" ${PROJECT_IS_TOP_LEVEL})
 option(ANVIL_INSTALL "Generate Anvil install and package-config rules" ${PROJECT_IS_TOP_LEVEL})
 option(ANVIL_SERVER "Build the Anvil SSH server" ${PROJECT_IS_TOP_LEVEL})
+option(ANVIL_HARDENING "Enable the optimized production hardening profile" OFF)
+
+if(ANVIL_SERVER)
+  enable_language(C)
+endif()
+
+include(cmake/hardening.cmake)
 
 set(ANVIL_WARNING_FLAGS
   -Wall
@@ -55,7 +62,6 @@ target_include_directories(anvil_loader
 target_link_libraries(anvil_loader PRIVATE ${CMAKE_DL_LIBS})
 
 if(ANVIL_SERVER)
-  enable_language(C)
   include(cmake/deps/libssh.cmake)
   include(cmake/deps/termforge.cmake)
 
