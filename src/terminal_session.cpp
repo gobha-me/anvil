@@ -110,7 +110,8 @@ struct SharedState {
 class EchoApp final : public termforge::App {
  public:
   EchoApp(int descriptor, std::string terminal_type, TerminalDimensions dimensions,
-          std::chrono::steady_clock::time_point channel_opened, SharedState &shared)
+          std::chrono::steady_clock::time_point channel_opened, SharedState &shared,
+          SessionInputHook input_hook_for_testing)
       : sink_(descriptor), channel_opened_(channel_opened), shared_(shared) {
     const auto io = terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
     if (!io) {
@@ -135,11 +136,14 @@ class EchoApp final : public termforge::App {
 
     input_.set_focused(true);
     input_.set_placeholder("Type here");
-    input_.on_change([this](const std::string &text) {
+    input_.on_change([this, input_hook_for_testing](const std::string &text) {
       if (text.size() <= max_echo_size) {
         accepted_input_ = text;
       } else {
         input_.set_text(accepted_input_);
+      }
+      if (input_hook_for_testing != nullptr) {
+        input_hook_for_testing(text);
       }
     });
     set_render_mode(termforge::RenderMode::Demand);
@@ -296,9 +300,11 @@ std::string normalize_terminal_type(const char *terminal_type) {
 class TerminalSession::Impl {
  public:
   Impl(int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
-       std::chrono::steady_clock::time_point channel_opened)
+       std::chrono::steady_clock::time_point channel_opened,
+       SessionInputHook input_hook_for_testing)
       : shared_(dimensions),
-        app_(io_descriptor, std::move(terminal_type), dimensions, channel_opened, shared_) {}
+        app_(io_descriptor, std::move(terminal_type), dimensions, channel_opened, shared_,
+             input_hook_for_testing) {}
 
   ~Impl() {
     request_stop();
@@ -311,11 +317,16 @@ class TerminalSession::Impl {
     }
     thread_ = std::thread([this] {
       try {
-        failed_.store(app_.run() != 0, std::memory_order_release);
+        if (app_.run() != 0) {
+          failure_reason_.store(SessionFailureReason::app_returned_failure,
+                                std::memory_order_release);
+        }
       } catch (const std::exception &) {
-        failed_.store(true, std::memory_order_release);
+        failure_reason_.store(SessionFailureReason::standard_exception,
+                              std::memory_order_release);
       } catch (...) {
-        failed_.store(true, std::memory_order_release);
+        failure_reason_.store(SessionFailureReason::unknown_exception,
+                              std::memory_order_release);
       }
       finished_.store(true, std::memory_order_release);
     });
@@ -354,7 +365,13 @@ class TerminalSession::Impl {
 
   [[nodiscard]] bool finished() const noexcept { return finished_.load(std::memory_order_acquire); }
 
-  [[nodiscard]] bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+  [[nodiscard]] bool failed() const noexcept {
+    return failure_reason() != SessionFailureReason::none;
+  }
+
+  [[nodiscard]] SessionFailureReason failure_reason() const noexcept {
+    return failure_reason_.load(std::memory_order_acquire);
+  }
 
   [[nodiscard]] SessionTelemetry telemetry() const noexcept {
     std::lock_guard lock(shared_.mutex);
@@ -366,14 +383,15 @@ class TerminalSession::Impl {
   EchoApp app_;
   std::thread thread_;
   std::atomic<bool> finished_{false};
-  std::atomic<bool> failed_{false};
+  std::atomic<SessionFailureReason> failure_reason_{SessionFailureReason::none};
 };
 
 TerminalSession::TerminalSession(int io_descriptor, std::string terminal_type,
                                  TerminalDimensions dimensions,
-                                 std::chrono::steady_clock::time_point channel_opened)
+                                 std::chrono::steady_clock::time_point channel_opened,
+                                 SessionInputHook input_hook_for_testing)
     : impl_(std::make_unique<Impl>(io_descriptor, std::move(terminal_type), dimensions,
-                                   channel_opened)) {}
+                                   channel_opened, input_hook_for_testing)) {}
 
 TerminalSession::~TerminalSession() = default;
 
@@ -390,6 +408,10 @@ void TerminalSession::join() { impl_->join(); }
 bool TerminalSession::finished() const noexcept { return impl_->finished(); }
 
 bool TerminalSession::failed() const noexcept { return impl_->failed(); }
+
+SessionFailureReason TerminalSession::failure_reason() const noexcept {
+  return impl_->failure_reason();
+}
 
 SessionTelemetry TerminalSession::telemetry() const noexcept { return impl_->telemetry(); }
 

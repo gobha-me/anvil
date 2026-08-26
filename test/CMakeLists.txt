@@ -222,6 +222,11 @@ catch_discover_tests(anvil_sdk_tests)
 catch_discover_tests(anvil_sdk_wrapper_tests)
 
 if(ANVIL_SERVER)
+  add_executable(anvil_failure_test_server failure_server_main.cpp)
+  target_compile_features(anvil_failure_test_server PRIVATE cxx_std_23)
+  target_compile_options(anvil_failure_test_server PRIVATE ${ANVIL_WARNING_FLAGS})
+  target_link_libraries(anvil_failure_test_server PRIVATE anvil_server)
+
   add_executable(anvil_server_tests test_admission.cpp test_server.cpp)
   target_compile_features(anvil_server_tests PRIVATE cxx_std_23)
   target_compile_options(anvil_server_tests PRIVATE ${ANVIL_WARNING_FLAGS})
@@ -248,6 +253,24 @@ if(ANVIL_SERVER)
       $<TARGET_FILE:anvil>
   )
   set_tests_properties(ssh_session_lifecycle PROPERTIES TIMEOUT 45)
+
+  add_test(
+    NAME ssh_session_failure_isolation
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_ssh_failure_isolation.py
+      $<TARGET_FILE:anvil_failure_test_server>
+  )
+  set_tests_properties(ssh_session_failure_isolation PROPERTIES TIMEOUT 60)
+  get_filename_component(_anvil_test_toolchain "${CMAKE_TOOLCHAIN_FILE}" NAME)
+  if(_anvil_test_toolchain MATCHES "^(address|address-undefined|thread|undefined)\\.cmake$")
+    # Sanitizer runtimes own fatal-signal handling and may convert or retain an
+    # externally delivered SIGSEGV. SIGKILL still proves the worker boundary
+    # and cannot be intercepted; default and hardened builds exercise SIGSEGV.
+    set_tests_properties(ssh_session_failure_isolation PROPERTIES
+      ENVIRONMENT "ANVIL_TEST_FATAL_SIGNAL=SIGKILL"
+    )
+  endif()
 
   add_test(
     NAME ssh_pty_resize

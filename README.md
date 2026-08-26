@@ -136,6 +136,14 @@ Each completed shell logs its rendered-frame count, accepted frames, byte
 breakdown, and channel-open-to-first-frame latency. These are the internal M0
 measurements that the future metrics endpoint will expose.
 
+Each SSH connection runs in a dedicated worker process during the M0 staging
+architecture. An exception escaping the terminal application closes only that
+session with a generic apology, while the worker logs a fixed failure class and
+its process id. A fatal signal likewise terminates only its worker; the
+supervisor reaps it, releases its admission slot, and continues serving other
+and new sessions. A future transition to pooled in-process sessions must prove
+this isolation contract again before replacing the worker boundary.
+
 ## Hardened container
 
 The shipped Compose deployment runs a shell-free `scratch` image as numeric
