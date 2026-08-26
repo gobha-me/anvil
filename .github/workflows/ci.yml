@@ -116,3 +116,11 @@ jobs:
         env:
           CXX: ${{ matrix.cxx }}
         run: example/consumer/verify.sh
+
+  container:
+    name: hardened container
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and verify the hardened deployment
+        run: python3 test/test_container.py

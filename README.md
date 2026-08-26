@@ -13,8 +13,9 @@ container.
 
 > **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
 > boundary types, process-isolated TermForge SSH session, persistent host
-> identity, live remote resize handling, bounded session lifecycles, and
-> supervisor-enforced per-IP admission limits are implemented. See
+> identity, live remote resize handling, bounded session lifecycles,
+> supervisor-enforced per-IP admission limits, and the hardened container are
+> implemented. See
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
 > tracker for the work breakdown.
 
@@ -132,6 +133,46 @@ Operators can set all three positive durations in whole seconds with
 Each completed shell logs its rendered-frame count, accepted frames, byte
 breakdown, and channel-open-to-first-frame latency. These are the internal M0
 measurements that the future metrics endpoint will expose.
+
+## Hardened container
+
+The shipped Compose deployment runs a shell-free `scratch` image as numeric
+user `65532:65532`. It publishes the unprivileged container port 2222, drops
+all capabilities, enables Docker's built-in seccomp profile and
+`no-new-privileges`, makes the root filesystem read-only, and provides only a
+bounded `/tmp` plus the persistent `/var/lib/anvil` volume as writable paths.
+The volume holds the SSH host identity now and the board database when storage
+lands.
+
+Create or choose an SSH key for the account that will be allowed into the M0
+server, then start the default egress-closed deployment:
+
+```sh
+export ANVIL_AUTHORIZED_KEY="$PWD/demo_ed25519.pub"
+export ANVIL_USER=demo
+docker compose up --build --detach
+ssh -p 2222 demo@127.0.0.1
+```
+
+`ANVIL_PORT` changes the published host port without granting
+`CAP_NET_BIND_SERVICE`. The container-level backstops default to two CPUs,
+512 MiB of memory, 256 PIDs, and a 16 MiB tmpfs; override them with
+`ANVIL_CPU_LIMIT`, `ANVIL_MEMORY_LIMIT`, `ANVIL_PID_LIMIT`, and
+`ANVIL_TMPFS_LIMIT`.
+
+The default Docker bridge disables IP masquerading, so sessions and future
+plugins have no outbound Internet route while the published SSH port remains
+reachable. Deployments that need supported egress opt in with the small
+override file:
+
+```sh
+docker compose -f compose.yaml -f compose.egress.yaml up --build --detach
+```
+
+Opening egress is an operator choice, not an unsupported posture. It permits
+push metrics and future network-using plugins, and correspondingly reduces the
+cost imposed on data exfiltration. Metrics scraping, health checks, and local
+sidecar scanning do not need the override.
 
 ## Design pillars
 

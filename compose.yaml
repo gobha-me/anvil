@@ -1,0 +1,50 @@
+name: anvil
+
+services:
+  anvil:
+    image: anvil:${ANVIL_IMAGE_TAG:-local}
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=builtin
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=${ANVIL_TMPFS_LIMIT:-16m},mode=1777
+    volumes:
+      - anvil-state:/var/lib/anvil
+    secrets:
+      - authorized_key
+    ports:
+      - "${ANVIL_PORT:-2222}:2222"
+    pids_limit: ${ANVIL_PID_LIMIT:-256}
+    mem_limit: ${ANVIL_MEMORY_LIMIT:-512m}
+    cpus: ${ANVIL_CPU_LIMIT:-2.0}
+    stop_grace_period: 10s
+    command:
+      - --bind-address
+      - 0.0.0.0
+      - --port
+      - "2222"
+      - --host-key
+      - /var/lib/anvil/host_key
+      - --authorized-key
+      - "${ANVIL_USER:-demo}=/run/secrets/authorized_key"
+
+secrets:
+  authorized_key:
+    file: ${ANVIL_AUTHORIZED_KEY:?set ANVIL_AUTHORIZED_KEY to an OpenSSH public-key file}
+
+volumes:
+  anvil-state:
+
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
