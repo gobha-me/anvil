@@ -700,6 +700,20 @@ void await_peer_channel_close(ssh_event event, ssh_session session, SessionState
 
 enum class SessionEnd { normal, idle_timeout, session_cap, shutdown };
 
+[[nodiscard]] std::string_view failure_reason_name(SessionFailureReason reason) noexcept {
+  switch (reason) {
+    case SessionFailureReason::none:
+      return "none";
+    case SessionFailureReason::app_returned_failure:
+      return "terminal application returned failure";
+    case SessionFailureReason::standard_exception:
+      return "standard exception escaped terminal session";
+    case SessionFailureReason::unknown_exception:
+      return "unknown exception escaped terminal session";
+  }
+  return "unknown terminal session failure";
+}
+
 int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorized_keys,
                 const Config &config, int signal_descriptor, int auth_report_descriptor) {
   SessionState state;
@@ -829,7 +843,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
         const TerminalDimensions dimensions{state.columns, state.rows, state.pixel_width,
                                             state.pixel_height};
         terminal_session = std::make_unique<TerminalSession>(
-            application_descriptor.get(), state.terminal_type, dimensions, state.channel_opened_at);
+            application_descriptor.get(), state.terminal_type, dimensions, state.channel_opened_at,
+            config.session_input_hook_for_testing);
         state.terminal_session = terminal_session.get();
         terminal_session->start();
       } catch (const std::exception &error) {
@@ -901,6 +916,11 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
                                                ssh_channel_is_open(state.channel) == 0));
     }
     application_failed = application_failed || terminal_session->failed();
+    const auto failure_reason = terminal_session->failure_reason();
+    if (failure_reason != SessionFailureReason::none) {
+      std::cerr << "anvil: session " << ::getpid() << " failed: "
+                << failure_reason_name(failure_reason) << '\n';
+    }
     const auto telemetry = terminal_session->telemetry();
     std::cerr << "anvil: session " << ::getpid() << " frames=" << telemetry.frames
               << " accepted=" << telemetry.accepted_frames << " cells=" << telemetry.cell_bytes
@@ -979,6 +999,10 @@ void reap_children(ChildMap &children, AdmissionController &admission) {
     int status = 0;
     const auto child = ::waitpid(-1, &status, WNOHANG);
     if (child > 0) {
+      if (WIFSIGNALED(status)) {
+        std::cerr << "anvil: session worker " << child << " terminated by signal "
+                  << WTERMSIG(status) << '\n';
+      }
       const auto found = children.find(child);
       if (found != children.end()) {
         const auto now = Clock::now();

@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace anvil::server {
 
@@ -26,6 +27,15 @@ struct SessionTelemetry {
   std::chrono::milliseconds first_frame_latency{};
 };
 
+enum class SessionFailureReason {
+  none,
+  app_returned_failure,
+  standard_exception,
+  unknown_exception,
+};
+
+using SessionInputHook = void (*)(std::string_view);
+
 [[nodiscard]] TerminalDimensions normalize_initial_dimensions(int columns, int rows,
                                                               int pixel_width,
                                                               int pixel_height) noexcept;
@@ -36,7 +46,8 @@ struct SessionTelemetry {
 class TerminalSession {
  public:
   TerminalSession(int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
-                  std::chrono::steady_clock::time_point channel_opened);
+                  std::chrono::steady_clock::time_point channel_opened,
+                  SessionInputHook input_hook_for_testing = nullptr);
   ~TerminalSession();
 
   TerminalSession(const TerminalSession &) = delete;
@@ -52,6 +63,7 @@ class TerminalSession {
 
   [[nodiscard]] bool finished() const noexcept;
   [[nodiscard]] bool failed() const noexcept;
+  [[nodiscard]] SessionFailureReason failure_reason() const noexcept;
   [[nodiscard]] SessionTelemetry telemetry() const noexcept;
 
  private:
