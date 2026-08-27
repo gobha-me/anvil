@@ -56,11 +56,34 @@ TEST_CASE("metrics expose opaque per-session accounting") {
   snapshot.started = now - 5s;
   snapshot.heartbeat = now;
   snapshot.accepting = true;
-  snapshot.sessions.push_back({42, 1234, 8192, {3, 2, 100, 20, 5, 25ms}});
+  snapshot.sessions.push_back(
+      {42, 1234, 8192,
+       {.frames = 3,
+        .accepted_frames = 2,
+        .cell_bytes = 100,
+        .image_transmit_bytes = 20,
+        .image_edit_bytes = 5,
+        .last_frame_cell_bytes = 7,
+        .last_frame_image_transmit_bytes = 3,
+        .last_frame_image_edit_bytes = 1,
+        .first_frame_latency = 25ms}});
 
   const auto metrics = anvil::server::render_metrics(snapshot, now);
   CHECK(metrics.body.find("anvil_ssh_active_sessions 1") != std::string::npos);
   CHECK(metrics.body.find("session=\"42\"") != std::string::npos);
-  CHECK(metrics.body.find("kind=\"cells\"} 100") != std::string::npos);
+  CHECK(metrics.body.find("anvil_session_output_bytes_total{session=\"42\",kind=\"cells\"} 100") !=
+        std::string::npos);
+  CHECK(metrics.body.find(
+            "anvil_session_last_frame_output_bytes{session=\"42\",kind=\"cells\"} 7") !=
+        std::string::npos);
+  CHECK(metrics.body.find("# TYPE anvil_session_last_frame_output_bytes gauge") !=
+        std::string::npos);
+  CHECK(metrics.body.find("anvil_session_last_frame_output_bytes{session=\"42\",kind=\"image_"
+                          "transmit\"} 3") != std::string::npos);
+  CHECK(metrics.body.find(
+            "anvil_session_last_frame_output_bytes{session=\"42\",kind=\"image_edit\"} 1") !=
+        std::string::npos);
+  CHECK(metrics.body.find("anvil_session_first_frame_seconds{session=\"42\"} 0.025000") !=
+        std::string::npos);
   CHECK(metrics.body.find("1234") == std::string::npos);
 }

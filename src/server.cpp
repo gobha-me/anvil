@@ -54,7 +54,7 @@ constexpr auto authentication_timeout = 15s;
 constexpr auto shutdown_timeout = 5s;
 constexpr int auth_report_failure_exit = 75;
 constexpr std::uint32_t worker_report_magic = 0x414E5657U;
-constexpr std::uint16_t worker_report_version = 1U;
+constexpr std::uint16_t worker_report_version = 2U;
 
 [[noreturn]] void throw_system_error(std::string_view operation);
 

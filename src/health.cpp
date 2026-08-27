@@ -453,6 +453,7 @@ HealthResponse render_metrics(const HealthSnapshot &snapshot, Clock::time_point 
           std::to_string(snapshot.supervisor_resident_bytes) + "\n";
   body += "anvil_resident_memory_bytes{role=\"health\"} " +
           std::to_string(snapshot.health_resident_bytes) + "\n";
+  body += "# TYPE anvil_session_last_frame_output_bytes gauge\n";
   for (const auto &session : snapshot.sessions) {
     const auto id = std::to_string(session.id);
     const auto label = "{session=\"" + id + "\"}";
@@ -470,6 +471,15 @@ HealthResponse render_metrics(const HealthSnapshot &snapshot, Clock::time_point 
     body += "anvil_session_output_bytes_total{session=\"" + id +
             "\",kind=\"image_edit\"} " +
             std::to_string(session.telemetry.image_edit_bytes) + "\n";
+    body += "anvil_session_last_frame_output_bytes{session=\"" + id +
+            "\",kind=\"cells\"} " +
+            std::to_string(session.telemetry.last_frame_cell_bytes) + "\n";
+    body += "anvil_session_last_frame_output_bytes{session=\"" + id +
+            "\",kind=\"image_transmit\"} " +
+            std::to_string(session.telemetry.last_frame_image_transmit_bytes) + "\n";
+    body += "anvil_session_last_frame_output_bytes{session=\"" + id +
+            "\",kind=\"image_edit\"} " +
+            std::to_string(session.telemetry.last_frame_image_edit_bytes) + "\n";
     body += "anvil_session_first_frame_seconds" + label + " " +
             std::to_string(static_cast<double>(session.telemetry.first_frame_latency.count()) /
                            1000.0) +

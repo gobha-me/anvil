@@ -163,7 +163,10 @@ failed component and reason. Storage and plugins are explicitly not configured
 during M0 rather than being silently treated as successful. `/metrics` uses the
 Prometheus text format and exposes uptime, resident memory, active sessions,
 opaque per-session frame/byte/latency counters, registered-user and door counts,
-and configured plugin status/version. It never labels a session with its
+and configured plugin status/version. Per-session byte metrics include
+`anvil_session_output_bytes_total` counters and
+`anvil_session_last_frame_output_bytes` gauges, each split into `cells`,
+`image_transmit`, and `image_edit` kinds. It never labels a session with its
 username, address, or other identity.
 
 Change the listener with `--health-bind-address` and `--health-port`. The health

@@ -95,6 +95,31 @@ def wait_for_metric(port: int, pattern: bytes, timeout: float = 5) -> bytes:
     raise AssertionError(f"metric did not match {pattern!r}: {last!r}")
 
 
+def metric_value(metrics: bytes, name: str, labels: str = "") -> float:
+    prefix = f"{name}{labels} ".encode()
+    matches = [
+        line[len(prefix):]
+        for line in metrics.splitlines()
+        if line.startswith(prefix)
+    ]
+    assert len(matches) == 1, (prefix, matches, metrics)
+    return float(matches[0])
+
+
+def wait_for_session_frame(port: int, session: str, minimum: int,
+                           timeout: float = 5) -> bytes:
+    deadline = time.monotonic() + timeout
+    labels = f'{{session="{session}"}}'
+    last = b""
+    while time.monotonic() < deadline:
+        status, _, last = request(port, "/metrics")
+        if status == 200 and metric_value(
+                last, "anvil_session_frames_total", labels) >= minimum:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"session {session} did not reach frame {minimum}: {last!r}")
+
+
 def test_live_server(executable: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="anvil-health-test-") as directory_name:
         directory = pathlib.Path(directory_name)
@@ -135,8 +160,85 @@ def test_live_server(executable: pathlib.Path) -> None:
                 health_port, rb"anvil_session_frames_total\{session=\"[0-9]+\"\} [1-9]"
             )
             assert b"anvil_ssh_active_sessions 1" in metrics, metrics
+            match = re.search(
+                rb'anvil_session_frames_total\{session="([0-9]+)"\} ([1-9][0-9]*)', metrics
+            )
+            assert match is not None, metrics
+            session_id = match.group(1).decode()
+            session_labels = f'{{session="{session_id}"}}'
+            cells_labels = f'{{session="{session_id}",kind="cells"}}'
+            image_transmit_labels = (
+                f'{{session="{session_id}",kind="image_transmit"}}'
+            )
+            image_edit_labels = f'{{session="{session_id}",kind="image_edit"}}'
+            initial_frames = int(metric_value(
+                metrics, "anvil_session_frames_total", session_labels
+            ))
+            initial_accepted = int(metric_value(
+                metrics, "anvil_session_accepted_frames_total", session_labels
+            ))
+            initial_cells = int(metric_value(
+                metrics, "anvil_session_output_bytes_total", cells_labels
+            ))
+            initial_frame_cells = int(metric_value(
+                metrics, "anvil_session_last_frame_output_bytes", cells_labels
+            ))
+            initial_latency = metric_value(
+                metrics, "anvil_session_first_frame_seconds", session_labels
+            )
+            assert initial_frames == 1, metrics
+            assert initial_accepted == 1, metrics
+            assert initial_cells == initial_frame_cells and initial_cells > 0, metrics
+            assert initial_latency >= 0, metrics
+            assert metric_value(
+                metrics, "anvil_session_last_frame_output_bytes", image_transmit_labels
+            ) == 0, metrics
+            assert metric_value(
+                metrics, "anvil_session_last_frame_output_bytes", image_edit_labels
+            ) == 0, metrics
+
+            time.sleep(0.35)
+            status, _, idle_metrics = request(health_port, "/metrics")
+            assert status == 200, idle_metrics
+            assert metric_value(
+                idle_metrics, "anvil_session_frames_total", session_labels
+            ) == initial_frames, idle_metrics
+            assert metric_value(
+                idle_metrics, "anvil_session_accepted_frames_total", session_labels
+            ) == initial_accepted, idle_metrics
+            assert metric_value(
+                idle_metrics, "anvil_session_output_bytes_total", cells_labels
+            ) == initial_cells, idle_metrics
+
             assert session.stdin is not None
-            session.stdin.write(b"health-check\x1b")
+            session.stdin.write(b"Q")
+            session.stdin.flush()
+            read_until(session, b"Q")
+            metrics = wait_for_session_frame(health_port, session_id, initial_frames + 1)
+            second_frames = int(metric_value(
+                metrics, "anvil_session_frames_total", session_labels
+            ))
+            second_accepted = int(metric_value(
+                metrics, "anvil_session_accepted_frames_total", session_labels
+            ))
+            second_cells = int(metric_value(
+                metrics, "anvil_session_output_bytes_total", cells_labels
+            ))
+            second_frame_cells = int(metric_value(
+                metrics, "anvil_session_last_frame_output_bytes", cells_labels
+            ))
+            incremental_frames = second_frames - initial_frames
+            assert incremental_frames >= 1, metrics
+            assert second_accepted == initial_accepted + incremental_frames, metrics
+            assert 0 < second_frame_cells < initial_frame_cells, metrics
+            assert (
+                second_frame_cells <= second_cells - initial_cells < initial_frame_cells
+            ), metrics
+            assert metric_value(
+                metrics, "anvil_session_first_frame_seconds", session_labels
+            ) == initial_latency, metrics
+
+            session.stdin.write(b"\x1b")
             session.stdin.flush()
             session.communicate(timeout=10)
             session = None
