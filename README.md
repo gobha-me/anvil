@@ -452,10 +452,10 @@ epoch-seconds value.
 Transactions are move-only. A successful commit or an explicit rollback ends
 the transaction; destroying an unfinished transaction rolls it back exactly
 once. A failed commit leaves the transaction active so stack unwinding still
-rolls it back. Store implementations keep database-specific transaction state
-behind `TransactionBackend`; domain queries are added with the board,
-moderation, and door-state features that own them rather than pre-freezing a
-SQLite-shaped API.
+rolls it back. The originating `Store` must outlive its active transactions.
+Store implementations keep database-specific transaction state behind
+`TransactionBackend`; domain queries are added with the board, moderation, and
+door-state features that own them rather than pre-freezing a SQLite-shaped API.
 
 The test suite provides a database-free in-memory implementation so domain
 logic can depend on `Store` without linking SQLite. The SQLite WAL backend,

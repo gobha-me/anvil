@@ -42,8 +42,9 @@ enum class TransactionMode {
 class Store;
 class TransactionBackend;
 
-// A transaction is bound to the Store that created it. It is move-only and
-// rolls back on destruction unless a commit or explicit rollback completed it.
+// A transaction is bound to the Store that created it. The Store must outlive
+// every active transaction. Transactions are move-only and roll back on
+// destruction unless a commit or explicit rollback completed them.
 class Transaction final {
 public:
   ~Transaction() noexcept;
