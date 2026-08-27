@@ -1,6 +1,9 @@
 #include <anvil/loader.hpp>
 #include <anvil/sdk.hpp>
+#include <anvil/store.hpp>
 
+#include <expected>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -11,7 +14,35 @@ IDoor::~IDoor() noexcept = default;
 
 } // namespace anvil
 
+namespace {
+
+class ConsumerTransaction final : public anvil::store::TransactionBackend {
+public:
+  [[nodiscard]] auto commit()
+      -> std::expected<void, anvil::store::Error> override {
+    return {};
+  }
+  void rollback() noexcept override {}
+};
+
+class ConsumerStore final : public anvil::store::Store {
+public:
+  [[nodiscard]] auto begin(anvil::store::TransactionMode)
+      -> std::expected<anvil::store::Transaction,
+                       anvil::store::Error> override {
+    return make_transaction(std::make_unique<ConsumerTransaction>());
+  }
+};
+
+} // namespace
+
 auto main() -> int {
+  ConsumerStore store;
+  auto transaction = store.begin(anvil::store::TransactionMode::read_only);
+  if (!transaction || !transaction->commit()) {
+    return 1;
+  }
+
   const std::string text{"external consumer"};
   const auto borrowed = anvil::sdk::as_str(text);
   std::vector<unsigned int> values{1, 2, 3};

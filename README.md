@@ -441,6 +441,27 @@ supplies the Anvil policy and names every mismatch. Symbol names are
 configurable and default to `anvil_abi_tag`,
 `anvil_plugin_create`, and `anvil_plugin_destroy`.
 
+## Storage interface
+
+`anvil::store` is the installed, host-only C++23 persistence seam. It is
+separate from the fixed-layout plugin SDK boundary and may use standard-library
+types. `<anvil/store.hpp>` provides a backend-neutral `Store`, structured
+errors, explicit read-only and read-write transaction modes, and a signed UTC
+epoch-seconds value.
+
+Transactions are move-only. A successful commit or an explicit rollback ends
+the transaction; destroying an unfinished transaction rolls it back exactly
+once. A failed commit leaves the transaction active so stack unwinding still
+rolls it back. Store implementations keep database-specific transaction state
+behind `TransactionBackend`; domain queries are added with the board,
+moderation, and door-state features that own them rather than pre-freezing a
+SQLite-shaped API.
+
+The test suite provides a database-free in-memory implementation so domain
+logic can depend on `Store` without linking SQLite. The SQLite WAL backend,
+forward-only migrations, schema, and tombstone-filtered queries remain the
+next storage milestones.
+
 ## Version compatibility
 
 Plugin compatibility is stated against the plugin interface, not the server or
@@ -458,6 +479,15 @@ independent stream.
 | `0.6.0` | `1.0–1.2` |
 | `0.7.0` | `1.0–1.2` |
 | `0.8.0` | `1.0–1.2` |
+| `0.9.0` | `1.0–1.2` |
+| `0.10.0` | `1.0–1.2` |
+| `0.11.0` | `1.0–1.2` |
+| `0.12.0` | `1.0–1.2` |
+| `0.13.0` | `1.0–1.2` |
+| `0.14.0` | `1.0–1.2` |
+| `0.15.0` | `1.0–1.2` |
+| `0.16.0` | `1.0–1.2` |
+| `0.17.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one
