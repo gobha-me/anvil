@@ -236,11 +236,17 @@ if(ANVIL_SERVER)
   target_compile_options(anvil_failure_test_server PRIVATE ${ANVIL_WARNING_FLAGS})
   target_link_libraries(anvil_failure_test_server PRIVATE anvil_server)
 
-  add_executable(anvil_server_tests test_admission.cpp test_health.cpp test_server.cpp)
+  add_executable(anvil_server_tests
+    test_admission.cpp
+    test_health.cpp
+    test_server.cpp
+    test_sqlite_store.cpp
+  )
   target_compile_features(anvil_server_tests PRIVATE cxx_std_23)
   target_compile_options(anvil_server_tests PRIVATE ${ANVIL_WARNING_FLAGS})
   target_link_libraries(anvil_server_tests
     PRIVATE anvil_server
+    PRIVATE anvil::store
     PRIVATE Catch2::Catch2WithMain
   )
   catch_discover_tests(anvil_server_tests)

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.17.0 LANGUAGES CXX)
+project(anvil VERSION 0.18.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -83,12 +83,14 @@ if(ANVIL_SERVER)
   include(cmake/deps/libssh.cmake)
   include(cmake/deps/termforge.cmake)
   include(cmake/deps/httplib.cmake)
+  include(cmake/deps/sqlite3.cmake)
   find_package(Threads REQUIRED)
 
   add_library(anvil_server STATIC
     src/admission.cpp
     src/health.cpp
     src/server.cpp
+    src/sqlite_store.cpp
     src/terminal_session.cpp
   )
   target_compile_features(anvil_server PUBLIC cxx_std_23)
@@ -97,7 +99,8 @@ if(ANVIL_SERVER)
   target_include_directories(anvil_server PUBLIC ${PROJECT_SOURCE_DIR}/src)
   target_link_libraries(anvil_server
     PUBLIC ${ANVIL_LIBSSH_TARGET}
-    PRIVATE termforge::lib httplib::httplib Threads::Threads
+    PRIVATE anvil::store termforge::lib httplib::httplib SQLite::SQLite3
+            Threads::Threads
   )
 
   add_executable(anvil src/main.cpp)

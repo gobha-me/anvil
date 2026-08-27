@@ -9,6 +9,7 @@ import pathlib
 import re
 import select
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -132,6 +133,7 @@ def test_live_server(executable: pathlib.Path) -> None:
             [
                 str(executable), "--bind-address", "127.0.0.1", "--port", str(ssh_port),
                 "--health-bind-address", "127.0.0.1", "--health-port", str(health_port),
+                "--database", str(directory / "anvil.db"),
                 "--host-key", str(host_key), "--authorized-key", f"tester={client_key}.pub",
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -145,8 +147,8 @@ def test_live_server(executable: pathlib.Path) -> None:
             ready = json.loads(body)
             assert status == 200 and ready["status"] == "ready", body
             assert ready["components"] == [
-                {"kind": "storage", "name": "database", "state": "not_configured",
-                 "version": ""}
+                {"kind": "storage", "name": "database", "state": "ready",
+                 "version": "1"}
             ], ready
             metrics = wait_for_metric(health_port, rb"anvil_ssh_active_sessions 0")
             assert b"tester" not in metrics and b"127.0.0.1" not in metrics, metrics
@@ -259,6 +261,23 @@ def test_live_server(executable: pathlib.Path) -> None:
                 server.communicate(timeout=10)
 
 
+def test_newer_database_refuses_startup(executable: pathlib.Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="anvil-newer-database-") as directory_name:
+        database = pathlib.Path(directory_name) / "anvil.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA application_id=1095652940")
+            connection.execute("PRAGMA user_version=2")
+        result = subprocess.run(
+            [
+                str(executable), "--database", str(database),
+                "--host-key", "unused", "--authorized-key", "tester=unused",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False,
+        )
+        assert result.returncode == 2, result
+        assert b"schema version is newer" in result.stderr, result.stderr
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         raise SystemExit("usage: test_health_http.py HEALTH_TEST_SERVER ANVIL")
@@ -268,6 +287,7 @@ def main() -> int:
     test_component_failure(
         health_server, "plugin-failed", 'hostile"plugin', "ABI tag mismatch"
     )
+    test_newer_database_refuses_startup(anvil)
     test_live_server(anvil)
     return 0
 

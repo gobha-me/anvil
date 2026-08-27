@@ -10,6 +10,7 @@ RUN apt-get update \
       cmake \
       g++-13 \
       git \
+      libsqlite3-dev \
       libssl-dev \
       ninja-build \
       openssh-client \

@@ -35,6 +35,8 @@ services:
       - 127.0.0.1
       - --health-port
       - "8080"
+      - --database
+      - /var/lib/anvil/anvil.db
       - --host-key
       - /var/lib/anvil/host_key
       - --authorized-key

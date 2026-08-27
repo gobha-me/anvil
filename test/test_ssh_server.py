@@ -58,6 +58,7 @@ def server_command(executable: pathlib.Path, port: int, host_key: pathlib.Path,
         "--max-sessions-per-ip", "8",
         "--connection-rate-limit", "1000/1",
         "--auth-attempt-rate-limit", "1000/1",
+        "--database", str(client_key.with_name(f"anvil-{port}.db")),
         "--host-key", str(host_key),
         "--authorized-key", f"tester={client_key}.pub",
     ]
@@ -222,7 +223,8 @@ def main() -> int:
         linked_key = directory / "linked_key.pub"
         linked_key.symlink_to(f"{client_key}.pub")
         assert_refused(
-            [str(executable), "--host-key", str(provided_host_key),
+            [str(executable), "--database", str(directory / "linked-key.db"),
+             "--host-key", str(provided_host_key),
              "--authorized-key", f"tester={linked_key}"],
             b"cannot open key file",
         )

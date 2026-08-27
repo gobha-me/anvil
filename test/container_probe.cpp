@@ -2,6 +2,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -44,6 +45,19 @@ constexpr auto connect_timeout = std::chrono::seconds(3);
   if (::unlink(path) != 0) {
     std::cerr << "cleanup failed: " << std::strerror(errno) << '\n';
     return 11;
+  }
+  return 0;
+}
+
+[[nodiscard]] int probe_file(const char *path) {
+  struct stat metadata {};
+  if (::stat(path, &metadata) != 0) {
+    std::cerr << "file unavailable: " << std::strerror(errno) << '\n';
+    return 12;
+  }
+  if (!S_ISREG(metadata.st_mode) || metadata.st_size <= 0) {
+    std::cerr << "path is not a non-empty regular file\n";
+    return 13;
   }
   return 0;
 }
@@ -115,9 +129,12 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::string_view{argv[1]} == "write") {
     return probe_write(argv[2]);
   }
+  if (argc == 3 && std::string_view{argv[1]} == "file") {
+    return probe_file(argv[2]);
+  }
   if (argc == 4 && std::string_view{argv[1]} == "connect") {
     return probe_connect(argv[2], argv[3]);
   }
-  std::cerr << "usage: container-probe write PATH | connect HOST PORT\n";
+  std::cerr << "usage: container-probe write PATH | file PATH | connect HOST PORT\n";
   return EXIT_FAILURE;
 }
