@@ -40,6 +40,7 @@
 
 #include "admission.hpp"
 #include "health.hpp"
+#include "sqlite_store.hpp"
 #include "terminal_session.hpp"
 
 namespace anvil::server {
@@ -1200,6 +1201,7 @@ std::string_view usage() noexcept {
          "  --port PORT             TCP port to listen on (default 2222)\n"
          "  --health-bind-address A private HTTP address (default 127.0.0.1)\n"
          "  --health-port PORT      private HTTP port (default 8080)\n"
+         "  --database PATH        SQLite database (default anvil.db)\n"
          "  --max-sessions COUNT    concurrent worker limit (default 64)\n"
          "  --max-sessions-per-ip N concurrent worker limit per IP (default 4)\n"
          "  --connection-rate-limit C/S\n"
@@ -1231,6 +1233,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
     if (argument != "--bind-address" && argument != "--port" &&
         argument != "--health-bind-address" && argument != "--health-port" &&
+        argument != "--database" &&
         argument != "--max-sessions" &&
         argument != "--max-sessions-per-ip" && argument != "--connection-rate-limit" &&
         argument != "--auth-attempt-rate-limit" &&
@@ -1255,6 +1258,8 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       result.config.health_bind_address = value;
     } else if (argument == "--health-port") {
       result.config.health_port = parse_port(value);
+    } else if (argument == "--database") {
+      result.config.database_path = value;
     } else if (argument == "--max-sessions") {
       result.config.max_sessions = parse_session_limit(value);
     } else if (argument == "--max-sessions-per-ip") {
@@ -1310,6 +1315,13 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
 }
 
 int run(const Config &config) {
+  auto database = store::SqliteStore::open(config.database_path);
+  if (!database) {
+    throw std::runtime_error("cannot initialize database '" +
+                             config.database_path + "': " +
+                             database.error().detail);
+  }
+
   if (ssh_init() != SSH_OK) {
     throw std::runtime_error("libssh initialization failed");
   }
@@ -1371,7 +1383,8 @@ int run(const Config &config) {
        worker_report_sender.get()},
   });
   health->set_component(
-      ComponentStatus{ComponentKind::storage, ComponentState::not_configured, "database", {}, {}});
+      ComponentStatus{ComponentKind::storage, ComponentState::ready, "database",
+                      std::to_string((*database)->schema_version()), {}});
   health->heartbeat(true);
 
   AdmissionController admission(config.max_sessions, config.max_sessions_per_ip,

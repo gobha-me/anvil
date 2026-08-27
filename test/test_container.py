@@ -133,6 +133,11 @@ def assert_write_policy(volume: str) -> None:
           extra=[*common, "--volume", f"{volume}:/var/lib/anvil"])
 
 
+def assert_database_persisted(volume: str) -> None:
+    probe(["file", "/var/lib/anvil/anvil.db"],
+          extra=["--volume", f"{volume}:/var/lib/anvil"])
+
+
 def assert_compose_posture(configuration: dict[str, object], inspection: dict[str, object]) -> None:
     services = configuration["services"]
     assert isinstance(services, dict)
@@ -268,6 +273,8 @@ def main(runtime_target: str = "runtime") -> int:
             "      - 0.0.0.0\n"
             "      - --port\n"
             "      - '2222'\n"
+            "      - --database\n"
+            "      - /var/lib/anvil/anvil.db\n"
             "      - --host-key\n"
             "      - /var/lib/anvil/host_key\n"
             "      - --authorized-key\n"
@@ -312,6 +319,7 @@ def main(runtime_target: str = "runtime") -> int:
                 raise
             assert_compose_posture(default_configuration, inspection)
             assert_write_policy(volume)
+            assert_database_persisted(volume)
             first_key = scan_host_key(port)
             assert_ssh_session(port, "container-test")
             assert_egress(identifier, allowed=False)
@@ -331,6 +339,7 @@ def main(runtime_target: str = "runtime") -> int:
                 raise
             if scan_host_key(port) != first_key:
                 raise AssertionError("container recreation changed the persistent host identity")
+            assert_database_persisted(volume)
             assert_egress(identifier, allowed=True)
         finally:
             compose(["down", "--volumes", "--remove-orphans"], env, egress=True,

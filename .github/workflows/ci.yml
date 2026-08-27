@@ -71,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install SSH server test dependencies
-        run: sudo apt-get install --yes libssl-dev openssh-client
+        run: sudo apt-get install --yes libsqlite3-dev libssl-dev openssh-client
       - name: Install Clang 20
         if: ${{ startsWith(matrix.cxx, 'clang') }}
         env:

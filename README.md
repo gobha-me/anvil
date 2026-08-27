@@ -91,6 +91,7 @@ install -d -m 700 state
   --idle-timeout-seconds 300 \
   --idle-warning-seconds 30 \
   --session-cap-seconds 86400 \
+  --database state/anvil.db \
   --host-key state/host_key \
   --authorized-key demo="$HOME/.ssh/id_ed25519.pub"
 ```
@@ -159,8 +160,9 @@ curl --fail http://127.0.0.1:8080/metrics
 `/livez` is healthy only while the supervisor heartbeat is current and the SSH
 listener is accepting. `/readyz` additionally fails when any configured storage
 backend is unreachable or any enabled plugin failed to load, and names the
-failed component and reason. Storage and plugins are explicitly not configured
-during M0 rather than being silently treated as successful. `/metrics` uses the
+failed component and reason. The default SQLite component reports its schema
+version; plugins remain explicitly not configured until the registry exists.
+`/metrics` uses the
 Prometheus text format and exposes uptime, resident memory, active sessions,
 opaque per-session frame/byte/latency counters, registered-user and door counts,
 and configured plugin status/version. Per-session byte metrics include
@@ -458,9 +460,28 @@ Store implementations keep database-specific transaction state behind
 door-state features that own them rather than pre-freezing a SQLite-shaped API.
 
 The test suite provides a database-free in-memory implementation so domain
-logic can depend on `Store` without linking SQLite. The SQLite WAL backend,
-forward-only migrations, schema, and tombstone-filtered queries remain the
-next storage milestones.
+logic can depend on `Store` without linking SQLite. The server's private SQLite
+implementation keeps that property: it stores only a path and opens an
+independent connection for each transaction, so session-worker forks never
+inherit a live database handle. Read transactions are SQLite `query_only`
+deferred transactions; write transactions begin immediately and competing
+writers wait for at most five seconds.
+
+At startup Anvil creates `anvil.db` in the working directory unless
+`--database PATH` overrides it, enables WAL mode with `synchronous=FULL`, and
+applies every pending migration in one transaction before opening either
+listener or forking. Migrations are compiled into the binary, strictly
+forward-only, and tracked with SQLite's `user_version`. Schema version 1 claims
+the otherwise empty file with application ID `ANVL`; an unknown application ID,
+a non-empty unclaimed file, corrupt data, or a schema newer than the binary
+stops startup. There is deliberately no migration metadata table, so issue #33
+can add only the domain tables specified by the storage contract.
+
+WAL's default 1,000-page automatic checkpoint remains enabled. `FULL` is
+intentional: a low-volume BBS should not trade away the most recent committed
+posts on sudden power loss merely to remove one sync per commit. The database,
+its `-wal` file, and its `-shm` file are one unit of live state; use SQLite's
+backup API rather than copying any of them while the server is running.
 
 ## Version compatibility
 
@@ -488,6 +509,7 @@ independent stream.
 | `0.15.0` | `1.0–1.2` |
 | `0.16.0` | `1.0–1.2` |
 | `0.17.0` | `1.0–1.2` |
+| `0.18.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one

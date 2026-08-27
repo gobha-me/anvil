@@ -21,6 +21,8 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"127.0.0.2"},
       std::string_view{"--health-port"},
       std::string_view{"22023"},
+      std::string_view{"--database"},
+      std::string_view{"state/anvil.db"},
       std::string_view{"--max-sessions"},
       std::string_view{"12"},
       std::string_view{"--max-sessions-per-ip"},
@@ -54,6 +56,7 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.port == 22022);
   CHECK(parsed.config.health_bind_address == "127.0.0.2");
   CHECK(parsed.config.health_port == 22023);
+  CHECK(parsed.config.database_path == "state/anvil.db");
   CHECK(parsed.config.max_sessions == 12);
   CHECK(parsed.config.max_sessions_per_ip == 3);
   CHECK(parsed.config.connection_rate.count == 20);
@@ -125,6 +128,7 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.max_sessions == 64);
   CHECK(parsed.config.health_bind_address == "127.0.0.1");
   CHECK(parsed.config.health_port == 8080);
+  CHECK(parsed.config.database_path == "anvil.db");
   CHECK(parsed.config.max_sessions_per_ip == 4);
   CHECK(parsed.config.connection_rate.count == 10);
   CHECK(parsed.config.connection_rate.period.count() == 10);

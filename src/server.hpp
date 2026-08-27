@@ -24,6 +24,7 @@ struct Config {
   std::uint16_t port{2222};
   std::string health_bind_address{"127.0.0.1"};
   std::uint16_t health_port{8080};
+  std::string database_path{"anvil.db"};
   std::uint32_t max_sessions{64};
   std::uint32_t max_sessions_per_ip{4};
   RateLimit connection_rate{10, std::chrono::seconds(10)};
