@@ -121,6 +121,14 @@ add_dependencies(anvil_sdk_wrapper_tests
   fixture_sdk_wrapper_throwing_factory
 )
 
+add_executable(anvil_store_tests test_store.cpp)
+target_compile_features(anvil_store_tests PRIVATE cxx_std_23)
+target_compile_options(anvil_store_tests PRIVATE ${ANVIL_WARNING_FLAGS})
+target_link_libraries(anvil_store_tests
+  PRIVATE anvil::store
+  PRIVATE Catch2::Catch2WithMain
+)
+
 add_executable(anvil_cross_stdlib_host cross_stdlib_host.cpp)
 set_target_properties(anvil_cross_stdlib_host PROPERTIES ENABLE_EXPORTS ON)
 target_compile_features(anvil_cross_stdlib_host PRIVATE cxx_std_23)
@@ -220,6 +228,7 @@ include(Catch)
 catch_discover_tests(anvil_loader_tests)
 catch_discover_tests(anvil_sdk_tests)
 catch_discover_tests(anvil_sdk_wrapper_tests)
+catch_discover_tests(anvil_store_tests)
 
 if(ANVIL_SERVER)
   add_executable(anvil_failure_test_server failure_server_main.cpp)

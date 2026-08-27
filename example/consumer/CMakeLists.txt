@@ -23,6 +23,7 @@ set_target_properties(anvil_loader_consumer PROPERTIES ENABLE_EXPORTS ON)
 target_link_libraries(anvil_loader_consumer
   PRIVATE anvil::loader
   PRIVATE anvil::sdk
+  PRIVATE anvil::store
 )
 
 add_library(anvil_consumer_plugin SHARED plugin.cpp)
