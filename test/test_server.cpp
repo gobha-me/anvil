@@ -17,6 +17,10 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"::1"},
       std::string_view{"--port"},
       std::string_view{"22022"},
+      std::string_view{"--health-bind-address"},
+      std::string_view{"127.0.0.2"},
+      std::string_view{"--health-port"},
+      std::string_view{"22023"},
       std::string_view{"--max-sessions"},
       std::string_view{"12"},
       std::string_view{"--max-sessions-per-ip"},
@@ -48,6 +52,8 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK_FALSE(parsed.show_help);
   CHECK(parsed.config.bind_address == "::1");
   CHECK(parsed.config.port == 22022);
+  CHECK(parsed.config.health_bind_address == "127.0.0.2");
+  CHECK(parsed.config.health_port == 22023);
   CHECK(parsed.config.max_sessions == 12);
   CHECK(parsed.config.max_sessions_per_ip == 3);
   CHECK(parsed.config.connection_rate.count == 20);
@@ -81,6 +87,8 @@ TEST_CASE("server CLI rejects malformed hostile values") {
   CHECK_THROWS_AS(parse("--port", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--port", "65536"), std::runtime_error);
   CHECK_THROWS_AS(parse("--port", "22x"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--health-port", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--health-port", "65536"), std::runtime_error);
   CHECK_THROWS_AS(parse("--max-sessions", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--max-sessions", "4097"), std::runtime_error);
   CHECK_THROWS_AS(parse("--max-sessions-per-ip", "0"), std::runtime_error);
@@ -115,6 +123,8 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.idle_warning.count() == 30);
   CHECK(parsed.config.session_cap.count() == 86'400);
   CHECK(parsed.config.max_sessions == 64);
+  CHECK(parsed.config.health_bind_address == "127.0.0.1");
+  CHECK(parsed.config.health_port == 8080);
   CHECK(parsed.config.max_sessions_per_ip == 4);
   CHECK(parsed.config.connection_rate.count == 10);
   CHECK(parsed.config.connection_rate.period.count() == 10);
@@ -146,6 +156,16 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
       std::string_view{"3"},
   };
   CHECK_THROWS_AS(anvil::server::parse_arguments(invalid_cross_field), std::runtime_error);
+
+  const std::array conflicting_ports{
+      std::string_view{"--host-key"},
+      std::string_view{"host_key"},
+      std::string_view{"--authorized-key"},
+      std::string_view{"user=key.pub"},
+      std::string_view{"--port"},
+      std::string_view{"8080"},
+  };
+  CHECK_THROWS_AS(anvil::server::parse_arguments(conflicting_ports), std::runtime_error);
 }
 
 TEST_CASE("server CLI help does not require operational arguments") {

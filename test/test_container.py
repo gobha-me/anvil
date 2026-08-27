@@ -151,6 +151,13 @@ def assert_compose_posture(configuration: dict[str, object], inspection: dict[st
         for argument in command
     ):
         raise AssertionError("Compose does not read the authorized key from the secret mount")
+    if "--health-bind-address" not in command or "127.0.0.1" not in command:
+        raise AssertionError("Compose does not keep the health listener on loopback")
+    published = service.get("ports")
+    if not isinstance(published, list) or any(
+        isinstance(item, dict) and item.get("target") != 2222 for item in published
+    ):
+        raise AssertionError(f"Compose publishes a non-SSH port: {published!r}")
 
     config = inspection["Config"]
     host = inspection["HostConfig"]
