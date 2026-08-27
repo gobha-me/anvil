@@ -25,6 +25,8 @@ struct SessionTelemetry {
   std::uint64_t image_transmit_bytes{};
   std::uint64_t image_edit_bytes{};
   std::chrono::milliseconds first_frame_latency{};
+
+  [[nodiscard]] auto operator==(const SessionTelemetry &) const noexcept -> bool = default;
 };
 
 enum class SessionFailureReason {

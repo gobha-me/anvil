@@ -14,8 +14,8 @@ container.
 > **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
 > boundary types, process-isolated TermForge SSH session, persistent host
 > identity, live remote resize handling, bounded session lifecycles,
-> supervisor-enforced per-IP admission limits, and the hardened container are
-> implemented. See
+> supervisor-enforced per-IP admission limits, private health/readiness/metrics,
+> and the hardened container are implemented. See
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
 > tracker for the work breakdown.
 
@@ -134,7 +134,7 @@ Operators can set all three positive durations in whole seconds with
 `--session-cap-seconds`; the warning must remain shorter than the idle timeout.
 Each completed shell logs its rendered-frame count, accepted frames, byte
 breakdown, and channel-open-to-first-frame latency. These are the internal M0
-measurements that the future metrics endpoint will expose.
+measurements exposed by the private metrics endpoint.
 
 Each SSH connection runs in a dedicated worker process during the M0 staging
 architecture. An exception escaping the terminal application closes only that
@@ -143,6 +143,34 @@ its process id. A fatal signal likewise terminates only its worker; the
 supervisor reaps it, releases its admission slot, and continues serving other
 and new sessions. A future transition to pooled in-process sessions must prove
 this isolation contract again before replacing the worker boundary.
+
+## Private health and metrics
+
+Anvil serves operational HTTP endpoints on `127.0.0.1:8080` by default, in a
+dedicated process that cannot add threads to the SSH supervisor before it forks
+session workers:
+
+```sh
+curl --fail http://127.0.0.1:8080/livez
+curl --fail http://127.0.0.1:8080/readyz
+curl --fail http://127.0.0.1:8080/metrics
+```
+
+`/livez` is healthy only while the supervisor heartbeat is current and the SSH
+listener is accepting. `/readyz` additionally fails when any configured storage
+backend is unreachable or any enabled plugin failed to load, and names the
+failed component and reason. Storage and plugins are explicitly not configured
+during M0 rather than being silently treated as successful. `/metrics` uses the
+Prometheus text format and exposes uptime, resident memory, active sessions,
+opaque per-session frame/byte/latency counters, registered-user and door counts,
+and configured plugin status/version. It never labels a session with its
+username, address, or other identity.
+
+Change the listener with `--health-bind-address` and `--health-port`. The health
+port must differ from the SSH port. The default Compose deployment does not
+publish port 8080. If a non-loopback bind is required for a private monitoring
+network, put it behind authentication and do not publish it on the public SSH
+ingress: the metrics are a presence and population feed.
 
 ## Hardened container
 

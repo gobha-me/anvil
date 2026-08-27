@@ -29,6 +29,7 @@ def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
             str(executable),
             "--bind-address", "127.0.0.1",
             "--port", str(port),
+            "--health-port", str(reserve_port()),
             "--max-sessions", "8",
             "--idle-timeout-seconds", str(idle),
             "--idle-warning-seconds", str(warning),
@@ -76,13 +77,14 @@ def read_until(process: subprocess.Popen[bytes], expected: bytes,
     )
 
 
-def wait_for_no_children(supervisor: subprocess.Popen[bytes], timeout: float = 5) -> None:
+def wait_for_no_session_children(supervisor: subprocess.Popen[bytes], timeout: float = 5) -> None:
     children_path = pathlib.Path(
         f"/proc/{supervisor.pid}/task/{supervisor.pid}/children"
     )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if children_path.read_text().strip() == "":
+        # The dedicated health process is a permanent supervised child.
+        if len(children_path.read_text().split()) == 1:
             return
         time.sleep(0.05)
     raise AssertionError(f"workers were not reaped: {children_path.read_text()!r}")
@@ -142,7 +144,7 @@ def main() -> int:
                     session, b"session closed after the idle timeout", 6
                 )
                 assert session.returncode != 0, (session.returncode, output, error)
-            wait_for_no_children(idle_server)
+            wait_for_no_session_children(idle_server)
             normal = shell_session(ssh_command(idle_port, client_key), b"still-alive\n")
             assert normal.returncode == 0, normal
             assert b"still-alive" in normal.stdout, normal.stdout

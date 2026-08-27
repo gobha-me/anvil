@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "admission.hpp"
+#include "health.hpp"
 #include "terminal_session.hpp"
 
 namespace anvil::server {
@@ -52,6 +53,8 @@ constexpr std::size_t max_pending_input = 64U * 1024U;
 constexpr auto authentication_timeout = 15s;
 constexpr auto shutdown_timeout = 5s;
 constexpr int auth_report_failure_exit = 75;
+constexpr std::uint32_t worker_report_magic = 0x414E5657U;
+constexpr std::uint16_t worker_report_version = 1U;
 
 [[noreturn]] void throw_system_error(std::string_view operation);
 
@@ -161,7 +164,7 @@ struct SessionState {
   ssh_channel channel{};
   unsigned int auth_attempts{};
   unsigned int max_auth_attempts{};
-  int auth_report_descriptor{-1};
+  int worker_report_descriptor{-1};
   bool authenticated{};
   bool auth_report_failed{};
   bool channel_callbacks_installed{};
@@ -182,11 +185,18 @@ struct SessionState {
   bool idle_warning_sent{};
 };
 
-struct AuthAttemptEvent {
+enum class WorkerReportKind : std::uint16_t { denied_auth, telemetry };
+
+struct WorkerReport {
+  std::uint32_t magic{worker_report_magic};
+  std::uint16_t version{worker_report_version};
+  WorkerReportKind kind{};
   pid_t worker{};
+  std::uint64_t session_id{};
+  SessionTelemetry telemetry;
 };
 
-static_assert(std::is_trivially_copyable_v<AuthAttemptEvent>);
+static_assert(std::is_trivially_copyable_v<WorkerReport>);
 
 [[noreturn]] void throw_system_error(std::string_view operation) {
   throw std::system_error(errno, std::generic_category(), std::string(operation));
@@ -441,14 +451,17 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
 
 void report_denied_auth_attempt(SessionState &state) noexcept {
   ++state.auth_attempts;
-  if (state.auth_report_descriptor < 0) {
+  if (state.worker_report_descriptor < 0) {
     state.auth_report_failed = true;
     state.close_requested = true;
     return;
   }
-  const AuthAttemptEvent event{.worker = ::getpid()};
+  const WorkerReport event{.kind = WorkerReportKind::denied_auth,
+                           .worker = ::getpid(),
+                           .telemetry = {}};
   for (;;) {
-    const auto count = ::send(state.auth_report_descriptor, &event, sizeof(event), MSG_NOSIGNAL);
+    const auto count =
+        ::send(state.worker_report_descriptor, &event, sizeof(event), MSG_NOSIGNAL);
     if (count == static_cast<ssize_t>(sizeof(event))) {
       return;
     }
@@ -459,6 +472,18 @@ void report_denied_auth_attempt(SessionState &state) noexcept {
     state.close_requested = true;
     return;
   }
+}
+
+void report_telemetry(int descriptor, std::uint64_t session_id,
+                      const SessionTelemetry &telemetry) noexcept {
+  const WorkerReport report{.kind = WorkerReportKind::telemetry,
+                            .worker = ::getpid(),
+                            .session_id = session_id,
+                            .telemetry = telemetry};
+  ssize_t count = -1;
+  do {
+    count = ::send(descriptor, &report, sizeof(report), MSG_NOSIGNAL);
+  } while (count < 0 && errno == EINTR);
 }
 
 int authenticate_public_key(ssh_session, const char *user, ssh_key offered_key,
@@ -715,11 +740,12 @@ enum class SessionEnd { normal, idle_timeout, session_cap, shutdown };
 }
 
 int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorized_keys,
-                const Config &config, int signal_descriptor, int auth_report_descriptor) {
+                const Config &config, int signal_descriptor, int worker_report_descriptor,
+                std::uint64_t session_id) {
   SessionState state;
   state.authorized_keys = &authorized_keys;
   state.max_auth_attempts = config.max_auth_attempts_per_session;
-  state.auth_report_descriptor = auth_report_descriptor;
+  state.worker_report_descriptor = worker_report_descriptor;
   state.pending_input.reserve(4096);
 
   ssh_server_callbacks_struct server_callbacks{};
@@ -769,6 +795,7 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
   FileDescriptor application_descriptor;
   FileDescriptor server_descriptor;
   std::unique_ptr<TerminalSession> terminal_session;
+  SessionTelemetry reported_telemetry;
   auto session_end = SessionEnd::normal;
 
   while (ssh_is_connected(session) != 0 && !state.close_requested) {
@@ -870,6 +897,11 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
         application_failed = terminal_session->failed();
         break;
       }
+      const auto telemetry = terminal_session->telemetry();
+      if (telemetry != reported_telemetry) {
+        report_telemetry(worker_report_descriptor, session_id, telemetry);
+        reported_telemetry = telemetry;
+      }
     }
 
     if (state.operation == RequestedOperation::shell && !state.idle_warning_sent &&
@@ -922,6 +954,7 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
                 << failure_reason_name(failure_reason) << '\n';
     }
     const auto telemetry = terminal_session->telemetry();
+    report_telemetry(worker_report_descriptor, session_id, telemetry);
     std::cerr << "anvil: session " << ::getpid() << " frames=" << telemetry.frames
               << " accepted=" << telemetry.accepted_frames << " cells=" << telemetry.cell_bytes
               << " image-transmit=" << telemetry.image_transmit_bytes
@@ -969,14 +1002,15 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
 
 struct ChildState {
   PeerAddress peer;
+  std::uint64_t session_id{};
 };
 
 using ChildMap = std::unordered_map<pid_t, ChildState>;
 
-void drain_auth_attempts(int descriptor, const ChildMap &children,
-                         AdmissionController &admission) {
+void drain_worker_reports(int descriptor, const ChildMap &children,
+                          AdmissionController &admission, HealthMonitor &health) {
   for (;;) {
-    AuthAttemptEvent event{};
+    WorkerReport event{};
     const auto count = ::recv(descriptor, &event, sizeof(event), 0);
     if (count < 0 && errno == EINTR) {
       continue;
@@ -984,40 +1018,45 @@ void drain_auth_attempts(int descriptor, const ChildMap &children,
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return;
     }
-    if (count != static_cast<ssize_t>(sizeof(event))) {
+    if (count != static_cast<ssize_t>(sizeof(event)) || event.magic != worker_report_magic ||
+        event.version != worker_report_version) {
       return;
     }
     const auto child = children.find(event.worker);
-    if (child != children.end()) {
+    if (child == children.end()) {
+      continue;
+    }
+    if (event.kind == WorkerReportKind::denied_auth) {
       admission.denied_auth_attempt(child->second.peer, Clock::now());
+    } else if (event.kind == WorkerReportKind::telemetry &&
+               event.session_id == child->second.session_id) {
+      health.session_updated(event.session_id, event.worker, event.telemetry);
     }
   }
 }
 
-void reap_children(ChildMap &children, AdmissionController &admission) {
-  for (;;) {
+void reap_children(ChildMap &children, AdmissionController &admission, HealthMonitor &health) {
+  for (auto iterator = children.begin(); iterator != children.end();) {
     int status = 0;
-    const auto child = ::waitpid(-1, &status, WNOHANG);
-    if (child > 0) {
+    const auto child = ::waitpid(iterator->first, &status, WNOHANG);
+    if (child == iterator->first) {
       if (WIFSIGNALED(status)) {
         std::cerr << "anvil: session worker " << child << " terminated by signal "
                   << WTERMSIG(status) << '\n';
       }
-      const auto found = children.find(child);
-      if (found != children.end()) {
-        const auto now = Clock::now();
-        if (WIFEXITED(status) && WEXITSTATUS(status) == auth_report_failure_exit) {
-          admission.exhaust_auth_attempts(found->second.peer, now);
-        }
-        admission.release(found->second.peer, now);
-        children.erase(found);
+      const auto now = Clock::now();
+      if (WIFEXITED(status) && WEXITSTATUS(status) == auth_report_failure_exit) {
+        admission.exhaust_auth_attempts(iterator->second.peer, now);
       }
+      admission.release(iterator->second.peer, now);
+      health.session_finished(iterator->second.session_id);
+      iterator = children.erase(iterator);
       continue;
     }
     if (child < 0 && errno == EINTR) {
       continue;
     }
-    break;
+    ++iterator;
   }
 }
 
@@ -1031,18 +1070,18 @@ void terminate_children(const ChildMap &children, int signal_number) {
   }
 }
 
-void await_children(ChildMap &children, int signal_descriptor, int auth_attempt_descriptor,
-                    AdmissionController &admission) {
+void await_children(ChildMap &children, int signal_descriptor, int worker_report_descriptor,
+                    AdmissionController &admission, HealthMonitor &health) {
   terminate_children(children, SIGTERM);
   const auto deadline = Clock::now() + shutdown_timeout;
   while (!children.empty() && Clock::now() < deadline) {
     std::array<pollfd, 2> descriptors{{
         {.fd = signal_descriptor, .events = POLLIN, .revents = 0},
-        {.fd = auth_attempt_descriptor, .events = POLLIN, .revents = 0},
+        {.fd = worker_report_descriptor, .events = POLLIN, .revents = 0},
     }};
     static_cast<void>(::poll(descriptors.data(), descriptors.size(), 100));
     if ((descriptors[1].revents & POLLIN) != 0) {
-      drain_auth_attempts(auth_attempt_descriptor, children, admission);
+      drain_worker_reports(worker_report_descriptor, children, admission, health);
     }
     if ((descriptors[0].revents & POLLIN) != 0) {
       signalfd_siginfo signal_info{};
@@ -1051,18 +1090,17 @@ void await_children(ChildMap &children, int signal_descriptor, int auth_attempt_
         std::cerr << "anvil: cannot read child signal: " << std::strerror(errno) << '\n';
       }
     }
-    reap_children(children, admission);
+    reap_children(children, admission, health);
   }
   if (!children.empty()) {
     terminate_children(children, SIGKILL);
     while (!children.empty()) {
-      const auto child = ::waitpid(-1, nullptr, 0);
-      if (child > 0) {
-        const auto found = children.find(child);
-        if (found != children.end()) {
-          admission.release(found->second.peer, Clock::now());
-          children.erase(found);
-        }
+      const auto found = children.begin();
+      const auto child = ::waitpid(found->first, nullptr, 0);
+      if (child == found->first || (child < 0 && errno == ECHILD)) {
+        admission.release(found->second.peer, Clock::now());
+        health.session_finished(found->second.session_id);
+        children.erase(found);
       } else if (child < 0 && errno != EINTR) {
         break;
       }
@@ -1160,6 +1198,8 @@ std::string_view usage() noexcept {
          "options:\n"
          "  --bind-address ADDRESS   address to listen on (default 127.0.0.1)\n"
          "  --port PORT             TCP port to listen on (default 2222)\n"
+         "  --health-bind-address A private HTTP address (default 127.0.0.1)\n"
+         "  --health-port PORT      private HTTP port (default 8080)\n"
          "  --max-sessions COUNT    concurrent worker limit (default 64)\n"
          "  --max-sessions-per-ip N concurrent worker limit per IP (default 4)\n"
          "  --connection-rate-limit C/S\n"
@@ -1189,7 +1229,9 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       result.show_help = true;
       continue;
     }
-    if (argument != "--bind-address" && argument != "--port" && argument != "--max-sessions" &&
+    if (argument != "--bind-address" && argument != "--port" &&
+        argument != "--health-bind-address" && argument != "--health-port" &&
+        argument != "--max-sessions" &&
         argument != "--max-sessions-per-ip" && argument != "--connection-rate-limit" &&
         argument != "--auth-attempt-rate-limit" &&
         argument != "--max-auth-attempts-per-session" && argument != "--max-tracked-ips" &&
@@ -1209,6 +1251,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       result.config.bind_address = value;
     } else if (argument == "--port") {
       result.config.port = parse_port(value);
+    } else if (argument == "--health-bind-address") {
+      result.config.health_bind_address = value;
+    } else if (argument == "--health-port") {
+      result.config.health_port = parse_port(value);
     } else if (argument == "--max-sessions") {
       result.config.max_sessions = parse_session_limit(value);
     } else if (argument == "--max-sessions-per-ip") {
@@ -1249,6 +1295,9 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
     if (result.config.idle_warning >= result.config.idle_timeout) {
       throw std::runtime_error("idle warning must be shorter than idle timeout");
+    }
+    if (result.config.health_port == result.config.port) {
+      throw std::runtime_error("health endpoint must use a separate port from SSH");
     }
     if (result.config.host_key_path.empty()) {
       throw std::runtime_error("--host-key is required");
@@ -1306,31 +1355,46 @@ int run(const Config &config) {
     throw_system_error("cannot create signal descriptor");
   }
 
-  std::array<int, 2> auth_attempt_descriptors{};
+  std::array<int, 2> worker_report_descriptors{};
   if (::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
-                   auth_attempt_descriptors.data()) != 0) {
-    throw_system_error("cannot create auth-attempt channel");
+                   worker_report_descriptors.data()) != 0) {
+    throw_system_error("cannot create worker-report channel");
   }
-  FileDescriptor auth_attempt_receiver(auth_attempt_descriptors[0]);
-  FileDescriptor auth_attempt_sender(auth_attempt_descriptors[1]);
+  FileDescriptor worker_report_receiver(worker_report_descriptors[0]);
+  FileDescriptor worker_report_sender(worker_report_descriptors[1]);
+
+  auto health = HealthMonitor::start(HealthMonitor::Config{
+      config.health_bind_address,
+      config.health_port,
+      config.max_sessions,
+      {ssh_bind_get_fd(bind.get()), signal_descriptor.get(), worker_report_receiver.get(),
+       worker_report_sender.get()},
+  });
+  health->set_component(
+      ComponentStatus{ComponentKind::storage, ComponentState::not_configured, "database", {}, {}});
+  health->heartbeat(true);
 
   AdmissionController admission(config.max_sessions, config.max_sessions_per_ip,
                                 config.connection_rate, config.auth_attempt_rate,
                                 config.max_tracked_ips);
   ChildMap children;
   children.reserve(config.max_sessions);
+  std::uint64_t next_session_id = 1U;
 
   bool stopping = false;
+  bool health_failed = false;
   std::cout << "anvil: listening on " << config.bind_address << ':' << config.port << '\n';
+  std::cout << "anvil: health listening on " << config.health_bind_address << ':'
+            << config.health_port << '\n';
   std::cout.flush();
 
   while (!stopping) {
     std::array<pollfd, 3> descriptors{{
         {.fd = ssh_bind_get_fd(bind.get()), .events = POLLIN, .revents = 0},
-        {.fd = auth_attempt_receiver.get(), .events = POLLIN, .revents = 0},
+        {.fd = worker_report_receiver.get(), .events = POLLIN, .revents = 0},
         {.fd = signal_descriptor.get(), .events = POLLIN, .revents = 0},
     }};
-    const auto ready = ::poll(descriptors.data(), descriptors.size(), -1);
+    const auto ready = ::poll(descriptors.data(), descriptors.size(), 1000);
     if (ready < 0 && errno == EINTR) {
       continue;
     }
@@ -1338,8 +1402,15 @@ int run(const Config &config) {
       throw_system_error("listener poll failed");
     }
 
+    health->heartbeat(!stopping);
+    if (!health->alive()) {
+      std::cerr << "anvil: health process exited unexpectedly\n";
+      health_failed = true;
+      stopping = true;
+    }
+
     if ((descriptors[1].revents & POLLIN) != 0) {
-      drain_auth_attempts(auth_attempt_receiver.get(), children, admission);
+      drain_worker_reports(worker_report_receiver.get(), children, admission, *health);
     }
     if ((descriptors[2].revents & POLLIN) != 0) {
       for (;;) {
@@ -1358,8 +1429,8 @@ int run(const Config &config) {
           stopping = true;
         }
       }
-      drain_auth_attempts(auth_attempt_receiver.get(), children, admission);
-      reap_children(children, admission);
+      drain_worker_reports(worker_report_receiver.get(), children, admission, *health);
+      reap_children(children, admission, *health);
     }
     if (stopping || (descriptors[0].revents & POLLIN) == 0) {
       continue;
@@ -1399,6 +1470,7 @@ int run(const Config &config) {
       continue;
     }
 
+    const auto session_id = next_session_id;
     const auto child = ::fork();
     if (child < 0) {
       std::cerr << "anvil: fork failed: " << std::strerror(errno) << '\n';
@@ -1407,8 +1479,9 @@ int run(const Config &config) {
       continue;
     }
     if (child == 0) {
+      health->detach_in_worker();
       static_cast<void>(::close(signal_descriptor.get()));
-      static_cast<void>(::close(auth_attempt_receiver.get()));
+      static_cast<void>(::close(worker_report_receiver.get()));
       bind.reset();
       sigset_t worker_mask;
       if (::sigemptyset(&worker_mask) != 0 || ::sigaddset(&worker_mask, SIGINT) != 0 ||
@@ -1425,18 +1498,26 @@ int run(const Config &config) {
       }
       const auto exit_status =
           run_session(session.get(), authorized_keys, config, worker_signal_descriptor.get(),
-                      auth_attempt_sender.get());
+                      worker_report_sender.get(), session_id);
       ssh_disconnect(session.get());
       session.reset();
       std::_Exit(exit_status);
     }
-    children.emplace(child, ChildState{*peer});
+    children.emplace(child, ChildState{*peer, session_id});
+    health->session_started(session_id, child);
+    ++next_session_id;
+    if (next_session_id == 0U) {
+      next_session_id = 1U;
+    }
     session.reset();
   }
 
+  health->heartbeat(false);
   bind.reset();
-  await_children(children, signal_descriptor.get(), auth_attempt_receiver.get(), admission);
-  return 0;
+  await_children(children, signal_descriptor.get(), worker_report_receiver.get(), admission,
+                 *health);
+  health->shutdown();
+  return health_failed ? 1 : 0;
 }
 
 }  // namespace anvil::server
