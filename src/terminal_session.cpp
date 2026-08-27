@@ -153,14 +153,17 @@ class EchoApp final : public termforge::App {
       ++telemetry.frames;
       if (observation.output_accepted) {
         ++telemetry.accepted_frames;
+        if (telemetry.accepted_frames == 1U) {
+          telemetry.first_frame_latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - channel_opened_);
+        }
       }
       telemetry.cell_bytes += observation.bytes.cells;
       telemetry.image_transmit_bytes += observation.bytes.image_transmit;
       telemetry.image_edit_bytes += observation.bytes.image_edit;
-      if (telemetry.frames == 1U) {
-        telemetry.first_frame_latency = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - channel_opened_);
-      }
+      telemetry.last_frame_cell_bytes = observation.bytes.cells;
+      telemetry.last_frame_image_transmit_bytes = observation.bytes.image_transmit;
+      telemetry.last_frame_image_edit_bytes = observation.bytes.image_edit;
     });
   }
 

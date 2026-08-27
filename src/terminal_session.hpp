@@ -24,6 +24,9 @@ struct SessionTelemetry {
   std::uint64_t cell_bytes{};
   std::uint64_t image_transmit_bytes{};
   std::uint64_t image_edit_bytes{};
+  std::uint64_t last_frame_cell_bytes{};
+  std::uint64_t last_frame_image_transmit_bytes{};
+  std::uint64_t last_frame_image_edit_bytes{};
   std::chrono::milliseconds first_frame_latency{};
 
   [[nodiscard]] auto operator==(const SessionTelemetry &) const noexcept -> bool = default;
