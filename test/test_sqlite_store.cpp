@@ -17,6 +17,9 @@
 
 namespace {
 
+using anvil::store::ContentKind;
+using anvil::store::ContentRef;
+using anvil::store::ContentStatus;
 using anvil::store::ErrorCode;
 using anvil::store::SqliteOptions;
 using anvil::store::SqliteStore;
@@ -67,7 +70,36 @@ constexpr std::array probe_migrations{
 [[nodiscard]] auto open_probe(const std::filesystem::path &path,
                               SqliteOptions options = {}) {
   return anvil::store::detail::open_sqlite_store(path, probe_migrations,
-                                                  options);
+                                                 options);
+}
+
+} // namespace
+
+namespace {
+
+constexpr std::string_view board_id = "00000000-0000-0000-0000-000000000001";
+
+void seed_messages(SqliteStore &store, anvil::store::Transaction &transaction) {
+  REQUIRE(store
+              .execute_for_testing(
+                  transaction,
+                  "INSERT INTO users(handle, status, created_at) "
+                  "VALUES('alice', 'active', 10);"
+                  "INSERT INTO boards(board_id, name, title, created_at) "
+                  "VALUES('00000000-0000-0000-0000-000000000001', "
+                  "'general', 'General', 11);"
+                  "INSERT INTO threads(thread_id, board_id, author_handle, "
+                  "subject, created_at, updated_at) VALUES('thread-1', "
+                  "'00000000-0000-0000-0000-000000000001', 'alice', "
+                  "'Welcome', 12, 12);"
+                  "INSERT INTO messages(message_id, board_id, thread_id, "
+                  "author_handle, body, posted_at, received_at) VALUES("
+                  "'message-1', "
+                  "'00000000-0000-0000-0000-000000000001', 'thread-1', "
+                  "'alice', 'first', 13, 14),('message-2', "
+                  "'00000000-0000-0000-0000-000000000001', 'thread-1', "
+                  "'alice', 'second', 14, 15)")
+              .has_value());
 }
 
 } // namespace
@@ -83,10 +115,8 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
   REQUIRE(transaction.has_value());
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA application_id") ==
         0x414E564C);
-  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") ==
-        2);
-  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA synchronous") ==
-        2);
+  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") == 2);
+  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA synchronous") == 2);
   CHECK((*store)->scalar_for_testing(*transaction,
                                      "PRAGMA wal_autocheckpoint") == 1000);
   CHECK((*store)->scalar_text_for_testing(
@@ -99,7 +129,7 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
         "tos_acceptances,user_keys,users");
   CHECK(transaction->commit().has_value());
 
-  struct stat metadata {};
+  struct stat metadata{};
   REQUIRE(::stat(database.path().c_str(), &metadata) == 0);
   CHECK((metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0);
 
@@ -111,8 +141,8 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
 TEST_CASE("SQLite upgrades the claimed version-one database") {
   TemporaryDatabase database;
   constexpr std::array claimed{SqliteMigration{1, {}}};
-  auto version_one = anvil::store::detail::open_sqlite_store(database.path(),
-                                                             claimed);
+  auto version_one =
+      anvil::store::detail::open_sqlite_store(database.path(), claimed);
   REQUIRE(version_one.has_value());
   CHECK((*version_one)->schema_version() == 1);
   version_one->reset();
@@ -156,18 +186,18 @@ TEST_CASE("domain schema preserves federation-safe storage contracts") {
             "schema.type = 'table' AND schema.name NOT LIKE 'sqlite_%' AND "
             "column.name GLOB '*_at' AND column.type != 'INTEGER'") == 0);
   CHECK((*store)->scalar_for_testing(
-            *transaction,
-            "SELECT count(*) FROM pragma_foreign_key_check") == 0);
+            *transaction, "SELECT count(*) FROM pragma_foreign_key_check") ==
+        0);
   constexpr std::array tombstoned_content{
-      "boards", "threads", "messages", "files", "leaderboards",
-      "oneliners", "blocks",  "reports",
+      "boards",       "threads",   "messages", "files",
+      "leaderboards", "oneliners", "blocks",   "reports",
   };
   for (const std::string_view table : tombstoned_content) {
     CAPTURE(table);
     CHECK((*store)->scalar_for_testing(
-              *transaction,
-              "SELECT count(*) FROM pragma_table_info('" +
-                  std::string(table) + "') WHERE name = 'status'") == 1);
+              *transaction, "SELECT count(*) FROM pragma_table_info('" +
+                                std::string(table) +
+                                "') WHERE name = 'status'") == 1);
   }
 
   REQUIRE((*store)
@@ -178,9 +208,8 @@ TEST_CASE("domain schema preserves federation-safe storage contracts") {
                   "('alice', 'remote.example', 'active', 11)")
               .has_value());
   const auto duplicate_local = (*store)->execute_for_testing(
-      *transaction,
-      "INSERT INTO users(handle, origin, status, created_at) "
-      "VALUES('alice', NULL, 'active', 12)");
+      *transaction, "INSERT INTO users(handle, origin, status, created_at) "
+                    "VALUES('alice', NULL, 'active', 12)");
   REQUIRE_FALSE(duplicate_local.has_value());
   CHECK(duplicate_local.error().code == ErrorCode::constraint_violation);
 
@@ -267,6 +296,187 @@ TEST_CASE("domain schema preserves federation-safe storage contracts") {
   CHECK(duplicate_message.error().code == ErrorCode::constraint_violation);
 }
 
+TEST_CASE("SQLite ordinary reads cannot reveal tombstoned messages") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto transaction = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(transaction.has_value());
+  seed_messages(**store, *transaction);
+
+  const auto before = (*store)->find_message(*transaction, "message-1");
+  REQUIRE(before.has_value());
+  REQUIRE(before->has_value());
+  CHECK((*before)->body == "first");
+  const auto before_list =
+      (*store)->list_messages_for_board(*transaction, board_id);
+  REQUIRE(before_list.has_value());
+  REQUIRE(before_list->size() == 2);
+  CHECK(before_list->front().message_id == "message-1");
+
+  const ContentRef message{ContentKind::message, std::string("message-1")};
+  CHECK((*store)->tombstone(*transaction, message).has_value());
+  CHECK((*store)->tombstone(*transaction, message).has_value());
+  CHECK_FALSE((*store)->find_message(*transaction, "message-1")->has_value());
+  const auto filtered =
+      (*store)->list_messages_for_board(*transaction, board_id);
+  REQUIRE(filtered.has_value());
+  REQUIRE(filtered->size() == 1);
+  CHECK(filtered->front().message_id == "message-2");
+
+  const auto retained =
+      (*store)->find_message_including_tombstones(*transaction, "message-1");
+  REQUIRE(retained.has_value());
+  REQUIRE(retained->has_value());
+  CHECK((*retained)->body == "first");
+  CHECK((*retained)->status == ContentStatus::tombstoned);
+  CHECK(
+      (*store)
+          ->list_messages_for_board_including_tombstones(*transaction, board_id)
+          ->size() == 2);
+
+  REQUIRE((*store)
+              ->tombstone(*transaction,
+                          {ContentKind::thread, std::string("thread-1")})
+              .has_value());
+  CHECK_FALSE((*store)->find_message(*transaction, "message-2")->has_value());
+  CHECK((*store)
+            ->find_message_including_tombstones(*transaction, "message-2")
+            ->has_value());
+  CHECK(transaction->commit().has_value());
+}
+
+TEST_CASE("SQLite tombstones every content kind without deleting rows") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto transaction = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(transaction.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *transaction,
+                  "INSERT INTO users(handle, status, created_at) VALUES"
+                  "('alice', 'active', 10),('bob', 'active', 10);"
+                  "INSERT INTO boards(board_id, name, title, created_at) "
+                  "VALUES('00000000-0000-0000-0000-000000000001', "
+                  "'general', 'General', 11);"
+                  "INSERT INTO threads(thread_id, board_id, author_handle, "
+                  "subject, created_at, updated_at) VALUES('thread-1', "
+                  "'00000000-0000-0000-0000-000000000001', 'alice', "
+                  "'Welcome', 12, 12);"
+                  "INSERT INTO messages(message_id, board_id, thread_id, "
+                  "author_handle, body, posted_at, received_at) VALUES("
+                  "'message-1', "
+                  "'00000000-0000-0000-0000-000000000001', 'thread-1', "
+                  "'alice', 'hello', 13, 14);"
+                  "INSERT INTO files(file_id, board_id, uploader_handle, "
+                  "name, storage_path, content_hash, byte_count, published_at) "
+                  "VALUES('file-1', "
+                  "'00000000-0000-0000-0000-000000000001', 'alice', "
+                  "'readme.txt', '/files/readme.txt', 'sha256:1', 4, 15);"
+                  "INSERT INTO plugins(plugin_id, author, version, updated_at) "
+                  "VALUES('org.example.game', 'Example', '1.0.0', 16);"
+                  "INSERT INTO leaderboards(entry_id, plugin_id, user_handle, "
+                  "board_id, category, score, submitted_at) VALUES("
+                  "'entry-1', 'org.example.game', 'alice', "
+                  "'00000000-0000-0000-0000-000000000001', 'score', 10, 17);"
+                  "INSERT INTO oneliners(oneliner_id, author_handle, body, "
+                  "posted_at, received_at) VALUES('oneliner-1', 'alice', "
+                  "'hi', 18, 18);"
+                  "INSERT INTO blocks(block_id, blocker_handle, "
+                  "blocked_handle, created_at) VALUES(1, 'alice', 'bob', 19);"
+                  "INSERT INTO reports(report_id, reporter_handle, "
+                  "target_kind, target_id, status, created_at) VALUES("
+                  "'report-1', 'alice', 'message', 'message-1', "
+                  "'resolved', 20)")
+              .has_value());
+
+  struct Case {
+    ContentRef content;
+    std::string_view status_query;
+  };
+  const std::array cases{
+      Case{{ContentKind::board, std::string(board_id)},
+           "SELECT count(*) FROM boards WHERE board_id="
+           "'00000000-0000-0000-0000-000000000001' AND "
+           "status='tombstoned'"},
+      Case{{ContentKind::thread, std::string("thread-1")},
+           "SELECT count(*) FROM threads WHERE thread_id='thread-1' AND "
+           "status='tombstoned'"},
+      Case{{ContentKind::message, std::string("message-1")},
+           "SELECT count(*) FROM messages WHERE message_id='message-1' AND "
+           "status='tombstoned'"},
+      Case{{ContentKind::file, std::string("file-1")},
+           "SELECT count(*) FROM files WHERE file_id='file-1' AND "
+           "status='tombstoned'"},
+      Case{{ContentKind::leaderboard_entry, std::string("entry-1")},
+           "SELECT count(*) FROM leaderboards WHERE entry_id='entry-1' AND "
+           "status='tombstoned'"},
+      Case{{ContentKind::oneliner, std::string("oneliner-1")},
+           "SELECT count(*) FROM oneliners WHERE oneliner_id='oneliner-1' "
+           "AND status='tombstoned'"},
+      Case{{ContentKind::block, std::int64_t{1}},
+           "SELECT count(*) FROM blocks WHERE block_id=1 AND "
+           "status='tombstoned'"},
+      Case{{ContentKind::report, std::string("report-1")},
+           "SELECT count(*) FROM reports WHERE report_id='report-1' AND "
+           "status='tombstoned'"},
+  };
+
+  for (const auto &test : cases) {
+    REQUIRE((*store)->tombstone(*transaction, test.content).has_value());
+    CHECK((*store)->scalar_for_testing(*transaction, test.status_query) == 1);
+  }
+  CHECK((*store)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM boards,threads,messages,files,leaderboards,"
+            "oneliners,blocks,reports") == 1);
+}
+
+TEST_CASE("SQLite tombstone failures are values and rollback is atomic") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  {
+    auto seed = (*store)->begin(TransactionMode::read_write);
+    REQUIRE(seed.has_value());
+    seed_messages(**store, *seed);
+    REQUIRE(seed->commit().has_value());
+  }
+
+  auto read = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  const auto read_only = (*store)->tombstone(
+      *read, {ContentKind::message, std::string("message-1")});
+  REQUIRE_FALSE(read_only.has_value());
+  CHECK(read_only.error().code == ErrorCode::invalid_state);
+  read->rollback();
+
+  {
+    auto write = (*store)->begin(TransactionMode::read_write);
+    REQUIRE(write.has_value());
+    const auto missing = (*store)->tombstone(
+        *write, {ContentKind::message, std::string("x'; DROP TABLE users;--")});
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error().code == ErrorCode::not_found);
+    const auto wrong_type =
+        (*store)->tombstone(*write, {ContentKind::message, std::int64_t{1}});
+    REQUIRE_FALSE(wrong_type.has_value());
+    CHECK(wrong_type.error().code == ErrorCode::invalid_data);
+    REQUIRE((*store)
+                ->tombstone(*write,
+                            {ContentKind::message, std::string("message-1")})
+                .has_value());
+  }
+
+  auto verify = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(verify.has_value());
+  CHECK((*store)->find_message(*verify, "message-1")->has_value());
+  CHECK((*store)->scalar_for_testing(
+            *verify, "SELECT count(*) FROM sqlite_schema WHERE name='users'") ==
+        1);
+}
+
 TEST_CASE("SQLite migrations are ordered and atomic") {
   TemporaryDatabase database;
   constexpr std::array migrations{
@@ -301,8 +511,9 @@ TEST_CASE("a failed SQLite migration rolls back the whole pending chain") {
   REQUIRE(recovered.has_value());
   auto transaction = (*recovered)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
-  CHECK((*recovered)->scalar_for_testing(*transaction,
-                                         "SELECT count(*) FROM probe") == 0);
+  CHECK((*recovered)
+            ->scalar_for_testing(*transaction, "SELECT count(*) FROM probe") ==
+        0);
   CHECK(transaction->commit().has_value());
 }
 
@@ -365,30 +576,28 @@ TEST_CASE("WAL readers and writers use independent transaction connections") {
   auto slow_reader = (*reader_store)->begin(TransactionMode::read_only);
   REQUIRE(slow_reader.has_value());
   REQUIRE((*reader_store)
-              ->scalar_for_testing(*slow_reader, "SELECT count(*) FROM probe") ==
-          0);
+              ->scalar_for_testing(*slow_reader,
+                                   "SELECT count(*) FROM probe") == 0);
 
   auto writer = (*writer_store)->begin(TransactionMode::read_write);
   REQUIRE(writer.has_value());
-  REQUIRE((*writer_store)
-              ->execute_for_testing(*writer,
-                                    "INSERT INTO probe(value) VALUES(1)")
-              .has_value());
+  REQUIRE(
+      (*writer_store)
+          ->execute_for_testing(*writer, "INSERT INTO probe(value) VALUES(1)")
+          .has_value());
   CHECK(writer->commit().has_value());
   CHECK((*reader_store)
             ->scalar_for_testing(*slow_reader, "SELECT count(*) FROM probe") ==
         0);
   CHECK(slow_reader->commit().has_value());
 
-  auto uncommitted_writer =
-      (*writer_store)->begin(TransactionMode::read_write);
+  auto uncommitted_writer = (*writer_store)->begin(TransactionMode::read_write);
   REQUIRE(uncommitted_writer.has_value());
   REQUIRE((*writer_store)
               ->execute_for_testing(*uncommitted_writer,
                                     "INSERT INTO probe(value) VALUES(2)")
               .has_value());
-  auto unrelated_reader =
-      (*reader_store)->begin(TransactionMode::read_only);
+  auto unrelated_reader = (*reader_store)->begin(TransactionMode::read_only);
   REQUIRE(unrelated_reader.has_value());
   CHECK((*reader_store)
             ->scalar_for_testing(*unrelated_reader,
@@ -428,7 +637,8 @@ TEST_CASE("read-only SQLite transactions reject writes") {
   CHECK(written.error().code == ErrorCode::unavailable);
 }
 
-TEST_CASE("a SQLite store constructed before fork opens only child-local handles") {
+TEST_CASE(
+    "a SQLite store constructed before fork opens only child-local handles") {
   TemporaryDatabase database;
   auto store = open_probe(database.path());
   REQUIRE(store.has_value());
@@ -437,11 +647,10 @@ TEST_CASE("a SQLite store constructed before fork opens only child-local handles
   REQUIRE(child >= 0);
   if (child == 0) {
     auto transaction = (*store)->begin(TransactionMode::read_only);
-    const bool passed =
-        transaction.has_value() &&
-        (*store)->scalar_for_testing(*transaction,
-                                     "SELECT count(*) FROM probe") == 0 &&
-        transaction->commit().has_value();
+    const bool passed = transaction.has_value() &&
+                        (*store)->scalar_for_testing(
+                            *transaction, "SELECT count(*) FROM probe") == 0 &&
+                        transaction->commit().has_value();
     ::_exit(passed ? 0 : 1);
   }
 

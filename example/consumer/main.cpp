@@ -27,10 +27,34 @@ public:
 
 class ConsumerStore final : public anvil::store::Store {
 public:
-  [[nodiscard]] auto begin(anvil::store::TransactionMode)
+  [[nodiscard]] auto begin(anvil::store::TransactionMode mode)
       -> std::expected<anvil::store::Transaction,
                        anvil::store::Error> override {
-    return make_transaction(std::make_unique<ConsumerTransaction>());
+    return make_transaction(mode, std::make_unique<ConsumerTransaction>());
+  }
+
+private:
+  [[nodiscard]] auto tombstone_impl(anvil::store::Transaction &,
+                                    const anvil::store::ContentRef &)
+      -> std::expected<void, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no content backend"});
+  }
+
+  [[nodiscard]] auto find_message_impl(anvil::store::Transaction &,
+                                       std::string_view, ContentVisibility)
+      -> std::expected<std::optional<anvil::store::MessageRecord>,
+                       anvil::store::Error> override {
+    return std::nullopt;
+  }
+
+  [[nodiscard]] auto list_messages_for_board_impl(anvil::store::Transaction &,
+                                                  std::string_view,
+                                                  ContentVisibility)
+      -> std::expected<std::vector<anvil::store::MessageRecord>,
+                       anvil::store::Error> override {
+    return std::vector<anvil::store::MessageRecord>{};
   }
 };
 

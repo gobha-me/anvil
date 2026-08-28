@@ -5,14 +5,39 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <expected>
+#include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
+using anvil::store::ContentKind;
+using anvil::store::ContentRef;
+using anvil::store::ContentStatus;
 using anvil::store::Error;
 using anvil::store::ErrorCode;
+using anvil::store::MessageRecord;
 using anvil::store::Store;
 using anvil::store::TransactionMode;
+
+constexpr std::string_view board_id = "00000000-0000-0000-0000-000000000001";
+
+[[nodiscard]] auto message(std::string id, std::int64_t received_at)
+    -> MessageRecord {
+  return {
+      .message_id = std::move(id),
+      .board_id = std::string(board_id),
+      .thread_id = "thread-1",
+      .parent_message_id = std::nullopt,
+      .author_handle = "alice",
+      .author_origin = std::nullopt,
+      .body = "hello",
+      .posted_at = {received_at - 1},
+      .received_at = {received_at},
+      .status = ContentStatus::active,
+  };
+}
 
 [[nodiscard]] auto board_read(Store &store) -> std::expected<void, Error> {
   auto transaction = store.begin(TransactionMode::read_only);
@@ -57,6 +82,7 @@ TEST_CASE("a committed transaction completes exactly once") {
 
   REQUIRE(transaction.has_value());
   CHECK(transaction->active());
+  CHECK(transaction->mode() == TransactionMode::read_write);
   CHECK(transaction->commit().has_value());
   CHECK_FALSE(transaction->active());
 
@@ -169,4 +195,95 @@ TEST_CASE("board moderation and door consumers need no database library") {
   CHECK(store.observations()[0].mode == TransactionMode::read_only);
   CHECK(store.observations()[1].mode == TransactionMode::read_write);
   CHECK(store.observations()[2].mode == TransactionMode::read_write);
+}
+
+TEST_CASE("ordinary memory-store reads cannot reveal a message tombstone") {
+  anvil::testing::MemoryStore store;
+  store.seed_message(message("message-1", 11));
+  store.seed_message(message("message-2", 12));
+
+  auto transaction = store.begin(TransactionMode::read_write);
+  REQUIRE(transaction.has_value());
+  REQUIRE(store.find_message(*transaction, "message-1").has_value());
+  CHECK(store.find_message(*transaction, "message-1")->has_value());
+  REQUIRE(store.list_messages_for_board(*transaction, board_id).has_value());
+  CHECK(store.list_messages_for_board(*transaction, board_id)->size() == 2);
+
+  const ContentRef first{ContentKind::message, std::string("message-1")};
+  CHECK(store.tombstone(*transaction, first).has_value());
+  CHECK(store.tombstone(*transaction, first).has_value());
+  CHECK_FALSE(store.find_message(*transaction, "message-1")->has_value());
+  CHECK(store.list_messages_for_board(*transaction, board_id)->size() == 1);
+
+  const auto retained =
+      store.find_message_including_tombstones(*transaction, "message-1");
+  REQUIRE(retained.has_value());
+  REQUIRE(retained->has_value());
+  CHECK((*retained)->status == ContentStatus::tombstoned);
+  CHECK((*retained)->body == "hello");
+  CHECK(
+      store
+          .list_messages_for_board_including_tombstones(*transaction, board_id)
+          ->size() == 2);
+  REQUIRE(transaction->commit().has_value());
+
+  CHECK(store.content_status(first) == ContentStatus::tombstoned);
+}
+
+TEST_CASE("memory-store tombstones obey transaction and identifier rules") {
+  anvil::testing::MemoryStore first;
+  anvil::testing::MemoryStore second;
+  const ContentRef message_ref{ContentKind::message, std::string("message-1")};
+  first.seed_message(message("message-1", 11));
+
+  auto read = first.begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  const auto read_only = first.tombstone(*read, message_ref);
+  REQUIRE_FALSE(read_only.has_value());
+  CHECK(read_only.error().code == ErrorCode::invalid_state);
+
+  const auto foreign = second.tombstone(*read, message_ref);
+  REQUIRE_FALSE(foreign.has_value());
+  CHECK(foreign.error().code == ErrorCode::invalid_state);
+  read->rollback();
+  const auto inactive = first.find_message(*read, "message-1");
+  REQUIRE_FALSE(inactive.has_value());
+  CHECK(inactive.error().code == ErrorCode::invalid_state);
+
+  auto write = first.begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  const auto missing =
+      first.tombstone(*write, {ContentKind::message, std::string("missing")});
+  REQUIRE_FALSE(missing.has_value());
+  CHECK(missing.error().code == ErrorCode::not_found);
+  const auto wrong_type =
+      first.tombstone(*write, {ContentKind::message, std::int64_t{1}});
+  REQUIRE_FALSE(wrong_type.has_value());
+  CHECK(wrong_type.error().code == ErrorCode::invalid_data);
+  const auto malformed_board = first.list_messages_for_board(*write, "../db");
+  REQUIRE_FALSE(malformed_board.has_value());
+  CHECK(malformed_board.error().code == ErrorCode::invalid_data);
+}
+
+TEST_CASE(
+    "memory-store rollback preserves content and parent tombstones hide it") {
+  anvil::testing::MemoryStore store;
+  store.seed_message(message("message-1", 11));
+  const ContentRef message_ref{ContentKind::message, std::string("message-1")};
+
+  {
+    auto transaction = store.begin(TransactionMode::read_write);
+    REQUIRE(transaction.has_value());
+    REQUIRE(store.tombstone(*transaction, message_ref).has_value());
+  }
+  CHECK(store.content_status(message_ref) == ContentStatus::active);
+
+  auto parent = store.begin(TransactionMode::read_write);
+  REQUIRE(parent.has_value());
+  REQUIRE(
+      store.tombstone(*parent, {ContentKind::thread, std::string("thread-1")})
+          .has_value());
+  CHECK_FALSE(store.find_message(*parent, "message-1")->has_value());
+  CHECK(store.find_message_including_tombstones(*parent, "message-1")
+            ->has_value());
 }
