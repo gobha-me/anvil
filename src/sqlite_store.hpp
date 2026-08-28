@@ -54,6 +54,18 @@ public:
       -> std::expected<std::string, Error>;
 
 private:
+  [[nodiscard]] auto tombstone_impl(Transaction &transaction,
+                                    const ContentRef &content)
+      -> std::expected<void, Error> final;
+  [[nodiscard]] auto find_message_impl(Transaction &transaction,
+                                       std::string_view message_id,
+                                       ContentVisibility visibility)
+      -> std::expected<std::optional<MessageRecord>, Error> final;
+  [[nodiscard]] auto list_messages_for_board_impl(Transaction &transaction,
+                                                  std::string_view board_id,
+                                                  ContentVisibility visibility)
+      -> std::expected<std::vector<MessageRecord>, Error> final;
+
   std::filesystem::path path_;
   SqliteOptions options_;
   std::uint32_t schema_version_{};

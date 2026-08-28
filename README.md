@@ -481,11 +481,19 @@ migration metadata table, private-chat table, or plugin-owned table.
 The schema stores local users with a null origin and carries `(handle, origin)`
 through every user reference. Boards use canonical lowercase UUIDs, messages
 use opaque globally unique IDs, and origin-claimed `posted_at` is separate from
-local `received_at`. Content reserves an explicit tombstone state; the future
-domain operations remain responsible for making filtered reads the default.
-All timestamps are signed integer UTC epoch seconds. User text is stored only
-as SQLite `TEXT`; the ingest and render boundaries remain responsible for the
-lossless UTF-8 and control-character rules.
+local `received_at`. All timestamps are signed integer UTC epoch seconds. User
+text is stored only as SQLite `TEXT`; the ingest and render boundaries remain
+responsible for the lossless UTF-8 and control-character rules.
+
+`Store::tombstone` is the only lifecycle transition for boards, threads,
+messages, files, leaderboard entries, one-liners, blocks, and reports. It is
+idempotent for an existing tombstone, reports a missing target distinctly, and
+never cascades or deletes a row. Ordinary `find_message` and
+`list_messages_for_board` reads exclude tombstoned messages and messages under
+a tombstoned thread or board. Moderation and audit code must opt into the
+deliberately verbose `*_including_tombstones` methods. The in-memory Store uses
+the same filtered contract and transaction commit/rollback semantics as the
+SQLite backend.
 
 Canonical message bytes begin with `ANVILMSG`, a big-endian 32-bit version, and
 then message ID, board ID, thread ID, optional parent ID, author handle,
@@ -530,6 +538,7 @@ independent stream.
 | `0.17.0` | `1.0–1.2` |
 | `0.18.0` | `1.0–1.2` |
 | `0.19.0` | `1.0–1.2` |
+| `0.20.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one

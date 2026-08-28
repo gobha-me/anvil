@@ -736,6 +736,11 @@ are local state and are not part of the origin's attestation.
 
 **Tombstone tax, acknowledged:** every read path now needs a status filter, and a missed filter leaks deleted content — a serious failure. Put the filter *inside* the `Store` interface rather than at call sites, so it exists in one place. This is a further reason to define the interface before writing the first query.
 
+The Store contract makes ordinary message lookup and board listing active-only;
+moderation and audit views use separately named operations that explicitly
+include tombstones. A parent board or thread tombstone hides its messages from
+ordinary reads without cascading state changes or deleting evidence.
+
 **Do not build:** peering protocol, key exchange, nodelist, conflict resolution, transport abstraction, or any federation configuration. All reversible, all better designed against real operators with real opinions than speculatively today.
 
 **Note on signing:** in an SSH BBS the server composes the message, so it can never produce a *user* signature — the key authenticates the connection, it is not a signing oracle. The realistic model is board-level attestation: "board X asserts user Y posted this." That is FidoNet's trust model and matches what allowlist federation assumes anyway, so nothing is lost by not signing per-user.
