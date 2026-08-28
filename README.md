@@ -457,7 +457,8 @@ once. A failed commit leaves the transaction active so stack unwinding still
 rolls it back. The originating `Store` must outlive its active transactions.
 Store implementations keep database-specific transaction state behind
 `TransactionBackend`; domain queries are added with the board, moderation, and
-door-state features that own them rather than pre-freezing a SQLite-shaped API.
+plugin-state features that own them rather than pre-freezing a SQLite-shaped
+API.
 
 The test suite provides a database-free in-memory implementation so domain
 logic can depend on `Store` without linking SQLite. The server's private SQLite
@@ -472,10 +473,28 @@ At startup Anvil creates `anvil.db` in the working directory unless
 applies every pending migration in one transaction before opening either
 listener or forking. Migrations are compiled into the binary, strictly
 forward-only, and tracked with SQLite's `user_version`. Schema version 1 claims
-the otherwise empty file with application ID `ANVL`; an unknown application ID,
-a non-empty unclaimed file, corrupt data, or a schema newer than the binary
-stops startup. There is deliberately no migration metadata table, so issue #33
-can add only the domain tables specified by the storage contract.
+the otherwise empty file with application ID `ANVL`; version 2 adds the exact
+17-table domain schema. An unknown application ID, a non-empty unclaimed file,
+corrupt data, or a schema newer than the binary stops startup. There is no
+migration metadata table, private-chat table, or plugin-owned table.
+
+The schema stores local users with a null origin and carries `(handle, origin)`
+through every user reference. Boards use canonical lowercase UUIDs, messages
+use opaque globally unique IDs, and origin-claimed `posted_at` is separate from
+local `received_at`. Content reserves an explicit tombstone state; the future
+domain operations remain responsible for making filtered reads the default.
+All timestamps are signed integer UTC epoch seconds. User text is stored only
+as SQLite `TEXT`; the ingest and render boundaries remain responsible for the
+lossless UTF-8 and control-character rules.
+
+Canonical message bytes begin with `ANVILMSG`, a big-endian 32-bit version, and
+then message ID, board ID, thread ID, optional parent ID, author handle,
+optional author origin, body, and posted-at time in that order. Strings are the
+exact stored UTF-8 bytes with big-endian 64-bit lengths; optional strings have
+an explicit one-byte presence marker, and the signed epoch is represented by
+its big-endian two's-complement bits. Mutable status and local receipt time are
+excluded from the origin's attestation. Version 1 of this representation never
+normalizes or otherwise rewrites stored text.
 
 WAL's default 1,000-page automatic checkpoint remains enabled. `FULL` is
 intentional: a low-volume BBS should not trade away the most recent committed
@@ -510,6 +529,7 @@ independent stream.
 | `0.16.0` | `1.0–1.2` |
 | `0.17.0` | `1.0–1.2` |
 | `0.18.0` | `1.0–1.2` |
+| `0.19.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one
