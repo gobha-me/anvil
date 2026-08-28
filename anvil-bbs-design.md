@@ -725,6 +725,15 @@ Federation is not built (§14). But the *data model* forecloses it if handled ca
 | Canonical message serialization defined — fixed field order, defined encoding and normalization | If signing ever matters, both sides must agree on bytes to sign over. Retrofitting canonical form onto historical content can be flatly impossible. |
 | **Sanitization must be lossless** | Stored bytes must be exactly what renders and what would be signed. Do not transform at render time in ways that cannot be reproduced. |
 
+Canonical message representation version 1 is the ASCII magic `ANVILMSG`, a
+big-endian 32-bit version, and these fields in order: message ID, board ID,
+thread ID, optional parent message ID, author handle, optional author origin,
+body, and `posted_at`. Strings are exact stored UTF-8 prefixed by a big-endian
+64-bit byte length; optional strings have a one-byte absent/present marker; the
+signed epoch is encoded as its big-endian two's-complement bits. There is no
+Unicode normalization. Mutable status and the receiving board's `received_at`
+are local state and are not part of the origin's attestation.
+
 **Tombstone tax, acknowledged:** every read path now needs a status filter, and a missed filter leaks deleted content — a serious failure. Put the filter *inside* the `Store` interface rather than at call sites, so it exists in one place. This is a further reason to define the interface before writing the first query.
 
 **Do not build:** peering protocol, key exchange, nodelist, conflict resolution, transport abstraction, or any federation configuration. All reversible, all better designed against real operators with real opinions than speculatively today.

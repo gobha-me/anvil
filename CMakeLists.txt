@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.18.0 LANGUAGES CXX)
+project(anvil VERSION 0.19.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -88,6 +88,7 @@ if(ANVIL_SERVER)
 
   add_library(anvil_server STATIC
     src/admission.cpp
+    src/canonical_message.cpp
     src/health.cpp
     src/server.cpp
     src/sqlite_store.cpp

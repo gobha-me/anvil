@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 #include <sys/stat.h>
@@ -71,27 +72,31 @@ constexpr std::array probe_migrations{
 
 } // namespace
 
-TEST_CASE("SQLite startup claims an empty database without domain tables") {
+TEST_CASE("SQLite startup creates exactly the domain schema") {
   TemporaryDatabase database;
 
   auto store = SqliteStore::open(database.path());
 
   REQUIRE(store.has_value());
-  CHECK((*store)->schema_version() == 1);
+  CHECK((*store)->schema_version() == 2);
   auto transaction = (*store)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA application_id") ==
         0x414E564C);
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") ==
-        1);
+        2);
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA synchronous") ==
         2);
   CHECK((*store)->scalar_for_testing(*transaction,
                                      "PRAGMA wal_autocheckpoint") == 1000);
-  CHECK((*store)->scalar_for_testing(
+  CHECK((*store)->scalar_text_for_testing(
             *transaction,
-            "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE "
-            "'sqlite_%'") == 0);
+            "SELECT group_concat(name, ',') FROM "
+            "(SELECT name FROM sqlite_schema WHERE type = 'table' AND "
+            "name NOT LIKE 'sqlite_%' ORDER BY name)") ==
+        "blocks,boards,files,invites,leaderboards,messages,moderation_log,"
+        "oneliners,plugin_state,plugins,presence,reports,sessions_log,threads,"
+        "tos_acceptances,user_keys,users");
   CHECK(transaction->commit().has_value());
 
   struct stat metadata {};
@@ -100,7 +105,166 @@ TEST_CASE("SQLite startup claims an empty database without domain tables") {
 
   auto reopened = SqliteStore::open(database.path());
   REQUIRE(reopened.has_value());
-  CHECK((*reopened)->schema_version() == 1);
+  CHECK((*reopened)->schema_version() == 2);
+}
+
+TEST_CASE("SQLite upgrades the claimed version-one database") {
+  TemporaryDatabase database;
+  constexpr std::array claimed{SqliteMigration{1, {}}};
+  auto version_one = anvil::store::detail::open_sqlite_store(database.path(),
+                                                             claimed);
+  REQUIRE(version_one.has_value());
+  CHECK((*version_one)->schema_version() == 1);
+  version_one->reset();
+
+  auto upgraded = SqliteStore::open(database.path());
+
+  REQUIRE(upgraded.has_value());
+  CHECK((*upgraded)->schema_version() == 2);
+  auto transaction = (*upgraded)->begin(TransactionMode::read_only);
+  REQUIRE(transaction.has_value());
+  CHECK((*upgraded)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND "
+            "name NOT LIKE 'sqlite_%'") == 17);
+}
+
+TEST_CASE("domain schema preserves federation-safe storage contracts") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto transaction = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(transaction.has_value());
+
+  CHECK((*store)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM pragma_table_info('messages') WHERE "
+            "(name IN ('posted_at', 'received_at') AND type = 'INTEGER') OR "
+            "(name = 'body' AND type = 'TEXT') OR name = 'status'") == 4);
+  CHECK((*store)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM pragma_table_info('plugin_state') WHERE "
+            "name IN ('plugin_id', 'user_handle', 'user_origin')") == 3);
+  CHECK((*store)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM pragma_table_info('presence') WHERE "
+            "name = 'screen'") == 0);
+  CHECK((*store)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM sqlite_schema AS schema, "
+            "pragma_table_info(schema.name) AS column WHERE "
+            "schema.type = 'table' AND schema.name NOT LIKE 'sqlite_%' AND "
+            "column.name GLOB '*_at' AND column.type != 'INTEGER'") == 0);
+  CHECK((*store)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM pragma_foreign_key_check") == 0);
+  constexpr std::array tombstoned_content{
+      "boards", "threads", "messages", "files", "leaderboards",
+      "oneliners", "blocks",  "reports",
+  };
+  for (const std::string_view table : tombstoned_content) {
+    CAPTURE(table);
+    CHECK((*store)->scalar_for_testing(
+              *transaction,
+              "SELECT count(*) FROM pragma_table_info('" +
+                  std::string(table) + "') WHERE name = 'status'") == 1);
+  }
+
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *transaction,
+                  "INSERT INTO users(handle, origin, status, created_at) "
+                  "VALUES('alice', NULL, 'active', 10),"
+                  "('alice', 'remote.example', 'active', 11)")
+              .has_value());
+  const auto duplicate_local = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO users(handle, origin, status, created_at) "
+      "VALUES('alice', NULL, 'active', 12)");
+  REQUIRE_FALSE(duplicate_local.has_value());
+  CHECK(duplicate_local.error().code == ErrorCode::constraint_violation);
+
+  const auto orphan_key = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO user_keys(fingerprint, user_handle, public_key, added_at) "
+      "VALUES('SHA256:orphan', 'missing', 'ssh-ed25519 AAAA', 12)");
+  REQUIRE_FALSE(orphan_key.has_value());
+  CHECK(orphan_key.error().code == ErrorCode::constraint_violation);
+
+  const auto empty_origin = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO user_keys(fingerprint, user_handle, user_origin, "
+      "public_key, added_at) VALUES('SHA256:empty-origin', 'alice', '', "
+      "'ssh-ed25519 AAAA', 12)");
+  REQUIRE_FALSE(empty_origin.has_value());
+  CHECK(empty_origin.error().code == ErrorCode::constraint_violation);
+
+  const auto invalid_board = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO boards(board_id, name, title, status, created_at) "
+      "VALUES('not-a-guid', 'general', 'General', 'active', 13)");
+  REQUIRE_FALSE(invalid_board.has_value());
+  CHECK(invalid_board.error().code == ErrorCode::constraint_violation);
+
+  const auto extra_hyphen_board = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO boards(board_id, name, title, status, created_at) "
+      "VALUES('-0000000-0000-0000-0000-000000000001', 'general', "
+      "'General', 'active', 13)");
+  REQUIRE_FALSE(extra_hyphen_board.has_value());
+  CHECK(extra_hyphen_board.error().code == ErrorCode::constraint_violation);
+
+  const auto invalid_status = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO boards(board_id, name, title, status, created_at) "
+      "VALUES('00000000-0000-0000-0000-000000000001', 'general', "
+      "'General', 'deleted', 13)");
+  REQUIRE_FALSE(invalid_status.has_value());
+  CHECK(invalid_status.error().code == ErrorCode::constraint_violation);
+
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *transaction,
+                  "INSERT INTO boards(board_id, name, title, created_at) "
+                  "VALUES('00000000-0000-0000-0000-000000000001', "
+                  "'general', 'General', 13);"
+                  "INSERT INTO threads(thread_id, board_id, author_handle, "
+                  "subject, created_at, updated_at) VALUES('thread-1', "
+                  "'00000000-0000-0000-0000-000000000001', 'alice', "
+                  "'Welcome', 14, 14);"
+                  "INSERT INTO messages(message_id, board_id, thread_id, "
+                  "author_handle, body, posted_at, received_at) VALUES("
+                  "'message-1', '00000000-0000-0000-0000-000000000001', "
+                  "'thread-1', 'alice', 'hello', 15, 16)")
+              .has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *transaction,
+                  "INSERT INTO reports(report_id, reporter_handle, "
+                  "target_kind, target_id, target_origin, created_at) "
+                  "VALUES('report-1', 'alice', 'user', 'alice', "
+                  "'remote.example', 16);"
+                  "INSERT INTO moderation_log(entry_id, moderator_handle, "
+                  "action, target_kind, target_id, target_origin, "
+                  "created_at) VALUES('moderation-1', 'alice', 'warn', "
+                  "'user', 'alice', 'remote.example', 17)")
+              .has_value());
+  const auto orphan_user_target = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO moderation_log(entry_id, moderator_handle, action, "
+      "target_kind, target_id, target_origin, created_at) VALUES("
+      "'moderation-2', 'alice', 'warn', 'user', 'missing', "
+      "'remote.example', 18)");
+  REQUIRE_FALSE(orphan_user_target.has_value());
+  CHECK(orphan_user_target.error().code == ErrorCode::constraint_violation);
+  const auto duplicate_message = (*store)->execute_for_testing(
+      *transaction,
+      "INSERT INTO messages(message_id, board_id, thread_id, author_handle, "
+      "body, posted_at, received_at) VALUES('message-1', "
+      "'00000000-0000-0000-0000-000000000001', 'thread-1', 'alice', "
+      "'again', 17, 18)");
+  REQUIRE_FALSE(duplicate_message.has_value());
+  CHECK(duplicate_message.error().code == ErrorCode::constraint_violation);
 }
 
 TEST_CASE("SQLite migrations are ordered and atomic") {
@@ -150,7 +314,7 @@ TEST_CASE("SQLite startup rejects newer and foreign databases") {
     auto transaction = (*store)->begin(TransactionMode::read_write);
     REQUIRE(transaction.has_value());
     REQUIRE((*store)
-                ->execute_for_testing(*transaction, "PRAGMA user_version=2")
+                ->execute_for_testing(*transaction, "PRAGMA user_version=3")
                 .has_value());
     REQUIRE(transaction->commit().has_value());
 

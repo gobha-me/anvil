@@ -1,4 +1,5 @@
 #include "sqlite_store.hpp"
+#include "sqlite_schema.hpp"
 
 #include <sqlite3.h>
 
@@ -20,6 +21,7 @@ namespace {
 constexpr std::int64_t anvil_application_id = 0x414E564C;
 constexpr std::array production_migrations{
     detail::SqliteMigration{1, {}},
+    detail::SqliteMigration{2, detail::domain_schema_v2},
 };
 
 struct DatabaseDeleter {
@@ -423,6 +425,19 @@ auto SqliteStore::scalar_for_testing(Transaction &transaction,
   }
   return scalar_integer(backend->database(), sql,
                         "SQLite test query failed");
+}
+
+auto SqliteStore::scalar_text_for_testing(Transaction &transaction,
+                                          std::string_view sql)
+    -> std::expected<std::string, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(Error{
+        ErrorCode::invalid_state,
+        "transaction is inactive or belongs to a different SQLite store"});
+  }
+  return scalar_text(backend->database(), sql, "SQLite test query failed");
 }
 
 namespace detail {

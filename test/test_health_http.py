@@ -148,7 +148,7 @@ def test_live_server(executable: pathlib.Path) -> None:
             assert status == 200 and ready["status"] == "ready", body
             assert ready["components"] == [
                 {"kind": "storage", "name": "database", "state": "ready",
-                 "version": "1"}
+                 "version": "2"}
             ], ready
             metrics = wait_for_metric(health_port, rb"anvil_ssh_active_sessions 0")
             assert b"tester" not in metrics and b"127.0.0.1" not in metrics, metrics
@@ -266,7 +266,7 @@ def test_newer_database_refuses_startup(executable: pathlib.Path) -> None:
         database = pathlib.Path(directory_name) / "anvil.db"
         with sqlite3.connect(database) as connection:
             connection.execute("PRAGMA application_id=1095652940")
-            connection.execute("PRAGMA user_version=2")
+            connection.execute("PRAGMA user_version=3")
         result = subprocess.run(
             [
                 str(executable), "--database", str(database),

@@ -49,6 +49,9 @@ public:
   [[nodiscard]] auto scalar_for_testing(Transaction &transaction,
                                         std::string_view sql)
       -> std::expected<std::int64_t, Error>;
+  [[nodiscard]] auto scalar_text_for_testing(Transaction &transaction,
+                                             std::string_view sql)
+      -> std::expected<std::string, Error>;
 
 private:
   std::filesystem::path path_;
