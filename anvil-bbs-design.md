@@ -143,6 +143,15 @@ User-submitted content is rendered into *other users'* terminals. A post contain
 - Validate UTF-8 on ingest; reject overlongs and surrogates.
 - Cap grapheme count and line length on ingest.
 
+Free-form prose uses TermForge's visible escape mode at the storage boundary:
+controls and malformed bytes become printable caret or hexadecimal notation,
+so moderation never silently loses what a user submitted. Every render path
+then applies strip mode again. Valid stored prose is a fixpoint of that pass;
+legacy, corrupt, or bypass-inserted controls fail closed. Raw TAB, CR and LF
+are controls too; later structured formatting owns semantic line breaks.
+Identifiers are never silently rewritten — their strict rejection rules and
+grapheme limits belong to #27.
+
 This is a classic BBS-era attack and it is fully applicable today.
 
 **Sanitization helpers ship in the plugin SDK.** A door rendering user-supplied text — a high score name, a chat line, anything — faces exactly this attack and must not be expected to reimplement the defence. Making the safe path the easy path is the only version of this that survives contact with a mod ecosystem.

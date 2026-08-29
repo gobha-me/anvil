@@ -243,6 +243,7 @@ if(ANVIL_SERVER)
     test_health.cpp
     test_server.cpp
     test_sqlite_store.cpp
+    test_text_sanitization.cpp
   )
   target_compile_features(anvil_server_tests PRIVATE cxx_std_23)
   target_compile_options(anvil_server_tests PRIVATE ${ANVIL_WARNING_FLAGS})

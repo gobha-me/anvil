@@ -19,6 +19,11 @@ container.
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
 > tracker for the work breakdown.
 
+The first M1 security boundary is also in place: user-authored prose is made
+visibly inert before storage and sanitized again before rendering. Anvil uses
+TermForge's single control-sequence parser for both policies, so OSC, CSI,
+C0/C1 controls, and malformed UTF-8 cannot drift between two implementations.
+
 ---
 
 ## What it is
