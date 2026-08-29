@@ -92,6 +92,9 @@ install -d -m 700 state
   --idle-warning-seconds 30 \
   --session-cap-seconds 86400 \
   --database state/anvil.db \
+  --backup-directory state/backups \
+  --backup-interval-seconds 86400 \
+  --backup-retention-seconds 604800 \
   --host-key state/host_key \
   --authorized-key demo="$HOME/.ssh/id_ed25519.pub"
 ```
@@ -510,6 +513,43 @@ posts on sudden power loss merely to remove one sync per commit. The database,
 its `-wal` file, and its `-shm` file are one unit of live state; use SQLite's
 backup API rather than copying any of them while the server is running.
 
+`--backup-directory PATH` enables an immediate snapshot at startup and periodic
+snapshots thereafter. The interval defaults to one day and the rolling window
+defaults to seven days; override them with `--backup-interval-seconds` and
+`--backup-retention-seconds`. Each private snapshot directory contains a
+standalone SQLite backup, the exact SSH host key, and a versioned manifest.
+Only completed snapshots participate in retention, pruning runs only after a
+new snapshot succeeds, and the newest successful snapshot is always retained.
+The supplied Compose deployment stores these snapshots under
+`/var/lib/anvil/backups` on the persistent volume.
+
+Backups contain both user content and the board's private host key. Protect the
+backup volume accordingly. A seven-day backup window also makes deleted data
+recoverable for up to seven days, even if another retention setting is shorter.
+Choose these values as one retention policy rather than treating backups as an
+exception.
+
+Create an operator-requested snapshot without starting listeners:
+
+```sh
+./build/anvil \
+  --backup-now state/backups \
+  --database state/anvil.db \
+  --host-key state/host_key
+```
+
+Restore only while the server is stopped. Remove the destroyed database, its
+`-wal` and `-shm` sidecars, and the lost host-key file first; restore refuses to
+overwrite any of them. It validates the private snapshot, SQLite integrity and
+schema, and host key before publishing new `0600` files:
+
+```sh
+./build/anvil \
+  --restore-backup state/backups/anvil-backup-EPOCH-SUFFIX \
+  --database state/anvil.db \
+  --host-key state/host_key
+```
+
 ## Version compatibility
 
 Plugin compatibility is stated against the plugin interface, not the server or
@@ -539,6 +579,7 @@ independent stream.
 | `0.18.0` | `1.0–1.2` |
 | `0.19.0` | `1.0–1.2` |
 | `0.20.0` | `1.0–1.2` |
+| `0.21.0` | `1.0–1.2` |
 
 Every release adds its accepted ranges to this table. A future interface-major
 transition includes a migration note and announcement, and defaults to one

@@ -684,7 +684,7 @@ Tables: `users`, `user_keys`, `invites`, `tos_acceptances`, `boards`, `threads`,
 - Message bodies plain UTF-8, sanitized (§5.2). ANSI is never stored.
 - Private chat has **no table** (§6.2). This is deliberate.
 - `plugins` holds enabled-state, last-loaded hash, author, version, and observed toolchain (§7.8). `plugin_state` is the backing store for `IStateStore`, keyed `(plugin_id, user_id)` — note the key is the *plugin*, not the door, since board services persist too.
-- Periodic backup — SQLite backup API, or standard tooling on Postgres. Retain a rolling window.
+- Periodic backup — SQLite backup API, or standard tooling on Postgres. Retain a rolling window. SQLite snapshots pair a standalone database with the exact SSH host key, publish atomically on the persistent volume, and have an exercised offline restore path. Backup retention is part of content retention: a snapshot can keep deleted user content recoverable after the live-store window expires.
 - Schema migrations versioned and applied at startup, forward-only.
 
 **Plugins do not own tables.** A plugin that needs richer storage than `IStateStore` provides is a signal to widen `IStateStore`, not to let foreign code migrate the board's schema. A mod ecosystem in which every mod adds tables produces a database no operator can back up, restore, or reason about.

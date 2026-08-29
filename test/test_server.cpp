@@ -129,6 +129,9 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.health_bind_address == "127.0.0.1");
   CHECK(parsed.config.health_port == 8080);
   CHECK(parsed.config.database_path == "anvil.db");
+  CHECK(parsed.config.backup_directory.empty());
+  CHECK(parsed.config.backup_interval.count() == 86'400);
+  CHECK(parsed.config.backup_retention.count() == 604'800);
   CHECK(parsed.config.max_sessions_per_ip == 4);
   CHECK(parsed.config.connection_rate.count == 10);
   CHECK(parsed.config.connection_rate.period.count() == 10);
@@ -170,6 +173,62 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
       std::string_view{"8080"},
   };
   CHECK_THROWS_AS(anvil::server::parse_arguments(conflicting_ports), std::runtime_error);
+}
+
+TEST_CASE("server CLI separates scheduled and offline backup modes") {
+  const std::array scheduled{
+      std::string_view{"--host-key"},
+      std::string_view{"host_key"},
+      std::string_view{"--authorized-key"},
+      std::string_view{"user=key.pub"},
+      std::string_view{"--backup-directory"},
+      std::string_view{"backups"},
+      std::string_view{"--backup-interval-seconds"},
+      std::string_view{"60"},
+      std::string_view{"--backup-retention-seconds"},
+      std::string_view{"600"},
+  };
+  const auto parsed = anvil::server::parse_arguments(scheduled);
+  CHECK(parsed.config.operation == anvil::server::Operation::serve);
+  CHECK(parsed.config.backup_directory == "backups");
+  CHECK(parsed.config.backup_interval.count() == 60);
+  CHECK(parsed.config.backup_retention.count() == 600);
+
+  const std::array one_shot{
+      std::string_view{"--backup-now"}, std::string_view{"backups"},
+      std::string_view{"--database"},   std::string_view{"state/anvil.db"},
+      std::string_view{"--host-key"},   std::string_view{"state/host_key"},
+  };
+  CHECK(anvil::server::parse_arguments(one_shot).config.operation ==
+        anvil::server::Operation::backup_once);
+
+  const std::array restore{
+      std::string_view{"--restore-backup"}, std::string_view{"snapshot"},
+      std::string_view{"--database"},       std::string_view{"state/anvil.db"},
+      std::string_view{"--host-key"},       std::string_view{"state/host_key"},
+  };
+  CHECK(anvil::server::parse_arguments(restore).config.operation ==
+        anvil::server::Operation::restore);
+
+  const std::array missing_destination{
+      std::string_view{"--backup-now"},
+      std::string_view{"backups"},
+      std::string_view{"--host-key"},
+      std::string_view{"state/host_key"},
+  };
+  CHECK_THROWS_AS(anvil::server::parse_arguments(missing_destination),
+                  std::runtime_error);
+
+  const std::array schedule_without_directory{
+      std::string_view{"--host-key"},
+      std::string_view{"host_key"},
+      std::string_view{"--authorized-key"},
+      std::string_view{"user=key.pub"},
+      std::string_view{"--backup-retention-seconds"},
+      std::string_view{"600"},
+  };
+  CHECK_THROWS_AS(anvil::server::parse_arguments(schedule_without_directory),
+                  std::runtime_error);
 }
 
 TEST_CASE("server CLI help does not require operational arguments") {

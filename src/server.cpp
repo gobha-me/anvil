@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "admission.hpp"
+#include "backup.hpp"
 #include "health.hpp"
 #include "sqlite_store.hpp"
 #include "terminal_session.hpp"
@@ -1061,6 +1062,79 @@ void reap_children(ChildMap &children, AdmissionController &admission, HealthMon
   }
 }
 
+[[noreturn]] void
+run_scheduled_backup(store::SqliteStore &database, const Config &config,
+                     std::span<const int> descriptors_to_close,
+                     HealthMonitor &health) {
+  health.detach_in_worker();
+  for (const auto descriptor : descriptors_to_close) {
+    if (descriptor >= 0) {
+      static_cast<void>(::close(descriptor));
+    }
+  }
+
+  auto snapshot = backup::create_snapshot(database, config.host_key_path,
+                                          config.backup_directory);
+  if (!snapshot) {
+    std::cerr << "anvil: scheduled backup failed: " << snapshot.error() << '\n';
+    std::_Exit(1);
+  }
+  auto pruned =
+      backup::prune_snapshots(config.backup_directory, config.backup_retention);
+  if (!pruned) {
+    std::cerr << "anvil: backup " << snapshot->path.string()
+              << " succeeded but retention failed: " << pruned.error() << '\n';
+    std::_Exit(1);
+  }
+  std::cerr << "anvil: created scheduled backup " << snapshot->path.string()
+            << '\n';
+  std::_Exit(0);
+}
+
+[[nodiscard]] auto
+start_scheduled_backup(store::SqliteStore &database, const Config &config,
+                       std::span<const int> descriptors_to_close,
+                       HealthMonitor &health) -> pid_t {
+  const auto child = ::fork();
+  if (child == 0) {
+    run_scheduled_backup(database, config, descriptors_to_close, health);
+  }
+  return child;
+}
+
+void reap_scheduled_backup(pid_t &child, HealthMonitor &health) {
+  if (child < 0) {
+    return;
+  }
+  int status = 0;
+  const auto found = ::waitpid(child, &status, WNOHANG);
+  if (found == 0 || (found < 0 && errno == EINTR)) {
+    return;
+  }
+  if (found == child && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    health.set_component(ComponentStatus{
+        ComponentKind::storage, ComponentState::ready, "backup", "1", {}});
+  } else {
+    health.set_component(ComponentStatus{ComponentKind::storage,
+                                         ComponentState::failed, "backup", "1",
+                                         "last scheduled backup failed"});
+  }
+  child = -1;
+}
+
+void stop_scheduled_backup(pid_t &child) noexcept {
+  if (child < 0) {
+    return;
+  }
+  if (::kill(child, SIGTERM) != 0 && errno != ESRCH) {
+    std::cerr << "anvil: cannot stop backup worker " << child << ": "
+              << std::strerror(errno) << '\n';
+  }
+  while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  child = -1;
+}
+
 void terminate_children(const ChildMap &children, int signal_number) {
   for (const auto &[child, state] : children) {
     static_cast<void>(state);
@@ -1202,14 +1276,25 @@ std::string_view usage() noexcept {
          "  --health-bind-address A private HTTP address (default 127.0.0.1)\n"
          "  --health-port PORT      private HTTP port (default 8080)\n"
          "  --database PATH        SQLite database (default anvil.db)\n"
+         "  --backup-directory P  enable snapshots in directory P\n"
+         "  --backup-interval-seconds S\n"
+         "                          snapshot period (default 86400)\n"
+         "  --backup-retention-seconds S\n"
+         "                          rolling window (default 604800)\n"
+         "  --backup-now PATH      create one snapshot and exit\n"
+         "  --restore-backup PATH restore one snapshot and exit\n"
          "  --max-sessions COUNT    concurrent worker limit (default 64)\n"
-         "  --max-sessions-per-ip N concurrent worker limit per IP (default 4)\n"
+         "  --max-sessions-per-ip N concurrent worker limit per IP (default "
+         "4)\n"
          "  --connection-rate-limit C/S\n"
-         "                          connection burst C per S seconds (default 10/10)\n"
+         "                          connection burst C per S seconds (default "
+         "10/10)\n"
          "  --auth-attempt-rate-limit C/S\n"
-         "                          denied-auth burst C per S seconds (default 6/60)\n"
+         "                          denied-auth burst C per S seconds (default "
+         "6/60)\n"
          "  --max-auth-attempts-per-session N\n"
-         "                          denied-auth limit per connection (default 6)\n"
+         "                          denied-auth limit per connection (default "
+         "6)\n"
          "  --max-tracked-ips N     bounded limiter state (default 4096)\n"
          "  --idle-timeout-seconds S\n"
          "                          idle limit in seconds (default 300)\n"
@@ -1225,6 +1310,11 @@ std::string_view usage() noexcept {
 
 ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   ParseResult result;
+  bool database_explicit = false;
+  bool host_key_explicit = false;
+  bool backup_interval_explicit = false;
+  bool backup_retention_explicit = false;
+  bool backup_directory_explicit = false;
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const auto argument = arguments[index];
     if (argument == "--help") {
@@ -1233,12 +1323,17 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
     if (argument != "--bind-address" && argument != "--port" &&
         argument != "--health-bind-address" && argument != "--health-port" &&
-        argument != "--database" &&
-        argument != "--max-sessions" &&
-        argument != "--max-sessions-per-ip" && argument != "--connection-rate-limit" &&
+        argument != "--database" && argument != "--backup-directory" &&
+        argument != "--backup-interval-seconds" &&
+        argument != "--backup-retention-seconds" &&
+        argument != "--backup-now" && argument != "--restore-backup" &&
+        argument != "--max-sessions" && argument != "--max-sessions-per-ip" &&
+        argument != "--connection-rate-limit" &&
         argument != "--auth-attempt-rate-limit" &&
-        argument != "--max-auth-attempts-per-session" && argument != "--max-tracked-ips" &&
-        argument != "--idle-timeout-seconds" && argument != "--idle-warning-seconds" &&
+        argument != "--max-auth-attempts-per-session" &&
+        argument != "--max-tracked-ips" &&
+        argument != "--idle-timeout-seconds" &&
+        argument != "--idle-warning-seconds" &&
         argument != "--session-cap-seconds" && argument != "--host-key" &&
         argument != "--authorized-key") {
       throw std::runtime_error("unknown option: " + std::string(argument));
@@ -1260,6 +1355,31 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       result.config.health_port = parse_port(value);
     } else if (argument == "--database") {
       result.config.database_path = value;
+      database_explicit = true;
+    } else if (argument == "--backup-directory") {
+      result.config.backup_directory = value;
+      backup_directory_explicit = true;
+    } else if (argument == "--backup-interval-seconds") {
+      result.config.backup_interval = parse_duration(value, "backup interval");
+      backup_interval_explicit = true;
+    } else if (argument == "--backup-retention-seconds") {
+      result.config.backup_retention =
+          parse_duration(value, "backup retention");
+      backup_retention_explicit = true;
+    } else if (argument == "--backup-now") {
+      if (result.config.operation != Operation::serve) {
+        throw std::runtime_error(
+            "backup and restore modes are mutually exclusive");
+      }
+      result.config.operation = Operation::backup_once;
+      result.config.backup_directory = value;
+    } else if (argument == "--restore-backup") {
+      if (result.config.operation != Operation::serve) {
+        throw std::runtime_error(
+            "backup and restore modes are mutually exclusive");
+      }
+      result.config.operation = Operation::restore;
+      result.config.restore_snapshot = value;
     } else if (argument == "--max-sessions") {
       result.config.max_sessions = parse_session_limit(value);
     } else if (argument == "--max-sessions-per-ip") {
@@ -1281,6 +1401,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       result.config.session_cap = parse_duration(value, "session cap");
     } else if (argument == "--host-key") {
       result.config.host_key_path = value;
+      host_key_explicit = true;
     } else {
       const auto separator = value.find('=');
       if (separator == std::string_view::npos || separator == 0U ||
@@ -1292,6 +1413,27 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
   }
   if (!result.show_help) {
+    if (result.config.operation != Operation::serve) {
+      if (!database_explicit || !host_key_explicit) {
+        throw std::runtime_error("maintenance mode requires explicit "
+                                 "--database and --host-key paths");
+      }
+      if (!result.config.authorized_keys.empty()) {
+        throw std::runtime_error(
+            "--authorized-key is not valid in backup or restore mode");
+      }
+      if (backup_directory_explicit || backup_interval_explicit ||
+          backup_retention_explicit) {
+        throw std::runtime_error(
+            "scheduled backup options are not valid in maintenance mode");
+      }
+      return result;
+    }
+    if ((backup_interval_explicit || backup_retention_explicit) &&
+        result.config.backup_directory.empty()) {
+      throw std::runtime_error(
+          "scheduled backup options require --backup-directory");
+    }
     if (result.config.max_sessions_per_ip > result.config.max_sessions) {
       throw std::runtime_error("per-IP session limit must not exceed global session limit");
     }
@@ -1315,6 +1457,39 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
 }
 
 int run(const Config &config) {
+  if (config.operation == Operation::restore) {
+    auto restored = backup::restore_snapshot(
+        config.restore_snapshot, config.database_path, config.host_key_path);
+    if (!restored) {
+      throw std::runtime_error("cannot restore backup: " + restored.error());
+    }
+    std::cout << "anvil: restored " << config.restore_snapshot << " to "
+              << config.database_path << " with host key "
+              << config.host_key_path << '\n';
+    return 0;
+  }
+
+  if (config.operation == Operation::backup_once) {
+    std::error_code status_error;
+    if (!std::filesystem::is_regular_file(config.database_path, status_error) ||
+        status_error) {
+      throw std::runtime_error("database does not exist as a regular file: " +
+                               config.database_path);
+    }
+    auto database = store::SqliteStore::open(config.database_path);
+    if (!database) {
+      throw std::runtime_error("cannot open database '" + config.database_path +
+                               "': " + database.error().detail);
+    }
+    auto snapshot = backup::create_snapshot(**database, config.host_key_path,
+                                            config.backup_directory);
+    if (!snapshot) {
+      throw std::runtime_error("cannot create backup: " + snapshot.error());
+    }
+    std::cout << "anvil: created backup " << snapshot->path.string() << '\n';
+    return 0;
+  }
+
   auto database = store::SqliteStore::open(config.database_path);
   if (!database) {
     throw std::runtime_error("cannot initialize database '" +
@@ -1385,6 +1560,13 @@ int run(const Config &config) {
   health->set_component(
       ComponentStatus{ComponentKind::storage, ComponentState::ready, "database",
                       std::to_string((*database)->schema_version()), {}});
+  if (!config.backup_directory.empty()) {
+    health->set_component(ComponentStatus{ComponentKind::storage,
+                                          ComponentState::not_configured,
+                                          "backup",
+                                          "1",
+                                          {}});
+  }
   health->heartbeat(true);
 
   AdmissionController admission(config.max_sessions, config.max_sessions_per_ip,
@@ -1393,15 +1575,42 @@ int run(const Config &config) {
   ChildMap children;
   children.reserve(config.max_sessions);
   std::uint64_t next_session_id = 1U;
+  pid_t backup_child = -1;
+  auto next_backup = Clock::now();
 
   bool stopping = false;
   bool health_failed = false;
   std::cout << "anvil: listening on " << config.bind_address << ':' << config.port << '\n';
   std::cout << "anvil: health listening on " << config.health_bind_address << ':'
             << config.health_port << '\n';
+  if (!config.backup_directory.empty()) {
+    std::cout << "anvil: backups enabled in " << config.backup_directory
+              << " every " << config.backup_interval.count() << " seconds with "
+              << config.backup_retention.count()
+              << " seconds retention; snapshots contain user content and the "
+                 "private host key\n";
+  }
   std::cout.flush();
 
   while (!stopping) {
+    reap_scheduled_backup(backup_child, *health);
+    const auto now = Clock::now();
+    if (!config.backup_directory.empty() && backup_child < 0 &&
+        now >= next_backup) {
+      const std::array descriptors_to_close{
+          ssh_bind_get_fd(bind.get()), signal_descriptor.get(),
+          worker_report_receiver.get(), worker_report_sender.get()};
+      backup_child = start_scheduled_backup(**database, config,
+                                            descriptors_to_close, *health);
+      next_backup = now + config.backup_interval;
+      if (backup_child < 0) {
+        std::cerr << "anvil: cannot start scheduled backup: "
+                  << std::strerror(errno) << '\n';
+        health->set_component(
+            ComponentStatus{ComponentKind::storage, ComponentState::failed,
+                            "backup", "1", "cannot start scheduled backup"});
+      }
+    }
     std::array<pollfd, 3> descriptors{{
         {.fd = ssh_bind_get_fd(bind.get()), .events = POLLIN, .revents = 0},
         {.fd = worker_report_receiver.get(), .events = POLLIN, .revents = 0},
@@ -1527,6 +1736,7 @@ int run(const Config &config) {
 
   health->heartbeat(false);
   bind.reset();
+  stop_scheduled_backup(backup_child);
   await_children(children, signal_descriptor.get(), worker_report_receiver.get(), admission,
                  *health);
   health->shutdown();

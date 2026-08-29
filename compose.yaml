@@ -37,6 +37,12 @@ services:
       - "8080"
       - --database
       - /var/lib/anvil/anvil.db
+      - --backup-directory
+      - /var/lib/anvil/backups
+      - --backup-interval-seconds
+      - "86400"
+      - --backup-retention-seconds
+      - "604800"
       - --host-key
       - /var/lib/anvil/host_key
       - --authorized-key

@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <variant>
@@ -44,6 +45,15 @@ struct StatementDeleter {
   }
 };
 using Statement = std::unique_ptr<sqlite3_stmt, StatementDeleter>;
+
+struct BackupDeleter {
+  void operator()(sqlite3_backup *backup) const noexcept {
+    if (backup != nullptr) {
+      static_cast<void>(sqlite3_backup_finish(backup));
+    }
+  }
+};
+using Backup = std::unique_ptr<sqlite3_backup, BackupDeleter>;
 
 [[nodiscard]] auto error_code(int result) noexcept -> ErrorCode {
   switch (result & 0xff) {
@@ -560,6 +570,116 @@ constexpr std::string_view message_columns =
   return database;
 }
 
+[[nodiscard]] auto open_backup_destination(const std::filesystem::path &path,
+                                           const SqliteOptions &options)
+    -> std::expected<Database, Error> {
+  const auto descriptor =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+             S_IRUSR | S_IWUSR);
+  if (descriptor < 0) {
+    return std::unexpected(
+        Error{ErrorCode::unavailable,
+              "cannot create SQLite backup destination: " +
+                  std::error_code(errno, std::generic_category()).message()});
+  }
+  if (::close(descriptor) != 0) {
+    const auto failure = errno;
+    static_cast<void>(::unlink(path.c_str()));
+    return std::unexpected(
+        Error{ErrorCode::unavailable,
+              "cannot close SQLite backup destination: " +
+                  std::error_code(failure, std::generic_category()).message()});
+  }
+
+  sqlite3 *raw_database = nullptr;
+  const auto flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX |
+                     SQLITE_OPEN_NOFOLLOW | SQLITE_OPEN_EXRESCODE;
+  const auto result =
+      sqlite3_open_v2(path.c_str(), &raw_database, flags, nullptr);
+  Database database(raw_database);
+  if (result != SQLITE_OK) {
+    static_cast<void>(::unlink(path.c_str()));
+    return std::unexpected(sqlite_error(
+        database.get(), result, "cannot open SQLite backup destination"));
+  }
+  if (auto configured = configure_security(database.get(), options);
+      !configured) {
+    static_cast<void>(::unlink(path.c_str()));
+    return std::unexpected(configured.error());
+  }
+  return database;
+}
+
+[[nodiscard]] auto copy_database(sqlite3 *source,
+                                 const std::filesystem::path &destination,
+                                 const SqliteOptions &options)
+    -> std::expected<void, Error> {
+  auto target = open_backup_destination(destination, options);
+  if (!target) {
+    return std::unexpected(target.error());
+  }
+
+  sqlite3_backup *raw_backup =
+      sqlite3_backup_init(target->get(), "main", source, "main");
+  if (raw_backup == nullptr) {
+    const auto error =
+        sqlite_error(target->get(), sqlite3_errcode(target->get()),
+                     "cannot initialize SQLite backup");
+    target->reset();
+    static_cast<void>(::unlink(destination.c_str()));
+    return std::unexpected(error);
+  }
+  Backup backup(raw_backup);
+
+  const auto deadline = std::chrono::steady_clock::now() + options.busy_timeout;
+  int result = SQLITE_OK;
+  do {
+    result = sqlite3_backup_step(backup.get(), 256);
+    if (result == SQLITE_BUSY || result == SQLITE_LOCKED) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  } while (result == SQLITE_OK || result == SQLITE_BUSY ||
+           result == SQLITE_LOCKED);
+
+  const auto finished = sqlite3_backup_finish(backup.release());
+  if (result != SQLITE_DONE || finished != SQLITE_OK) {
+    const auto failure = result == SQLITE_DONE ? finished : result;
+    const auto error =
+        sqlite_error(target->get(), failure, "cannot complete SQLite backup");
+    target->reset();
+    static_cast<void>(::unlink(destination.c_str()));
+    return std::unexpected(error);
+  }
+  if (const auto flushed = sqlite3_db_cacheflush(target->get());
+      flushed != SQLITE_OK) {
+    const auto error =
+        sqlite_error(target->get(), flushed, "cannot flush SQLite backup");
+    target->reset();
+    static_cast<void>(::unlink(destination.c_str()));
+    return std::unexpected(error);
+  }
+  target->reset();
+
+  const auto descriptor =
+      ::open(destination.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0 || ::fsync(descriptor) != 0) {
+    const auto failure = errno;
+    if (descriptor >= 0) {
+      static_cast<void>(::close(descriptor));
+    }
+    static_cast<void>(::unlink(destination.c_str()));
+    return std::unexpected(
+        Error{ErrorCode::unavailable,
+              "cannot flush SQLite backup file: " +
+                  std::error_code(failure, std::generic_category()).message()});
+  }
+  static_cast<void>(::close(descriptor));
+  return {};
+}
+
 class SqliteTransactionBackend final : public TransactionBackend {
 public:
   explicit SqliteTransactionBackend(Database database) noexcept
@@ -643,6 +763,62 @@ auto SqliteStore::begin(TransactionMode mode)
   }
   return make_transaction(
       mode, std::make_unique<SqliteTransactionBackend>(std::move(*database)));
+}
+
+auto SqliteStore::backup_to(const std::filesystem::path &destination)
+    -> std::expected<void, Error> {
+  auto source = open_connection(path_, options_, false);
+  if (!source) {
+    return std::unexpected(source.error());
+  }
+  return copy_database(source->get(), destination, options_);
+}
+
+auto SqliteStore::restore_from(const std::filesystem::path &snapshot,
+                               const std::filesystem::path &destination)
+    -> std::expected<void, Error> {
+  const auto remove_destination = [&destination] {
+    static_cast<void>(::unlink(destination.c_str()));
+    static_cast<void>(::unlink((destination.string() + "-wal").c_str()));
+    static_cast<void>(::unlink((destination.string() + "-shm").c_str()));
+  };
+  sqlite3 *raw_source = nullptr;
+  const auto flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
+                     SQLITE_OPEN_NOFOLLOW | SQLITE_OPEN_EXRESCODE;
+  const auto result =
+      sqlite3_open_v2(snapshot.c_str(), &raw_source, flags, nullptr);
+  Database source(raw_source);
+  if (result != SQLITE_OK) {
+    return std::unexpected(
+        sqlite_error(source.get(), result, "cannot open SQLite backup"));
+  }
+  SqliteOptions options;
+  if (auto configured = configure_security(source.get(), options);
+      !configured) {
+    return std::unexpected(configured.error());
+  }
+  auto integrity = scalar_text(source.get(), "PRAGMA quick_check",
+                               "cannot check SQLite backup integrity");
+  if (!integrity) {
+    return std::unexpected(integrity.error());
+  }
+  if (*integrity != "ok") {
+    return std::unexpected(
+        invalid_data("SQLite backup failed its integrity check"));
+  }
+  auto copied = copy_database(source.get(), destination, options);
+  if (!copied) {
+    return copied;
+  }
+  auto validated = SqliteStore::open(destination);
+  if (!validated) {
+    remove_destination();
+    return std::unexpected(validated.error());
+  }
+  validated->reset();
+  static_cast<void>(::unlink((destination.string() + "-wal").c_str()));
+  static_cast<void>(::unlink((destination.string() + "-shm").c_str()));
+  return {};
 }
 
 auto SqliteStore::schema_version() const noexcept -> std::uint32_t {

@@ -238,6 +238,7 @@ if(ANVIL_SERVER)
 
   add_executable(anvil_server_tests
     test_admission.cpp
+    test_backup.cpp
     test_canonical_message.cpp
     test_health.cpp
     test_server.cpp
@@ -266,6 +267,15 @@ if(ANVIL_SERVER)
       $<TARGET_FILE:anvil>
   )
   set_tests_properties(health_http_contract PROPERTIES TIMEOUT 60)
+
+  add_test(
+    NAME backup_restore_cli
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_backup_restore.py
+      $<TARGET_FILE:anvil>
+  )
+  set_tests_properties(backup_restore_cli PROPERTIES TIMEOUT 60)
 
   add_test(
     NAME ssh_server_end_to_end
