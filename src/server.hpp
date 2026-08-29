@@ -19,12 +19,19 @@ struct RateLimit {
   std::chrono::seconds period{};
 };
 
+enum class Operation : std::uint8_t { serve, backup_once, restore };
+
 struct Config {
+  Operation operation{Operation::serve};
   std::string bind_address{"127.0.0.1"};
   std::uint16_t port{2222};
   std::string health_bind_address{"127.0.0.1"};
   std::uint16_t health_port{8080};
   std::string database_path{"anvil.db"};
+  std::string backup_directory;
+  std::chrono::seconds backup_interval{86'400};
+  std::chrono::seconds backup_retention{604'800};
+  std::string restore_snapshot;
   std::uint32_t max_sessions{64};
   std::uint32_t max_sessions_per_ip{4};
   RateLimit connection_rate{10, std::chrono::seconds(10)};

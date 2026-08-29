@@ -39,6 +39,18 @@ public:
   [[nodiscard]] auto begin(TransactionMode mode)
       -> std::expected<Transaction, Error> final;
 
+  // Server-private online backup support. The destination must not already
+  // exist and is removed if SQLite cannot publish a complete backup.
+  [[nodiscard]] auto backup_to(const std::filesystem::path &destination)
+      -> std::expected<void, Error>;
+
+  // Restore an offline snapshot into a new database file. The restored
+  // database is validated and migrated before it is published by the caller.
+  [[nodiscard]] static auto
+  restore_from(const std::filesystem::path &snapshot,
+               const std::filesystem::path &destination)
+      -> std::expected<void, Error>;
+
   [[nodiscard]] auto schema_version() const noexcept -> std::uint32_t;
 
   // Internal probes used by backend tests. Domain code must continue to add

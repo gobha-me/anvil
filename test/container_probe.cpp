@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <string_view>
@@ -60,6 +62,54 @@ constexpr auto connect_timeout = std::chrono::seconds(3);
     return 13;
   }
   return 0;
+}
+
+[[nodiscard]] int probe_backup_directory(const char *path) {
+  const int raw_directory =
+      ::open(path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+  if (raw_directory < 0) {
+    std::cerr << "backup directory unavailable: " << std::strerror(errno)
+              << '\n';
+    return 14;
+  }
+  DIR *directory = ::fdopendir(raw_directory);
+  if (directory == nullptr) {
+    static_cast<void>(::close(raw_directory));
+    std::cerr << "backup directory unreadable: " << std::strerror(errno)
+              << '\n';
+    return 15;
+  }
+  int result = 16;
+  while (const auto *entry = ::readdir(directory)) {
+    const std::string_view name(entry->d_name);
+    if (!name.starts_with("anvil-backup-")) {
+      continue;
+    }
+    const int snapshot =
+        ::openat(raw_directory, entry->d_name,
+                 O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (snapshot < 0) {
+      continue;
+    }
+    bool complete = true;
+    for (const auto *filename : {"anvil.db", "host_key", "manifest"}) {
+      struct stat metadata{};
+      if (::fstatat(snapshot, filename, &metadata, AT_SYMLINK_NOFOLLOW) != 0 ||
+          !S_ISREG(metadata.st_mode) || metadata.st_size <= 0) {
+        complete = false;
+      }
+    }
+    static_cast<void>(::close(snapshot));
+    if (complete) {
+      result = 0;
+      break;
+    }
+  }
+  static_cast<void>(::closedir(directory));
+  if (result != 0) {
+    std::cerr << "no complete backup snapshot found\n";
+  }
+  return result;
 }
 
 [[nodiscard]] bool connect_one(const addrinfo &address) {
@@ -132,9 +182,13 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::string_view{argv[1]} == "file") {
     return probe_file(argv[2]);
   }
+  if (argc == 3 && std::string_view{argv[1]} == "backup-directory") {
+    return probe_backup_directory(argv[2]);
+  }
   if (argc == 4 && std::string_view{argv[1]} == "connect") {
     return probe_connect(argv[2], argv[3]);
   }
-  std::cerr << "usage: container-probe write PATH | file PATH | connect HOST PORT\n";
+  std::cerr << "usage: container-probe write PATH | file PATH | "
+               "backup-directory PATH | connect HOST PORT\n";
   return EXIT_FAILURE;
 }

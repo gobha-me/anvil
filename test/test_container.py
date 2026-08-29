@@ -138,6 +138,20 @@ def assert_database_persisted(volume: str) -> None:
           extra=["--volume", f"{volume}:/var/lib/anvil"])
 
 
+def wait_for_backup(volume: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = probe(
+            ["backup-directory", "/var/lib/anvil/backups"],
+            extra=["--volume", f"{volume}:/var/lib/anvil"],
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(0.1)
+    raise AssertionError("container did not publish a complete backup on its volume")
+
+
 def assert_compose_posture(configuration: dict[str, object], inspection: dict[str, object]) -> None:
     services = configuration["services"]
     assert isinstance(services, dict)
@@ -158,6 +172,8 @@ def assert_compose_posture(configuration: dict[str, object], inspection: dict[st
         raise AssertionError("Compose does not read the authorized key from the secret mount")
     if "--health-bind-address" not in command or "127.0.0.1" not in command:
         raise AssertionError("Compose does not keep the health listener on loopback")
+    if "--backup-directory" not in command or "/var/lib/anvil/backups" not in command:
+        raise AssertionError("Compose does not keep backups on the persistent volume")
     published = service.get("ports")
     if not isinstance(published, list) or any(
         isinstance(item, dict) and item.get("target") != 2222 for item in published
@@ -275,6 +291,12 @@ def main(runtime_target: str = "runtime") -> int:
             "      - '2222'\n"
             "      - --database\n"
             "      - /var/lib/anvil/anvil.db\n"
+            "      - --backup-directory\n"
+            "      - /var/lib/anvil/backups\n"
+            "      - --backup-interval-seconds\n"
+            "      - '3600'\n"
+            "      - --backup-retention-seconds\n"
+            "      - '604800'\n"
             "      - --host-key\n"
             "      - /var/lib/anvil/host_key\n"
             "      - --authorized-key\n"
@@ -320,6 +342,7 @@ def main(runtime_target: str = "runtime") -> int:
             assert_compose_posture(default_configuration, inspection)
             assert_write_policy(volume)
             assert_database_persisted(volume)
+            wait_for_backup(volume)
             first_key = scan_host_key(port)
             assert_ssh_session(port, "container-test")
             assert_egress(identifier, allowed=False)
@@ -340,6 +363,7 @@ def main(runtime_target: str = "runtime") -> int:
             if scan_host_key(port) != first_key:
                 raise AssertionError("container recreation changed the persistent host identity")
             assert_database_persisted(volume)
+            wait_for_backup(volume)
             assert_egress(identifier, allowed=True)
         finally:
             compose(["down", "--volumes", "--remove-orphans"], env, egress=True,
