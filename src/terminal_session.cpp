@@ -1,5 +1,7 @@
 #include "terminal_session.hpp"
 
+#include "text_sanitization.hpp"
+
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -137,8 +139,12 @@ class EchoApp final : public termforge::App {
     input_.set_focused(true);
     input_.set_placeholder("Type here");
     input_.on_change([this, input_hook_for_testing](const std::string &text) {
-      if (text.size() <= max_echo_size) {
-        accepted_input_ = text;
+      auto sanitized = sanitize_prose_for_render(text);
+      if (text.size() <= max_echo_size && sanitized.size() <= max_echo_size) {
+        accepted_input_ = std::move(sanitized);
+        if (accepted_input_ != text) {
+          input_.set_text(accepted_input_);
+        }
       } else {
         input_.set_text(accepted_input_);
       }
@@ -243,7 +249,8 @@ class EchoApp final : public termforge::App {
       input_.draw(screen);
     }
     if (!status_.empty() && screen.rows() > 4) {
-      static_cast<void>(screen.write_text(0, screen.rows() - 1, status_, accent, background));
+      const auto status = sanitize_prose_for_render(status_);
+      static_cast<void>(screen.write_text(0, screen.rows() - 1, status, accent, background));
     }
   }
 
