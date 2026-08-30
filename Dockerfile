@@ -36,6 +36,8 @@ FROM production-build AS production-rootfs
 
 RUN set -eux; \
     install -D -m 0755 /build/anvil /runtime/usr/local/bin/anvil; \
+    install -D -m 0644 /src/LICENSE.md /runtime/usr/share/licenses/anvil/LICENSE.md; \
+    install -D -m 0644 /src/THIRD_PARTY_LICENSES.md /runtime/usr/share/licenses/anvil/THIRD_PARTY_LICENSES.md; \
     install -d -m 0755 /runtime/etc /runtime/etc/ssl /runtime/var/lib/anvil /runtime/tmp; \
     ldd /build/anvil \
       | awk '/=> \// { print $3 } $1 ~ /^\// { print $1 }' \
@@ -68,6 +70,8 @@ FROM staging-build AS staging-rootfs
 
 RUN set -eux; \
     install -D -m 0755 /build/anvil /runtime/usr/local/bin/anvil; \
+    install -D -m 0644 /src/LICENSE.md /runtime/usr/share/licenses/anvil/LICENSE.md; \
+    install -D -m 0644 /src/THIRD_PARTY_LICENSES.md /runtime/usr/share/licenses/anvil/THIRD_PARTY_LICENSES.md; \
     install -D -m 0755 /usr/bin/addr2line /runtime/usr/bin/addr2line; \
     install -d -m 0755 /runtime/etc /runtime/etc/ssl /runtime/var/lib/anvil /runtime/tmp; \
     ldd /build/anvil /usr/bin/addr2line \

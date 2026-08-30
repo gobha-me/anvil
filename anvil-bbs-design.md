@@ -152,6 +152,16 @@ are controls too; later structured formatting owns semantic line breaks.
 Identifiers are never silently rewritten — their strict rejection rules and
 grapheme limits belong to #27.
 
+Ingest validates before the storage sanitizer runs. The seven field classes
+are bounded in extended grapheme clusters: handles 32, subjects 120, post
+bodies 16,384, profile text and file descriptions 1,024, one-liners 280, and
+chat messages 2,048. Every raw logical line (CR, LF, or CRLF separated) is
+limited to 240 graphemes. A separate raw-byte ceiling of 32 bytes per allowed
+grapheme bounds adversarial combining sequences before decoding. Handles are
+the exception to free-form Unicode: M1 accepts only ASCII letters, digits,
+underscore, and hyphen. Matching remains exact and no accepted field is
+normalized, replaced, or truncated.
+
 This is a classic BBS-era attack and it is fully applicable today.
 
 **Sanitization helpers ship in the plugin SDK.** A door rendering user-supplied text — a high score name, a chat line, anything — faces exactly this attack and must not be expected to reimplement the defence. Making the safe path the easy path is the only version of this that survives contact with a mod ecosystem.

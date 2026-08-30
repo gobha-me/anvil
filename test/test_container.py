@@ -107,6 +107,15 @@ def assert_runtime_filesystem() -> None:
         present = forbidden & names
         if present:
             raise AssertionError(f"runtime image contains forbidden tools: {sorted(present)}")
+        required_notices = {
+            "usr/share/licenses/anvil/LICENSE.md",
+            "usr/share/licenses/anvil/THIRD_PARTY_LICENSES.md",
+        }
+        missing_notices = required_notices - names
+        if missing_notices:
+            raise AssertionError(
+                f"runtime image omits license notices: {sorted(missing_notices)}"
+            )
         if executable is None or executable.uid != 0 or executable.gid != 0:
             raise AssertionError("runtime executable is not owned by root")
         if executable.mode & 0o022:

@@ -23,6 +23,10 @@ The first M1 security boundary is also in place: user-authored prose is made
 visibly inert before storage and sanitized again before rendering. Anvil uses
 TermForge's single control-sequence parser for both policies, so OSC, CSI,
 C0/C1 controls, and malformed UTF-8 cannot drift between two implementations.
+Ingest rejects malformed UTF-8 before sanitization and applies explicit
+Unicode grapheme, raw-byte, and logical-line limits for every planned user text
+field. M1 handles are intentionally limited to ASCII letters, digits, `_`, and
+`-`; accepted text is never normalized or silently truncated.
 
 ---
 
@@ -686,4 +690,5 @@ you need.
 
 ## License
 
-BSD 3-Clause. See [LICENSE.md](LICENSE.md).
+BSD 3-Clause. See [LICENSE.md](LICENSE.md). Bundled dependency notices are in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
