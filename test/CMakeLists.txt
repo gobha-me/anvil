@@ -241,6 +241,7 @@ if(ANVIL_SERVER)
     test_backup.cpp
     test_canonical_message.cpp
     test_health.cpp
+    test_remote_bytes.cpp
     test_server.cpp
     test_sqlite_store.cpp
     test_text_sanitization.cpp

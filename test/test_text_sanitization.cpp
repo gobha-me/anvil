@@ -14,6 +14,11 @@ namespace {
 using anvil::server::UserTextError;
 using anvil::server::UserTextField;
 
+[[nodiscard]] auto prepare(UserTextField field, std::string_view input) {
+  return anvil::server::prepare_user_text_for_ingest(
+      field, anvil::server::RemoteBytes::from_text(input));
+}
+
 struct FieldLimitCase {
   UserTextField field;
   std::size_t graphemes;
@@ -212,34 +217,28 @@ TEST_CASE("every user text field has an enforced grapheme and byte cap") {
     auto exact = limit.field == UserTextField::handle
                      ? std::string(limit.graphemes, 'a')
                      : bounded_ascii(limit.graphemes);
-    const auto accepted =
-        anvil::server::prepare_user_text_for_ingest(limit.field, exact);
+    const auto accepted = prepare(limit.field, exact);
     REQUIRE(accepted.has_value());
 
     exact.push_back('a');
-    const auto over_grapheme =
-        anvil::server::prepare_user_text_for_ingest(limit.field, exact);
+    const auto over_grapheme = prepare(limit.field, exact);
     REQUIRE_FALSE(over_grapheme.has_value());
     CHECK(over_grapheme.error() == UserTextError::too_many_graphemes);
 
     const std::string over_bytes(limit.bytes + 1, 'a');
-    const auto rejected_bytes =
-        anvil::server::prepare_user_text_for_ingest(limit.field, over_bytes);
+    const auto rejected_bytes = prepare(limit.field, over_bytes);
     REQUIRE_FALSE(rejected_bytes.has_value());
     CHECK(rejected_bytes.error() == UserTextError::too_many_bytes);
 
     if (limit.field != UserTextField::handle) {
       const auto exact_bytes = one_extended_grapheme(limit.bytes);
-      const auto accepted_bytes = anvil::server::prepare_user_text_for_ingest(
-          limit.field, exact_bytes);
+      const auto accepted_bytes = prepare(limit.field, exact_bytes);
       REQUIRE(accepted_bytes.has_value());
       CHECK(accepted_bytes->size() == limit.bytes);
 
       auto one_byte_over = exact_bytes;
       one_byte_over.push_back('a');
-      const auto rejected_one_byte =
-          anvil::server::prepare_user_text_for_ingest(limit.field,
-                                                      one_byte_over);
+      const auto rejected_one_byte = prepare(limit.field, one_byte_over);
       REQUIRE_FALSE(rejected_one_byte.has_value());
       CHECK(rejected_one_byte.error() == UserTextError::too_many_bytes);
     }
@@ -257,8 +256,7 @@ TEST_CASE("ingest rejects every malformed UTF-8 class before sanitizing") {
   };
 
   for (const auto &input : malformed) {
-    const auto result = anvil::server::prepare_user_text_for_ingest(
-        UserTextField::post_body, input);
+    const auto result = prepare(UserTextField::post_body, input);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == UserTextError::invalid_utf8);
   }
@@ -276,13 +274,10 @@ TEST_CASE("extended grapheme clusters, not scalars or bytes, own the cap") {
   for (const auto cluster : clusters) {
     INFO("cluster bytes: " << cluster.size());
     const auto exact = repeated(cluster, 120);
-    REQUIRE(anvil::server::prepare_user_text_for_ingest(UserTextField::subject,
-                                                        exact)
-                .has_value());
+    REQUIRE(prepare(UserTextField::subject, exact).has_value());
 
     const auto over = repeated(cluster, 121);
-    const auto result = anvil::server::prepare_user_text_for_ingest(
-        UserTextField::subject, over);
+    const auto result = prepare(UserTextField::subject, over);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == UserTextError::too_many_graphemes);
   }
@@ -296,13 +291,10 @@ TEST_CASE("raw CR LF and CRLF delimit lines capped at 240 graphemes") {
     INFO("separator bytes: " << separator.size());
     const auto accepted = std::string(240, 'a') + std::string(separator) +
                           std::string(240, 'b');
-    REQUIRE(anvil::server::prepare_user_text_for_ingest(
-                UserTextField::post_body, accepted)
-                .has_value());
+    REQUIRE(prepare(UserTextField::post_body, accepted).has_value());
 
     const auto over = std::string(241, 'a') + std::string(separator) + "b";
-    const auto result = anvil::server::prepare_user_text_for_ingest(
-        UserTextField::post_body, over);
+    const auto result = prepare(UserTextField::post_body, over);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == UserTextError::line_too_long);
   }
@@ -312,8 +304,7 @@ TEST_CASE("M1 handles use the exact ASCII grammar") {
   const std::array valid{std::string_view{"a"}, std::string_view{"Alice-_09"},
                          std::string_view{"--------------------------------"}};
   for (const auto handle : valid) {
-    const auto result = anvil::server::prepare_user_text_for_ingest(
-        UserTextField::handle, handle);
+    const auto result = prepare(UserTextField::handle, handle);
     REQUIRE(result.has_value());
     CHECK(*result == handle);
   }
@@ -326,24 +317,22 @@ TEST_CASE("M1 handles use the exact ASCII grammar") {
       std::string_view{"line\nbreak"},
   };
   for (const auto handle : invalid) {
-    const auto result = anvil::server::prepare_user_text_for_ingest(
-        UserTextField::handle, handle);
+    const auto result = prepare(UserTextField::handle, handle);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == UserTextError::invalid_handle);
   }
 }
 
 TEST_CASE("validated prose enters the existing visible storage boundary") {
-  const auto result = anvil::server::prepare_user_text_for_ingest(
-      UserTextField::post_body, "first\nsecond\t\x1b[31mred");
+  const auto result =
+      prepare(UserTextField::post_body, "first\nsecond\t\x1b[31mred");
   REQUIRE(result.has_value());
   CHECK(*result == "first^Jsecond^I^[[31mred");
   CHECK(anvil::server::sanitize_prose_for_render(*result) == *result);
 }
 
 TEST_CASE("unknown user text fields fail closed") {
-  const auto result = anvil::server::prepare_user_text_for_ingest(
-      static_cast<UserTextField>(0xff), "text");
+  const auto result = prepare(static_cast<UserTextField>(0xff), "text");
   REQUIRE_FALSE(result.has_value());
   CHECK(result.error() == UserTextError::unknown_field);
 }

@@ -541,7 +541,11 @@ int request_pty(ssh_session, ssh_channel, const char *terminal_type, int columns
   state.rows = dimensions.rows;
   state.pixel_width = dimensions.pixel_width;
   state.pixel_height = dimensions.pixel_height;
-  state.terminal_type = normalize_terminal_type(terminal_type);
+  const auto remote_terminal_type = RemoteBytes::from_bounded_c_string(
+      terminal_type, max_remote_terminal_type_size);
+  state.terminal_type = remote_terminal_type
+                            ? normalize_terminal_type(*remote_terminal_type)
+                            : std::string{};
   if (state.terminal_session != nullptr) {
     state.terminal_session->post_resize(dimensions);
   }
@@ -606,12 +610,13 @@ int receive_data(ssh_session, ssh_channel, void *data, std::uint32_t length, int
   if (is_stderr != 0 || state.operation != RequestedOperation::shell || length == 0U) {
     return static_cast<int>(length);
   }
-  if (length > max_pending_input - state.pending_input.size()) {
+  const auto remote_input = RemoteBytes::from_raw(data, length);
+  if (!remote_input ||
+      !append_remote_bytes(state.pending_input, *remote_input,
+                           max_pending_input)) {
     state.close_requested = true;
-    return static_cast<int>(length);
+    return remote_input ? static_cast<int>(length) : SSH_ERROR;
   }
-  const auto *first = static_cast<const std::byte *>(data);
-  state.pending_input.insert(state.pending_input.end(), first, first + length);
   state.last_activity = Clock::now();
   state.idle_warning_sent = false;
   if (state.terminal_session != nullptr) {
@@ -682,8 +687,8 @@ void await_peer_channel_close(ssh_event event, ssh_session session, SessionState
 }
 
 [[nodiscard]] bool forward_session_output(int descriptor, ssh_channel channel,
+                                          std::span<std::byte> buffer,
                                           bool discard = false) {
-  std::array<std::byte, 16U * 1024U> buffer{};
   for (;;) {
     const auto count = ::recv(descriptor, buffer.data(), buffer.size(), 0);
     if (count > 0) {
@@ -797,6 +802,7 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
   FileDescriptor application_descriptor;
   FileDescriptor server_descriptor;
   std::unique_ptr<TerminalSession> terminal_session;
+  std::vector<std::byte> session_output_buffer(16U * 1024U);
   SessionTelemetry reported_telemetry;
   auto session_end = SessionEnd::normal;
 
@@ -892,7 +898,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
         application_failed = true;
         break;
       }
-      if (!forward_session_output(server_descriptor.get(), state.channel)) {
+      if (!forward_session_output(server_descriptor.get(), state.channel,
+                                  session_output_buffer)) {
         break;
       }
       if (terminal_session->finished()) {
@@ -938,16 +945,18 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     const auto drain_deadline = Clock::now() + 2s;
     while (!terminal_session->finished() && Clock::now() < drain_deadline) {
       static_cast<void>(ssh_event_dopoll(event.get(), 10));
-      static_cast<void>(forward_session_output(server_descriptor.get(), state.channel,
-                                               ssh_channel_is_open(state.channel) == 0));
+      static_cast<void>(forward_session_output(
+          server_descriptor.get(), state.channel, session_output_buffer,
+          ssh_channel_is_open(state.channel) == 0));
     }
     if (!terminal_session->finished()) {
       server_descriptor = FileDescriptor();
     }
     terminal_session->join();
     if (server_descriptor.get() >= 0) {
-      static_cast<void>(forward_session_output(server_descriptor.get(), state.channel,
-                                               ssh_channel_is_open(state.channel) == 0));
+      static_cast<void>(forward_session_output(
+          server_descriptor.get(), state.channel, session_output_buffer,
+          ssh_channel_is_open(state.channel) == 0));
     }
     application_failed = application_failed || terminal_session->failed();
     const auto failure_reason = terminal_session->failure_reason();
@@ -1670,8 +1679,11 @@ int run(const Config &config) {
       std::cerr << "anvil: accept failed: " << std::strerror(errno) << '\n';
       continue;
     }
-    const auto peer =
-        PeerAddress::from_sockaddr(reinterpret_cast<const sockaddr *>(&raw_peer), raw_peer_size);
+    const auto raw_peer_bytes = std::as_bytes(std::span{&raw_peer, 1U});
+    const auto peer = raw_peer_size <= raw_peer_bytes.size()
+                          ? PeerAddress::from_remote_bytes(RemoteBytes::from_span(
+                                raw_peer_bytes.first(raw_peer_size)))
+                          : std::nullopt;
     if (!peer || admission.admit(*peer, Clock::now()) != AdmissionDecision::allowed) {
       continue;
     }

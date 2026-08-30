@@ -28,6 +28,11 @@ Unicode grapheme, raw-byte, and logical-line limits for every planned user text
 field. M1 handles are intentionally limited to ASCII letters, digits, `_`, and
 `-`; accepted text is never normalized or silently truncated.
 
+Network callback adapters mark peer-controlled payloads with a server-private
+`RemoteBytes` span before project-owned parsing. This keeps hostile provenance
+visible in function signatures, rejects invalid pointer/length pairs at the
+adapter, and makes bounded span operations the only path into parsers.
+
 ---
 
 ## What it is
@@ -235,6 +240,18 @@ automatic variables, PIE, full RELRO, immediate binding, and a non-executable
 stack. On x86 it also enables CET indirect-branch and shadow-stack metadata.
 CI inspects the final ELF for those properties instead of trusting the command
 line used to build it.
+
+### Parse-path review checklist
+
+Changes that touch remote input must satisfy all of the following before
+review:
+
+- mark hostile bytes at the external callback or descriptor adapter;
+- cap lengths before allocating, copying, or advancing a view;
+- pass `RemoteBytes` or `std::span`, never a pointer-and-length pair;
+- keep remote-sized data off the stack and avoid raw pointer arithmetic; and
+- test every parser with truncated input under ASan and require a clean error
+  with no partial state change.
 
 For continuous staging, use the dedicated ASan+UBSan image. It keeps debug
 symbols, stops on the first sanitizer finding, and otherwise runs with the same

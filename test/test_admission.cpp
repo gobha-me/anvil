@@ -3,7 +3,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
+#include <cstddef>
+#include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,13 +22,19 @@ using anvil::server::PeerAddress;
 using anvil::server::RateLimit;
 using namespace std::chrono_literals;
 
+template <typename Address>
+[[nodiscard]] anvil::server::RemoteBytes remote_address(
+    const Address &address) {
+  return anvil::server::RemoteBytes::from_span(
+      std::as_bytes(std::span{&address, 1U}));
+}
+
 [[nodiscard]] PeerAddress ipv4(std::string_view text) {
   sockaddr_in address{};
   address.sin_family = AF_INET;
   const std::string value(text);
   REQUIRE(::inet_pton(AF_INET, value.c_str(), &address.sin_addr) == 1);
-  const auto peer = PeerAddress::from_sockaddr(reinterpret_cast<const sockaddr *>(&address),
-                                                sizeof(address));
+  const auto peer = PeerAddress::from_remote_bytes(remote_address(address));
   REQUIRE(peer.has_value());
   return *peer;
 }
@@ -35,15 +45,59 @@ TEST_CASE("peer addresses normalize IPv4-mapped IPv6") {
   sockaddr_in6 mapped{};
   mapped.sin6_family = AF_INET6;
   REQUIRE(::inet_pton(AF_INET6, "::ffff:192.0.2.42", &mapped.sin6_addr) == 1);
-  const auto normalized = PeerAddress::from_sockaddr(
-      reinterpret_cast<const sockaddr *>(&mapped), sizeof(mapped));
+  const auto normalized =
+      PeerAddress::from_remote_bytes(remote_address(mapped));
   REQUIRE(normalized.has_value());
   CHECK(*normalized == ipv4("192.0.2.42"));
 
   sockaddr unsupported{};
   unsupported.sa_family = AF_UNIX;
-  CHECK_FALSE(PeerAddress::from_sockaddr(&unsupported, sizeof(unsupported)));
-  CHECK_FALSE(PeerAddress::from_sockaddr(nullptr, 0));
+  CHECK_FALSE(PeerAddress::from_remote_bytes(remote_address(unsupported)));
+  CHECK_FALSE(PeerAddress::from_remote_bytes(
+      anvil::server::RemoteBytes::from_span({})));
+}
+
+TEST_CASE("peer address parsing rejects every truncated structure") {
+  sockaddr_in ipv4_address{};
+  ipv4_address.sin_family = AF_INET;
+  REQUIRE(::inet_pton(AF_INET, "192.0.2.1", &ipv4_address.sin_addr) == 1);
+  const auto ipv4_bytes = std::as_bytes(std::span{&ipv4_address, 1U});
+
+  for (std::size_t size = 0; size < ipv4_bytes.size(); ++size) {
+    INFO("truncated IPv4 size: " << size);
+    CHECK_FALSE(PeerAddress::from_remote_bytes(
+        anvil::server::RemoteBytes::from_span(ipv4_bytes.first(size))));
+  }
+  REQUIRE(
+      PeerAddress::from_remote_bytes(remote_address(ipv4_address)).has_value());
+
+  sockaddr_in6 ipv6_address{};
+  ipv6_address.sin6_family = AF_INET6;
+  REQUIRE(::inet_pton(AF_INET6, "2001:db8::1", &ipv6_address.sin6_addr) == 1);
+  const auto ipv6_bytes = std::as_bytes(std::span{&ipv6_address, 1U});
+
+  for (std::size_t size = 0; size < ipv6_bytes.size(); ++size) {
+    INFO("truncated IPv6 size: " << size);
+    CHECK_FALSE(PeerAddress::from_remote_bytes(
+        anvil::server::RemoteBytes::from_span(ipv6_bytes.first(size))));
+  }
+  REQUIRE(
+      PeerAddress::from_remote_bytes(remote_address(ipv6_address)).has_value());
+}
+
+TEST_CASE("peer address parsing does not require aligned remote storage") {
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  REQUIRE(::inet_pton(AF_INET, "192.0.2.99", &address.sin_addr) == 1);
+
+  std::array<std::byte, sizeof(address) + 1U> storage{};
+  std::memcpy(storage.data() + 1U, &address, sizeof(address));
+  const auto unaligned = std::span<const std::byte>{storage}.subspan(1U);
+  const auto parsed = PeerAddress::from_remote_bytes(
+      anvil::server::RemoteBytes::from_span(unaligned));
+
+  REQUIRE(parsed.has_value());
+  CHECK(*parsed == ipv4("192.0.2.99"));
 }
 
 TEST_CASE("admission enforces connection and concurrency limits before allocation") {

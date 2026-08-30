@@ -256,9 +256,16 @@ TEST_CASE("SSH terminal dimensions bound hostile peer claims") {
 }
 
 TEST_CASE("SSH terminal type is a bounded printable hint") {
-  CHECK(anvil::server::normalize_terminal_type(nullptr).empty());
-  CHECK(anvil::server::normalize_terminal_type("xterm-256color") == "xterm-256color");
-  CHECK(anvil::server::normalize_terminal_type("xterm\x1b[31m").empty());
+  using anvil::server::RemoteBytes;
+
+  CHECK(anvil::server::normalize_terminal_type(RemoteBytes::from_text({})).empty());
+  CHECK(anvil::server::normalize_terminal_type(
+            RemoteBytes::from_text("xterm-256color")) == "xterm-256color");
+  CHECK(anvil::server::normalize_terminal_type(
+            RemoteBytes::from_text("xterm\x1b[31m"))
+            .empty());
   const std::string oversized(257, 'x');
-  CHECK(anvil::server::normalize_terminal_type(oversized.c_str()).empty());
+  CHECK(anvil::server::normalize_terminal_type(
+            RemoteBytes::from_text(oversized))
+            .empty());
 }

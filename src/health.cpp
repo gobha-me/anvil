@@ -1,6 +1,16 @@
 #include "health.hpp"
 
+#if defined(__clang__)
+// cpp-httplib owns inline parser functions with 16 KiB internal buffers.
+// Anvil's 8 KiB frame policy applies again immediately after the adapter
+// header; it is intentionally not imposed on this upstream implementation.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wframe-larger-than"
+#endif
 #include <httplib.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #include <poll.h>
 #include <pthread.h>

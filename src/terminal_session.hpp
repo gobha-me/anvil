@@ -7,6 +7,8 @@
 #include <string>
 #include <string_view>
 
+#include "remote_bytes.hpp"
+
 namespace anvil::server {
 
 struct TerminalDimensions {
@@ -17,6 +19,8 @@ struct TerminalDimensions {
 
   [[nodiscard]] auto operator==(const TerminalDimensions &) const noexcept -> bool = default;
 };
+
+inline constexpr std::size_t max_remote_terminal_type_size = 256U;
 
 struct SessionTelemetry {
   std::uint64_t frames{};
@@ -46,7 +50,7 @@ using SessionInputHook = void (*)(std::string_view);
                                                               int pixel_height) noexcept;
 [[nodiscard]] std::optional<TerminalDimensions> normalize_resize_dimensions(
     int columns, int rows, int pixel_width, int pixel_height) noexcept;
-[[nodiscard]] std::string normalize_terminal_type(const char *terminal_type);
+[[nodiscard]] std::string normalize_terminal_type(RemoteBytes terminal_type);
 
 class TerminalSession {
  public:

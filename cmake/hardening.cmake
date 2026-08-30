@@ -68,7 +68,6 @@ endif()
 
 add_compile_definitions(
   _FORTIFY_SOURCE=3
-  "$<$<COMPILE_LANGUAGE:CXX>:_GLIBCXX_ASSERTIONS>"
 )
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
