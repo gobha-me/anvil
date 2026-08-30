@@ -1,7 +1,5 @@
 #pragma once
 
-#include <sys/socket.h>
-
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -10,6 +8,7 @@
 #include <unordered_map>
 
 #include "server.hpp"
+#include "remote_bytes.hpp"
 
 namespace anvil::server {
 
@@ -18,8 +17,8 @@ struct PeerAddress {
   std::uint32_t scope_id{};
   std::uint8_t size{};
 
-  [[nodiscard]] static std::optional<PeerAddress> from_sockaddr(const sockaddr *address,
-                                                                socklen_t length) noexcept;
+  [[nodiscard]] static std::optional<PeerAddress> from_remote_bytes(
+      RemoteBytes address) noexcept;
 
   friend bool operator==(const PeerAddress &, const PeerAddress &) = default;
 };

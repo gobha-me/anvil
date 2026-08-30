@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.23.0 LANGUAGES CXX)
+project(anvil VERSION 0.24.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -26,6 +26,20 @@ set(ANVIL_WARNING_FLAGS
   -Wconversion
   -Wsign-conversion
 )
+
+function(anvil_apply_input_safety target)
+  target_compile_definitions(${target} PRIVATE
+    "$<$<COMPILE_LANGUAGE:CXX>:_GLIBCXX_ASSERTIONS>"
+  )
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(${target} PRIVATE -Werror=stack-usage=8192)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(${target} PRIVATE
+      -Wframe-larger-than=8192
+      "-Werror=frame-larger-than="
+    )
+  endif()
+endfunction()
 
 add_library(anvil_sdk INTERFACE)
 add_library(anvil::sdk ALIAS anvil_sdk)
@@ -60,6 +74,7 @@ target_include_directories(anvil_loader
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(anvil_loader PRIVATE ${CMAKE_DL_LIBS})
+anvil_apply_input_safety(anvil_loader)
 
 add_library(anvil_store STATIC
   src/store.cpp
@@ -78,6 +93,7 @@ target_include_directories(anvil_store
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+anvil_apply_input_safety(anvil_store)
 
 if(ANVIL_SERVER)
   include(cmake/deps/libssh.cmake)
@@ -101,16 +117,23 @@ if(ANVIL_SERVER)
   target_compile_options(anvil_server PRIVATE ${ANVIL_WARNING_FLAGS})
   target_compile_definitions(anvil_server PRIVATE _GNU_SOURCE=1)
   target_include_directories(anvil_server PUBLIC ${PROJECT_SOURCE_DIR}/src)
+  # cpp-httplib is header-only. Keep Anvil's stack-frame gate from becoming a
+  # policy for upstream inline parser functions compiled through health.cpp.
+  target_include_directories(anvil_server SYSTEM PRIVATE
+    $<TARGET_PROPERTY:httplib::httplib,INTERFACE_INCLUDE_DIRECTORIES>
+  )
   target_link_libraries(anvil_server
     PUBLIC ${ANVIL_LIBSSH_TARGET}
     PRIVATE anvil::store termforge::lib httplib::httplib SQLite::SQLite3
             Threads::Threads utf8proc::utf8proc
   )
+  anvil_apply_input_safety(anvil_server)
 
   add_executable(anvil src/main.cpp)
   target_compile_features(anvil PRIVATE cxx_std_23)
   target_compile_options(anvil PRIVATE ${ANVIL_WARNING_FLAGS})
   target_link_libraries(anvil PRIVATE anvil_server)
+  anvil_apply_input_safety(anvil)
 endif()
 
 if(ANVIL_TESTS)

@@ -172,6 +172,21 @@ This is a classic BBS-era attack and it is fully applicable today.
 - No fixed-size stack buffers for network-derived data. `std::span`, bounds-checked ranges, no raw pointer arithmetic on remote input.
 - Staging builds run ASan and UBSan continuously. Production builds enable `_FORTIFY_SOURCE`, stack protector, full RELRO, PIE.
 
+Anvil marks bytes from external network adapters with the server-private
+`RemoteBytes` strong type before any project-owned parser sees them. The type
+is a non-owning span: it carries hostile provenance without copying, rejects a
+non-zero length paired with a null pointer, and keeps bounds available to every
+consumer. Libssh and TermForge retain ownership of their protocol parsers;
+their C callbacks and descriptors are adapter seams, not permission for raw
+pointers to propagate into Anvil.
+
+All Anvil production C++ targets use libstdc++ bounds assertions in every
+configuration. An 8 KiB warning-as-error stack-frame ceiling is enforced on
+Anvil-owned code with the native GCC and Clang diagnostics; header-only
+dependencies retain their upstream policy. Network buffers that exceed that
+ceiling are bounded heap allocations owned by the session, never remote-sized
+automatic arrays.
+
 ### 5.4 Authentication and registration
 
 - **Public keys only. Never implement password authentication.**

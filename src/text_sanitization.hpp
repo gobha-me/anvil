@@ -5,6 +5,8 @@
 #include <string>
 #include <string_view>
 
+#include "remote_bytes.hpp"
+
 namespace anvil::server {
 
 enum class UserTextField : std::uint8_t {
@@ -30,7 +32,7 @@ enum class UserTextError : std::uint8_t {
 // escape malformed bytes. Prose is returned in the visible, inert storage
 // form; handles use a strict ASCII grammar and are returned byte-for-byte.
 [[nodiscard]] auto prepare_user_text_for_ingest(UserTextField field,
-                                                std::string_view input)
+                                                RemoteBytes input)
     -> std::expected<std::string, UserTextError>;
 
 // User-authored prose is made visibly inert before persistence. The result is

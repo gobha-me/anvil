@@ -32,7 +32,6 @@ using namespace std::chrono_literals;
 
 constexpr int max_cell_dimension = 1000;
 constexpr int max_pixel_dimension = 65'535;
-constexpr std::size_t max_terminal_type_size = 256;
 constexpr std::size_t max_echo_size = 4096;
 constexpr auto sink_stall_timeout = 5s;
 
@@ -284,25 +283,20 @@ std::optional<TerminalDimensions> normalize_resize_dimensions(int columns, int r
   return TerminalDimensions{columns, rows, width, height};
 }
 
-std::string normalize_terminal_type(const char *terminal_type) {
-  if (terminal_type == nullptr) {
-    return {};
-  }
-  std::size_t length = 0;
-  while (length <= max_terminal_type_size && terminal_type[length] != '\0') {
-    ++length;
-  }
-  if (length == 0U || length > max_terminal_type_size) {
+std::string normalize_terminal_type(RemoteBytes remote_terminal_type) {
+  const auto terminal_type = remote_terminal_type.text();
+  if (terminal_type.empty() ||
+      terminal_type.size() > max_remote_terminal_type_size) {
     return {};
   }
   std::string result;
-  result.reserve(length);
-  for (std::size_t index = 0; index < length; ++index) {
-    const auto byte = static_cast<unsigned char>(terminal_type[index]);
+  result.reserve(terminal_type.size());
+  for (const auto character : terminal_type) {
+    const auto byte = static_cast<unsigned char>(character);
     if (byte < 0x20U || byte > 0x7EU) {
       return {};
     }
-    result.push_back(static_cast<char>(byte));
+    result.push_back(character);
   }
   return result;
 }

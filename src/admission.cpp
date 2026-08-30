@@ -20,27 +20,34 @@ void hash_byte(std::uint64_t &hash, std::uint8_t byte) noexcept {
 
 }  // namespace
 
-std::optional<PeerAddress> PeerAddress::from_sockaddr(const sockaddr *address,
-                                                      socklen_t length) noexcept {
-  if (address == nullptr) {
+std::optional<PeerAddress> PeerAddress::from_remote_bytes(
+    RemoteBytes remote_address) noexcept {
+  const auto bytes = remote_address.bytes();
+  if (bytes.size() < sizeof(sockaddr)) {
     return std::nullopt;
   }
+  sockaddr address{};
+  std::memcpy(&address, bytes.first(sizeof(address)).data(), sizeof(address));
+
   PeerAddress result;
-  if (address->sa_family == AF_INET && length >= sizeof(sockaddr_in)) {
-    const auto *ipv4 = reinterpret_cast<const sockaddr_in *>(address);
-    std::memcpy(result.bytes.data(), &ipv4->sin_addr, sizeof(ipv4->sin_addr));
+  if (address.sa_family == AF_INET && bytes.size() >= sizeof(sockaddr_in)) {
+    sockaddr_in ipv4{};
+    std::memcpy(&ipv4, bytes.first(sizeof(ipv4)).data(), sizeof(ipv4));
+    std::memcpy(result.bytes.data(), &ipv4.sin_addr, sizeof(ipv4.sin_addr));
     result.size = 4;
     return result;
   }
-  if (address->sa_family == AF_INET6 && length >= sizeof(sockaddr_in6)) {
-    const auto *ipv6 = reinterpret_cast<const sockaddr_in6 *>(address);
-    if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr)) {
-      std::memcpy(result.bytes.data(), ipv6->sin6_addr.s6_addr + 12, 4);
+  if (address.sa_family == AF_INET6 && bytes.size() >= sizeof(sockaddr_in6)) {
+    sockaddr_in6 ipv6{};
+    std::memcpy(&ipv6, bytes.first(sizeof(ipv6)).data(), sizeof(ipv6));
+    if (IN6_IS_ADDR_V4MAPPED(&ipv6.sin6_addr)) {
+      const auto address_bytes = std::span{ipv6.sin6_addr.s6_addr};
+      std::memcpy(result.bytes.data(), address_bytes.last(4).data(), 4);
       result.size = 4;
       return result;
     }
-    std::memcpy(result.bytes.data(), &ipv6->sin6_addr, sizeof(ipv6->sin6_addr));
-    result.scope_id = ipv6->sin6_scope_id;
+    std::memcpy(result.bytes.data(), &ipv6.sin6_addr, sizeof(ipv6.sin6_addr));
+    result.scope_id = ipv6.sin6_scope_id;
     result.size = 16;
     return result;
   }

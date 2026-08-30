@@ -52,8 +52,9 @@ constexpr std::array kUserTextPolicies{
 
 } // namespace
 
-auto prepare_user_text_for_ingest(UserTextField field, std::string_view input)
+auto prepare_user_text_for_ingest(UserTextField field, RemoteBytes remote_input)
     -> std::expected<std::string, UserTextError> {
+  const auto input = remote_input.text();
   const auto *policy = policy_for(field);
   if (policy == nullptr) return std::unexpected(UserTextError::unknown_field);
   if (input.size() > policy->max_bytes)
