@@ -208,13 +208,21 @@ automatic arrays.
 
 ### 5.5 Per-session limits
 
-| Resource | Reason |
-|---|---|
-| Memory cap | One session cannot exhaust the box |
-| CPU time slice | Doors are arbitrary compute |
-| Output byte rate | A runaway render loop must not saturate the link |
-| Image quota | Client-side kitty image memory is finite; a door must not exhaust the *user's* terminal |
-| Session duration | Reclaim abandoned connections |
+| Resource | Default | Enforcement |
+|---|---:|---|
+| Memory cap | 64 MiB | Worker address-space headroom plus explicit allocation reservations |
+| CPU time slice | 50 ms | Maximum application-thread CPU between progress points |
+| Output byte rate | 1,000,000 B/s | Per-session token bucket with a one-second burst |
+| Image quota | 32 MiB | Resident kitty source payload, reserved before an Anvil-mediated upload |
+| Session duration | 24 hours | Absolute wall-clock lifetime |
+
+All five defaults are operator-configurable. Output is delayed to its rate and
+a frame larger than the burst is rejected. Image accounting is reconciled
+against the terminal driver's per-session residency counter, without scanning
+shared state. Every breach closes the offending connection with a specific
+message and records the resource class; other workers continue normally. The
+worker process supplies the hard termination boundary when a runaway
+application cannot unwind cooperatively.
 
 These bound *accidents*, not *malice*. A plugin runs in-process and can bypass every one of them by not going through the interface (§7.9). They exist so that a buggy door degrades one session instead of the board — which is the failure that will actually happen.
 

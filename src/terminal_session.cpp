@@ -3,7 +3,9 @@
 #include "text_sanitization.hpp"
 
 #include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -13,7 +15,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -51,10 +55,31 @@ constexpr auto sink_stall_timeout = 5s;
 
 class SocketSink final : public termforge::ByteSink {
  public:
-  explicit SocketSink(int descriptor) noexcept : descriptor_(descriptor) {}
+  SocketSink(int descriptor, SessionResources &resources,
+             const std::atomic<bool> &stop_requested) noexcept
+      : descriptor_(descriptor), resources_(resources), stop_requested_(stop_requested) {}
 
   [[nodiscard]] auto write(std::span<const char> bytes)
       -> std::expected<void, termforge::ErrorEvent> override {
+    for (;;) {
+      const auto delay = resources_.output_delay(bytes.size(), std::chrono::steady_clock::now());
+      if (!delay) {
+        return std::unexpected(termforge::ErrorEvent{
+            termforge::Severity::Error, "resource.output",
+            "session output frame exceeds the configured one-second burst"});
+      }
+      if (*delay <= std::chrono::steady_clock::duration::zero()) {
+        resources_.consume_output(bytes.size());
+        break;
+      }
+      if (stop_requested_.load(std::memory_order_acquire)) {
+        return std::unexpected(termforge::ErrorEvent{
+            termforge::Severity::Error, "ssh", "session output stopped"});
+      }
+      std::this_thread::sleep_for(std::min(
+          *delay, std::chrono::duration_cast<std::chrono::steady_clock::duration>(10ms)));
+    }
+
     const auto deadline = std::chrono::steady_clock::now() + sink_stall_timeout;
     std::size_t offset = 0;
     while (offset < bytes.size()) {
@@ -96,15 +121,20 @@ class SocketSink final : public termforge::ByteSink {
 
  private:
   int descriptor_;
+  SessionResources &resources_;
+  const std::atomic<bool> &stop_requested_;
 };
 
 struct SharedState {
-  explicit SharedState(TerminalDimensions initial_dimensions) : dimensions(initial_dimensions) {}
+  SharedState(TerminalDimensions initial_dimensions, SessionResourceLimits resource_limits)
+      : dimensions(initial_dimensions), resources(resource_limits) {}
 
   std::mutex mutex;
   TerminalDimensions dimensions;
   std::string notice;
   SessionTelemetry telemetry;
+  SessionResources resources;
+  std::atomic<std::uint64_t> progress_generation{};
   std::atomic<bool> stop_requested{false};
 };
 
@@ -113,7 +143,8 @@ class EchoApp final : public termforge::App {
   EchoApp(int descriptor, std::string terminal_type, TerminalDimensions dimensions,
           std::chrono::steady_clock::time_point channel_opened, SharedState &shared,
           SessionInputHook input_hook_for_testing)
-      : sink_(descriptor), channel_opened_(channel_opened), shared_(shared) {
+      : sink_(descriptor, shared.resources, shared.stop_requested),
+        channel_opened_(channel_opened), shared_(shared) {
     const auto io = terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
     if (!io) {
       throw std::runtime_error(io.error().message);
@@ -148,7 +179,7 @@ class EchoApp final : public termforge::App {
         input_.set_text(accepted_input_);
       }
       if (input_hook_for_testing != nullptr) {
-        input_hook_for_testing(text);
+        input_hook_for_testing(text, shared_.resources);
       }
     });
     set_render_mode(termforge::RenderMode::Demand);
@@ -169,6 +200,13 @@ class EchoApp final : public termforge::App {
       telemetry.last_frame_cell_bytes = observation.bytes.cells;
       telemetry.last_frame_image_transmit_bytes = observation.bytes.image_transmit;
       telemetry.last_frame_image_edit_bytes = observation.bytes.image_edit;
+      if (observation.output_accepted) {
+        shared_.resources.reconcile_image(driver().residency().source_payload_bytes);
+      }
+      shared_.progress_generation.fetch_add(1U, std::memory_order_release);
+      if (shared_.resources.limit_reason() == ResourceLimitReason::image) {
+        quit();
+      }
     });
   }
 
@@ -305,8 +343,9 @@ class TerminalSession::Impl {
  public:
   Impl(int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
        std::chrono::steady_clock::time_point channel_opened,
+       SessionResourceLimits resource_limits,
        SessionInputHook input_hook_for_testing)
-      : shared_(dimensions),
+      : shared_(dimensions, resource_limits),
         app_(io_descriptor, std::move(terminal_type), dimensions, channel_opened, shared_,
              input_hook_for_testing) {}
 
@@ -320,17 +359,32 @@ class TerminalSession::Impl {
       throw std::logic_error("terminal session already started");
     }
     thread_ = std::thread([this] {
+      clockid_t clock{};
+      if (::pthread_getcpuclockid(::pthread_self(), &clock) == 0) {
+        cpu_clock_ = clock;
+        cpu_clock_ready_.store(true, std::memory_order_release);
+      }
       try {
         if (app_.run() != 0) {
           failure_reason_.store(SessionFailureReason::app_returned_failure,
                                 std::memory_order_release);
         }
+      } catch (const ResourceLimitError &error) {
+        shared_.resources.mark_exceeded(error.reason());
+        failure_reason_.store(failure_reason_for(error.reason()), std::memory_order_release);
+      } catch (const std::bad_alloc &) {
+        shared_.resources.mark_exceeded(ResourceLimitReason::memory);
+        failure_reason_.store(SessionFailureReason::memory_limit, std::memory_order_release);
       } catch (const std::exception &) {
         failure_reason_.store(SessionFailureReason::standard_exception,
                               std::memory_order_release);
       } catch (...) {
         failure_reason_.store(SessionFailureReason::unknown_exception,
                               std::memory_order_release);
+      }
+      if (const auto limit = shared_.resources.limit_reason();
+          limit != ResourceLimitReason::none) {
+        failure_reason_.store(failure_reason_for(limit), std::memory_order_release);
       }
       finished_.store(true, std::memory_order_release);
     });
@@ -377,15 +431,60 @@ class TerminalSession::Impl {
     return failure_reason_.load(std::memory_order_acquire);
   }
 
+  [[nodiscard]] ResourceLimitReason limit_reason() const noexcept {
+    return shared_.resources.limit_reason();
+  }
+
+  [[nodiscard]] SessionCpuProgress cpu_progress() const noexcept {
+    SessionCpuProgress result;
+    result.generation = shared_.progress_generation.load(std::memory_order_acquire);
+    if (!cpu_clock_ready_.load(std::memory_order_acquire)) {
+      return result;
+    }
+    timespec consumed{};
+    if (::clock_gettime(cpu_clock_, &consumed) != 0 || consumed.tv_sec < 0 ||
+        consumed.tv_nsec < 0) {
+      return result;
+    }
+    constexpr auto billion = std::int64_t{1'000'000'000};
+    if (consumed.tv_sec > std::numeric_limits<std::int64_t>::max() / billion) {
+      result.consumed = std::chrono::nanoseconds::max();
+    } else {
+      result.consumed = std::chrono::seconds(consumed.tv_sec) +
+                        std::chrono::nanoseconds(consumed.tv_nsec);
+    }
+    result.ready = true;
+    return result;
+  }
+
   [[nodiscard]] SessionTelemetry telemetry() const noexcept {
     std::lock_guard lock(shared_.mutex);
     return shared_.telemetry;
   }
 
  private:
+  [[nodiscard]] static SessionFailureReason failure_reason_for(
+      ResourceLimitReason reason) noexcept {
+    switch (reason) {
+      case ResourceLimitReason::memory:
+        return SessionFailureReason::memory_limit;
+      case ResourceLimitReason::output:
+        return SessionFailureReason::output_limit;
+      case ResourceLimitReason::image:
+        return SessionFailureReason::image_limit;
+      case ResourceLimitReason::none:
+      case ResourceLimitReason::cpu:
+      case ResourceLimitReason::duration:
+        return SessionFailureReason::unknown_exception;
+    }
+    return SessionFailureReason::unknown_exception;
+  }
+
   mutable SharedState shared_;
   EchoApp app_;
   std::thread thread_;
+  clockid_t cpu_clock_{};
+  std::atomic<bool> cpu_clock_ready_{false};
   std::atomic<bool> finished_{false};
   std::atomic<SessionFailureReason> failure_reason_{SessionFailureReason::none};
 };
@@ -393,9 +492,10 @@ class TerminalSession::Impl {
 TerminalSession::TerminalSession(int io_descriptor, std::string terminal_type,
                                  TerminalDimensions dimensions,
                                  std::chrono::steady_clock::time_point channel_opened,
+                                 SessionResourceLimits resource_limits,
                                  SessionInputHook input_hook_for_testing)
     : impl_(std::make_unique<Impl>(io_descriptor, std::move(terminal_type), dimensions,
-                                   channel_opened, input_hook_for_testing)) {}
+                                   channel_opened, resource_limits, input_hook_for_testing)) {}
 
 TerminalSession::~TerminalSession() = default;
 
@@ -415,6 +515,14 @@ bool TerminalSession::failed() const noexcept { return impl_->failed(); }
 
 SessionFailureReason TerminalSession::failure_reason() const noexcept {
   return impl_->failure_reason();
+}
+
+ResourceLimitReason TerminalSession::limit_reason() const noexcept {
+  return impl_->limit_reason();
+}
+
+SessionCpuProgress TerminalSession::cpu_progress() const noexcept {
+  return impl_->cpu_progress();
 }
 
 SessionTelemetry TerminalSession::telemetry() const noexcept { return impl_->telemetry(); }
