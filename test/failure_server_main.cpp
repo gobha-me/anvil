@@ -1,6 +1,7 @@
 #include "server.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <stdexcept>
@@ -14,6 +15,7 @@ constexpr std::string_view memory_marker{"anvil-test-memory"};
 constexpr std::string_view cpu_marker{"anvil-test-cpu"};
 constexpr std::string_view output_marker{"anvil-test-output"};
 constexpr std::string_view image_marker{"anvil-test-image"};
+std::atomic<std::uint64_t> cpu_spin_counter{};
 
 void inject_failure(std::string_view input, anvil::server::SessionResources &resources) {
   if (input == failure_marker) {
@@ -37,7 +39,7 @@ void inject_failure(std::string_view input, anvil::server::SessionResources &res
   }
   if (input == cpu_marker) {
     for (;;) {
-      std::atomic_signal_fence(std::memory_order_seq_cst);
+      cpu_spin_counter.fetch_add(1U, std::memory_order_relaxed);
     }
   }
 }
