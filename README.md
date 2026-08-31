@@ -11,11 +11,12 @@ games served to anyone with a terminal — built entirely on
 [termforge](https://github.com/gobha-me/termforge), C++23, in a single hardened
 container.
 
-> **Status: M0 transport.** The standalone plugin loader, stable plugin SDK
+> **Status: M1 identity foundation.** The standalone plugin loader, stable plugin SDK
 > boundary types, process-isolated TermForge SSH session, persistent host
 > identity, live remote resize handling, bounded session lifecycles,
 > supervisor-enforced per-IP admission limits, private health/readiness/metrics,
-> and the hardened container are implemented. See
+> database-backed public-key identities, read-only guest access, pending
+> registration, and the hardened container are implemented. See
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
 > tracker for the work breakdown.
 
@@ -74,17 +75,20 @@ boundary.
 
 ## M0 SSH transport
 
-The `anvil` executable listens on one address and port, accepts public-key
-authentication only, and starts one isolated worker process per connection.
-Its temporary M0 shell is a demand-rendered TermForge screen that reports the
-remote dimensions and echoes input. The initial size and every SSH
+The `anvil` executable listens on one address and port and starts one isolated
+worker process per connection. Registered identities use public keys only;
+the exact SSH username is not an authority. The reserved `guest` username may
+authenticate anonymously into a read-only board and door-menu shell. Unknown
+signed keys reach pending registration. The M1 shell is a demand-rendered
+TermForge screen that reports the remote dimensions and retains the M0 echo
+field for bootstrap-active users. The initial size and every SSH
 `window-change` are bounded before reaching the renderer; invalid changes keep
 the last valid size. An interactive PTY is required. SSH sessions started with
 `-T`, `exec`, and subsystem requests are rejected with exit status 126; no
 system shell or subsystem is reachable.
 
-Build and run it with a persistent host-key path and one or more public-key
-mappings:
+Build and run it with a persistent host-key path. Existing deployments may
+bootstrap one or more active identities from public-key files:
 
 ```sh
 cmake -S . -B build \
@@ -126,10 +130,22 @@ and is never silently replaced. The parent directory must already exist and be
 writable on first start. In a deployment, mount that directory from persistent
 storage: losing it gives every returning user a host-key warning.
 
-Each authorized-key file must contain exactly one ordinary OpenSSH public-key
-line; repeat `--authorized-key USER=PATH` to allow additional users or keys.
-The server refuses symlinked key files, oversized or malformed key material,
-and host private keys accessible by group or others. Send `SIGINT` or `SIGTERM`
+Each optional authorized-key file must contain exactly one ordinary OpenSSH
+public-key line. At startup, `--authorized-key USER=PATH` imports the key into
+SQLite as an active identity; exact repeats are idempotent, while conflicting,
+revoked, or non-active mappings stop startup rather than overwriting identity
+state. Repeat the option to bootstrap additional users or keys. The server
+refuses symlinked key files, oversized or malformed key material, and host
+private keys accessible by group or others.
+
+Connect anonymously with `ssh guest@HOST`. Guest sessions can see the board
+and door-menu shell but have no writable controls. Any signed key not yet in
+the database reaches handle selection under the temporary open-registration
+behavior; the key and chosen handle are stored as pending. Pending identities
+remain gated until versioned TOS acceptance lands in issue #40. There is no
+email or recovery address: losing every registered key loses the account.
+
+Send `SIGINT` or `SIGTERM`
 to stop accepting connections. Active shells receive a shutdown message and
 are closed before their workers are reaped; a worker that does not drain within
 five seconds is killed. The session limit bounds concurrent workers; excess
@@ -139,7 +155,7 @@ exchange, or forks a worker. The default per-IP concurrent limit is four.
 The supervisor also applies two per-IP token buckets before key exchange.
 `--connection-rate-limit COUNT/PERIOD_SECONDS` counts every accepted TCP
 connection and defaults to a burst of 10 replenished uniformly over 10
-seconds. `--auth-attempt-rate-limit` counts denied public-key requests and
+seconds. `--auth-attempt-rate-limit` counts denied authentication requests and
 defaults to 6 over 60 seconds; workers report denials to the supervisor so the
 next connection is refused before it can make key exchange expensive. A
 single connection is closed after six denials by default, configurable with

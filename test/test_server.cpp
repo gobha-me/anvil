@@ -7,9 +7,20 @@
 #include "server.hpp"
 #include "terminal_session.hpp"
 
-TEST_CASE("server CLI requires host and authorized keys") {
+TEST_CASE("server CLI requires a host key") {
   const std::array<std::string_view, 0> arguments{};
-  CHECK_THROWS_AS(anvil::server::parse_arguments(arguments), std::runtime_error);
+  CHECK_THROWS_AS(anvil::server::parse_arguments(arguments),
+                  std::runtime_error);
+}
+
+TEST_CASE("server CLI permits guest and registration service without bootstrap "
+          "keys") {
+  const std::array arguments{
+      std::string_view{"--host-key"},
+      std::string_view{"host_key"},
+  };
+  const auto parsed = anvil::server::parse_arguments(arguments);
+  CHECK(parsed.config.authorized_keys.empty());
 }
 
 TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
@@ -78,7 +89,8 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.idle_warning.count() == 45);
   CHECK(parsed.config.session_cap.count() == 7200);
   CHECK(parsed.config.session_resources.memory_bytes == 134'217'728U);
-  CHECK(parsed.config.session_resources.cpu_burst == std::chrono::milliseconds(75));
+  CHECK(parsed.config.session_resources.cpu_burst ==
+        std::chrono::milliseconds(75));
   CHECK(parsed.config.session_resources.output_bytes_per_second == 2'000'000U);
   CHECK(parsed.config.session_resources.image_bytes == 67'108'864U);
   REQUIRE(parsed.config.authorized_keys.size() == 2);
@@ -111,22 +123,27 @@ TEST_CASE("server CLI rejects malformed hostile values") {
   CHECK_THROWS_AS(parse("--connection-rate-limit", "10"), std::runtime_error);
   CHECK_THROWS_AS(parse("--connection-rate-limit", "0/10"), std::runtime_error);
   CHECK_THROWS_AS(parse("--connection-rate-limit", "10/0"), std::runtime_error);
-  CHECK_THROWS_AS(parse("--auth-attempt-rate-limit", "1/2/3"), std::runtime_error);
-  CHECK_THROWS_AS(parse("--max-auth-attempts-per-session", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--auth-attempt-rate-limit", "1/2/3"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--max-auth-attempts-per-session", "0"),
+                  std::runtime_error);
   CHECK_THROWS_AS(parse("--max-tracked-ips", "65537"), std::runtime_error);
   CHECK_THROWS_AS(
       parse("--max-tracked-ips", "18446744073709551616000000000000000000"),
       std::runtime_error);
   CHECK_THROWS_AS(parse("--idle-timeout-seconds", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--idle-timeout-seconds", "1x"), std::runtime_error);
-  CHECK_THROWS_AS(parse("--idle-timeout-seconds", "4294967296"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--idle-timeout-seconds", "4294967296"),
+                  std::runtime_error);
   CHECK_THROWS_AS(parse("--idle-warning-seconds", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--session-cap-seconds", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--session-memory-bytes", "0"), std::runtime_error);
-  CHECK_THROWS_AS(parse("--session-memory-bytes", "1099511627777"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-memory-bytes", "1099511627777"),
+                  std::runtime_error);
   CHECK_THROWS_AS(parse("--session-cpu-burst-ms", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--session-cpu-burst-ms", "60001"), std::runtime_error);
-  CHECK_THROWS_AS(parse("--session-output-bytes-per-second", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-output-bytes-per-second", "0"),
+                  std::runtime_error);
   CHECK_THROWS_AS(parse("--session-output-bytes-per-second", "1000000001"),
                   std::runtime_error);
   CHECK_THROWS_AS(parse("--session-image-bytes", "1x"), std::runtime_error);
@@ -147,7 +164,8 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.idle_warning.count() == 30);
   CHECK(parsed.config.session_cap.count() == 86'400);
   CHECK(parsed.config.session_resources.memory_bytes == (64U << 20U));
-  CHECK(parsed.config.session_resources.cpu_burst == std::chrono::milliseconds(50));
+  CHECK(parsed.config.session_resources.cpu_burst ==
+        std::chrono::milliseconds(50));
   CHECK(parsed.config.session_resources.output_bytes_per_second == 1'000'000U);
   CHECK(parsed.config.session_resources.image_bytes == (32U << 20U));
   CHECK(parsed.config.max_sessions == 64);
@@ -187,17 +205,16 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
       std::string_view{"--max-sessions-per-ip"},
       std::string_view{"3"},
   };
-  CHECK_THROWS_AS(anvil::server::parse_arguments(invalid_cross_field), std::runtime_error);
+  CHECK_THROWS_AS(anvil::server::parse_arguments(invalid_cross_field),
+                  std::runtime_error);
 
   const std::array conflicting_ports{
-      std::string_view{"--host-key"},
-      std::string_view{"host_key"},
-      std::string_view{"--authorized-key"},
-      std::string_view{"user=key.pub"},
-      std::string_view{"--port"},
-      std::string_view{"8080"},
+      std::string_view{"--host-key"},       std::string_view{"host_key"},
+      std::string_view{"--authorized-key"}, std::string_view{"user=key.pub"},
+      std::string_view{"--port"},           std::string_view{"8080"},
   };
-  CHECK_THROWS_AS(anvil::server::parse_arguments(conflicting_ports), std::runtime_error);
+  CHECK_THROWS_AS(anvil::server::parse_arguments(conflicting_ports),
+                  std::runtime_error);
 }
 
 TEST_CASE("server CLI separates scheduled and offline backup modes") {
@@ -283,14 +300,15 @@ TEST_CASE("SSH terminal dimensions bound hostile peer claims") {
 TEST_CASE("SSH terminal type is a bounded printable hint") {
   using anvil::server::RemoteBytes;
 
-  CHECK(anvil::server::normalize_terminal_type(RemoteBytes::from_text({})).empty());
+  CHECK(anvil::server::normalize_terminal_type(RemoteBytes::from_text({}))
+            .empty());
   CHECK(anvil::server::normalize_terminal_type(
             RemoteBytes::from_text("xterm-256color")) == "xterm-256color");
   CHECK(anvil::server::normalize_terminal_type(
             RemoteBytes::from_text("xterm\x1b[31m"))
             .empty());
   const std::string oversized(257, 'x');
-  CHECK(anvil::server::normalize_terminal_type(
-            RemoteBytes::from_text(oversized))
-            .empty());
+  CHECK(
+      anvil::server::normalize_terminal_type(RemoteBytes::from_text(oversized))
+          .empty());
 }

@@ -7,6 +7,7 @@ import pathlib
 import select
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -238,6 +239,18 @@ def test_auth_attempt_rate(executable: pathlib.Path, directory: pathlib.Path,
     shell: subprocess.Popen[bytes] | None = None
     recovered: socket.socket | None = None
     try:
+        fingerprint = subprocess.run(
+            ["ssh-keygen", "-lf", f"{wrong_key}.pub", "-E", "sha256"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.split()[1]
+        key_fields = pathlib.Path(f"{wrong_key}.pub").read_text().split()
+        public_key = f"{key_fields[0]} {key_fields[1]}"
+        with sqlite3.connect(directory / f"anvil-{port}.db") as connection:
+            connection.execute(
+                "INSERT INTO user_keys(fingerprint,user_handle,public_key,added_at,revoked_at) "
+                "VALUES(?,?,?,?,?)",
+                (fingerprint, "tester", public_key, 1, 2),
+            )
         shell, received = start_shell(port, client_key, b"auth-start")
         denied = subprocess.run(ssh_command(port, wrong_key) + ["-T"], capture_output=True,
                                 timeout=10, check=False)

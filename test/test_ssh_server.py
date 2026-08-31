@@ -8,6 +8,7 @@ import pathlib
 import re
 import select
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -123,6 +124,23 @@ def ssh_command(port: int, identity: pathlib.Path, user: str = "tester") -> list
     ]
 
 
+def guest_command(port: int, user: str = "guest") -> list[str]:
+    return [
+        "ssh",
+        "-F", "/dev/null",
+        "-o", "PreferredAuthentications=none",
+        "-o", "PubkeyAuthentication=no",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "ConnectTimeout=10",
+        "-p", str(port),
+        f"{user}@127.0.0.1",
+    ]
+
+
 def shell_session(base: list[str], payload: bytes) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(base + ["-tt"], input=payload, capture_output=True,
                           timeout=15, check=False)
@@ -134,7 +152,7 @@ def assert_shell(result: subprocess.CompletedProcess[bytes], own: bytes,
     assert own.rstrip(b"\n") in result.stdout, result.stdout
     if foreign is not None:
         assert foreign not in result.stdout, result.stdout
-    match = re.search(rb"Anvil M0 echo session ([0-9]+)", result.stdout)
+    match = re.search(rb"Anvil board session ([0-9]+)", result.stdout)
     assert match is not None, result.stdout
     return int(match.group(1))
 
@@ -259,6 +277,12 @@ def main() -> int:
 
             first = shell_session(base, b"first-session\n")
             assert_shell(first, b"first-session\n")
+            assert b"Signed in as tester" in first.stdout, first.stdout
+
+            spoofed = shell_session(ssh_command(port, client_key, "mallory"),
+                                    b"same-key\n")
+            assert_shell(spoofed, b"same-key\n")
+            assert b"Signed in as tester" in spoofed.stdout, spoofed.stdout
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 alpha_future = executor.submit(shell_session, base, b"alpha-only\n")
@@ -279,9 +303,35 @@ def main() -> int:
             assert subsystem.returncode != 0, subsystem
             assert b"does not provide SSH subsystems" in subsystem.stderr, subsystem.stderr
 
-            unauthorized = shell_session(ssh_command(port, wrong_key), b"intruder\n")
-            assert unauthorized.returncode != 0, unauthorized
-            assert b"intruder" not in unauthorized.stdout, unauthorized.stdout
+            guest = shell_session(guest_command(port), b"cannot-post\n")
+            assert guest.returncode == 0, guest
+            assert b"Guest access: boards and doors are read-only" in guest.stdout, guest.stdout
+            assert b"cannot-post" not in guest.stdout, guest.stdout
+
+            non_guest_none = shell_session(guest_command(port, "visitor"), b"")
+            assert non_guest_none.returncode != 0, non_guest_none
+
+            registration_screen = shell_session(ssh_command(port, wrong_key), b"\x1b")
+            assert registration_screen.returncode == 0, registration_screen
+            assert b"There is no email recovery" in registration_screen.stdout, registration_screen.stdout
+
+            registering = shell_session(ssh_command(port, wrong_key), b"new_user\n")
+            assert registering.returncode == 0, registering
+            assert b"Registration pending for new_user" in registering.stdout, registering.stdout
+
+            pending = shell_session(ssh_command(port, wrong_key), b"ignored\n")
+            assert pending.returncode == 0, pending
+            assert b"Registration pending for new_user" in pending.stdout, pending.stdout
+            assert b"ignored" not in pending.stdout, pending.stdout
+
+            database = directory / f"anvil-{port}.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "UPDATE user_keys SET revoked_at=99 WHERE user_handle='new_user'"
+                )
+            revoked = shell_session(ssh_command(port, wrong_key), b"revoked\n")
+            assert revoked.returncode != 0, revoked
+            assert b"revoked" not in revoked.stdout, revoked.stdout
         finally:
             stop_server(process)
 

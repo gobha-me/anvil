@@ -157,7 +157,7 @@ def test_live_server(executable: pathlib.Path) -> None:
                 ssh_command(ssh_port, client_key) + ["-tt"], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            read_until(session, b"Anvil M0 echo session")
+            read_until(session, b"Anvil board session")
             metrics = wait_for_metric(
                 health_port, rb"anvil_session_frames_total\{session=\"[0-9]+\"\} [1-9]"
             )

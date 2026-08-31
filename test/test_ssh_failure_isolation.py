@@ -83,8 +83,8 @@ def read_until(process: subprocess.Popen[bytes], expected: bytes,
 
 def open_session(port: int, client_key: pathlib.Path) -> tuple[subprocess.Popen[bytes], int]:
     process = start_session(port, client_key)
-    output = read_until(process, b"Anvil M0 echo session")
-    match = re.search(rb"Anvil M0 echo session ([0-9]+)", output)
+    output = read_until(process, b"Anvil board session")
+    match = re.search(rb"Anvil board session ([0-9]+)", output)
     assert match is not None, output
     return process, int(match.group(1))
 

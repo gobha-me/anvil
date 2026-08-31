@@ -1,7 +1,6 @@
 #pragma once
 
 #include <anvil/store.hpp>
-
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -23,13 +22,13 @@ struct SqliteMigration {
   std::string_view sql;
 };
 
-} // namespace detail
+}  // namespace detail
 
 // Server-private SQLite implementation. It intentionally retains only the
 // database path and configuration: every Transaction owns a fresh connection,
 // so no SQLite handle is inherited by a forked session worker.
 class SqliteStore final : public Store {
-public:
+ public:
   [[nodiscard]] static auto open(const std::filesystem::path &path)
       -> std::expected<std::unique_ptr<SqliteStore>, Error>;
 
@@ -65,7 +64,7 @@ public:
                                              std::string_view sql)
       -> std::expected<std::string, Error>;
 
-private:
+ private:
   [[nodiscard]] auto tombstone_impl(Transaction &transaction,
                                     const ContentRef &content)
       -> std::expected<void, Error> final;
@@ -77,6 +76,13 @@ private:
                                                   std::string_view board_id,
                                                   ContentVisibility visibility)
       -> std::expected<std::vector<MessageRecord>, Error> final;
+  [[nodiscard]] auto find_local_credential_impl(Transaction &transaction,
+                                                std::string_view fingerprint)
+      -> std::expected<std::optional<CredentialRecord>, Error> final;
+  [[nodiscard]] auto
+  provision_local_credential_impl(Transaction &transaction,
+                                  const LocalCredentialProvision &provision)
+      -> std::expected<void, Error> final;
 
   std::filesystem::path path_;
   SqliteOptions options_;
@@ -91,6 +97,6 @@ open_sqlite_store(const std::filesystem::path &path,
                   SqliteOptions options = {})
     -> std::expected<std::unique_ptr<SqliteStore>, Error>;
 
-} // namespace detail
+}  // namespace detail
 
-} // namespace anvil::store
+}  // namespace anvil::store

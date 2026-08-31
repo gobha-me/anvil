@@ -71,6 +71,45 @@ enum class ContentStatus {
   tombstoned,
 };
 
+enum class UserStatus {
+  pending,
+  active,
+  suspended,
+  tombstoned,
+};
+
+// Revocation belongs to a credential rather than its user. Keeping it in the
+// lookup result prevents a revoked key from becoming indistinguishable from a
+// never-seen key and accidentally entering registration again.
+enum class CredentialStatus {
+  pending,
+  active,
+  suspended,
+  tombstoned,
+  revoked,
+};
+
+struct CredentialRecord {
+  std::string handle;
+  std::string fingerprint;
+  std::string public_key;
+  CredentialStatus status{CredentialStatus::pending};
+
+  [[nodiscard]] auto operator==(const CredentialRecord &) const
+      -> bool = default;
+};
+
+struct LocalCredentialProvision {
+  std::string handle;
+  std::string fingerprint;
+  std::string public_key;
+  UtcEpochSeconds created_at;
+  UserStatus user_status{UserStatus::pending};
+
+  [[nodiscard]] auto operator==(const LocalCredentialProvision &) const
+      -> bool = default;
+};
+
 struct MessageRecord {
   std::string message_id;
   std::string board_id;
@@ -93,7 +132,7 @@ class TransactionBackend;
 // every active transaction. Transactions are move-only and roll back on
 // destruction unless a commit or explicit rollback completed them.
 class Transaction final {
-public:
+ public:
   ~Transaction() noexcept;
 
   Transaction(const Transaction &) = delete;
@@ -106,7 +145,7 @@ public:
   [[nodiscard]] auto active() const noexcept -> bool;
   [[nodiscard]] auto mode() const noexcept -> TransactionMode;
 
-private:
+ private:
   friend class Store;
 
   Transaction(const Store *owner, TransactionMode mode,
@@ -120,7 +159,7 @@ private:
 // Implementations keep backend-flavoured transaction state behind this seam.
 // rollback() is noexcept because Transaction invokes it during stack unwinding.
 class TransactionBackend {
-public:
+ public:
   virtual ~TransactionBackend() noexcept;
 
   [[nodiscard]] virtual auto commit() -> std::expected<void, Error> = 0;
@@ -128,7 +167,7 @@ public:
 };
 
 class Store {
-public:
+ public:
   virtual ~Store() noexcept;
 
   [[nodiscard]] virtual auto begin(TransactionMode mode)
@@ -158,7 +197,22 @@ public:
                                                std::string_view board_id)
       -> std::expected<std::vector<MessageRecord>, Error>;
 
-protected:
+  // An absent result means the fingerprint has never been registered. A
+  // revoked credential remains present with CredentialStatus::revoked.
+  [[nodiscard]] auto find_local_credential(Transaction &transaction,
+                                           std::string_view fingerprint)
+      -> std::expected<std::optional<CredentialRecord>, Error>;
+
+  // Provisioning is atomic. Pending registration requires a new handle and
+  // fingerprint. Active bootstrap provisioning is idempotent for an exact
+  // match and may add another key to an existing active local user, but never
+  // changes existing status or credential ownership.
+  [[nodiscard]] auto
+  provision_local_credential(Transaction &transaction,
+                             const LocalCredentialProvision &provision)
+      -> std::expected<void, Error>;
+
+ protected:
   // Store implementations use this factory so null backends fail as data,
   // rather than producing an apparently active transaction that later crashes.
   [[nodiscard]] auto
@@ -190,6 +244,14 @@ protected:
                                std::string_view board_id,
                                ContentVisibility visibility)
       -> std::expected<std::vector<MessageRecord>, Error> = 0;
+  [[nodiscard]] virtual auto
+  find_local_credential_impl(Transaction &transaction,
+                             std::string_view fingerprint)
+      -> std::expected<std::optional<CredentialRecord>, Error> = 0;
+  [[nodiscard]] virtual auto
+  provision_local_credential_impl(Transaction &transaction,
+                                  const LocalCredentialProvision &provision)
+      -> std::expected<void, Error> = 0;
 };
 
-} // namespace anvil::store
+}  // namespace anvil::store

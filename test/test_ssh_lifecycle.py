@@ -139,7 +139,7 @@ def main() -> int:
         sessions = [start_session(idle_port, client_key) for _ in range(4)]
         try:
             for session in sessions:
-                read_until(session, b"Anvil M0 echo session", 5)
+                read_until(session, b"Anvil board session", 5)
             for session in sessions:
                 output, error = wait_for_session_message(
                     session, b"session closed after the idle timeout", 6
@@ -160,7 +160,7 @@ def main() -> int:
         )
         cap_session = start_session(cap_port, client_key)
         try:
-            read_until(cap_session, b"Anvil M0 echo session", 5)
+            read_until(cap_session, b"Anvil board session", 5)
             output, error = wait_for_session_message(
                 cap_session, b"maximum session duration reached", 5
             )
@@ -175,7 +175,7 @@ def main() -> int:
         )
         shutdown_session = start_session(shutdown_port, client_key)
         try:
-            read_until(shutdown_session, b"Anvil M0 echo session", 5)
+            read_until(shutdown_session, b"Anvil board session", 5)
             shutdown_server.send_signal(signal.SIGTERM)
             output, error = wait_for_session_message(
                 shutdown_session, b"server is shutting down", 5

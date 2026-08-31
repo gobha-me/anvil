@@ -56,6 +56,22 @@ private:
                        anvil::store::Error> override {
     return std::vector<anvil::store::MessageRecord>{};
   }
+
+  [[nodiscard]] auto find_local_credential_impl(
+      anvil::store::Transaction &, std::string_view)
+      -> std::expected<std::optional<anvil::store::CredentialRecord>,
+                       anvil::store::Error> override {
+    return std::nullopt;
+  }
+
+  [[nodiscard]] auto provision_local_credential_impl(
+      anvil::store::Transaction &,
+      const anvil::store::LocalCredentialProvision &)
+      -> std::expected<void, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no identity backend"});
+  }
 };
 
 } // namespace
