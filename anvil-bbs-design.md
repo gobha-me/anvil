@@ -204,6 +204,12 @@ automatic arrays.
 
 **The invite graph is stored and is an accountability mechanism, not just a growth limiter.** Each account records who invited it. Abuse becomes traceable upstream to whoever vouched, which changes behaviour before moderation ever engages. Operators can configure invites per user, invite regeneration rate, and whether an inviter is notified of moderation actions against their invitees.
 
+The shipped defaults are five invite credits per active account, one credit
+regenerated every 30 days up to that cap, and seven days before an issued code
+expires. Expired, claimed, or revoked codes do not refund a credit early.
+Inviter notification of moderation actions defaults off: an operator must
+explicitly choose that accountability disclosure over invitee privacy.
+
 **TOS acceptance is versioned.** Store the accepted version per user; a TOS change re-gates access until re-accepted. The TOS text is operator-supplied, not shipped.
 
 ### 5.5 Per-session limits
@@ -930,6 +936,7 @@ Recorded so they are not relitigated in a later session.
 | Question | Decision |
 |---|---|
 | Registration gating | Operator-configurable: `open` / `invite` / `closed`. Invite graph stored for accountability. |
+| Invite economics | Five-credit cap, one credit regenerated every 30 days, seven-day bearer-code expiry, and inviter moderation notifications off. All four are operator-configurable. |
 | TOS | Required at registration, versioned, re-gates on change. Text is operator-supplied. |
 | Private chat | Supported, unmoderated, **never persisted**. Recipient-initiated reporting. |
 | Uploads | Post-MVP. Server-configurable age limit on arrival. Scanning hook, no scanner. |
@@ -963,17 +970,16 @@ Recorded so they are not relitigated in a later session.
 
 ## 15b. Still open
 
-1. Invite economics: how many invites per user, on what regeneration schedule, and does an inviter get notified of moderation actions against their invitees? Defaults need picking even though they are configurable.
-2. Does shadow-ban belong in the moderation set, or does it create more confusion than it prevents at small scale?
-3. Board-level read permissions — are all boards visible to guests, or can an operator mark some registered-only?
-4. Retention defaults for `sessions_log` and `moderation_log`. Long enough to investigate, short enough not to be a liability.
-5. Whether presence should show *what screen* a user is on, or only that they are online. The former is more alive, the latter is less surveillant.
-6. Are board services (`PluginKind::BoardService`) actually needed in MVP, or does only `Door` ship in M3? The SDK should define the kind either way; the question is whether any host-side wiring exists for it at first release.
-7. **Signed plugin releases** (§7.9) — `ssh-keygen -Y sign` with an allowed-signers file is cheap and fits the project's existing key model. Post-MVP or M3? It is the difference between an operator trusting a *download* and trusting an *author*, and retrofitting it means every existing manifest entry lacks a signature.
-8. Which plugins make up the first-party demonstration set (§7.10)? The constraint is coverage of the interface — one tier-1 door, one tier-3 door, one verifier, possibly one board service — not entertainment value.
-9. Does the second-party repository build with a *different* compiler than the server's in CI, or the same one? Different is a much stronger test of §7.3 and costs one more CI job.
-10. Should a plugin be able to declare a dependency on another plugin? Almost certainly not in v1 — load-ordering and version-resolution are how plugin systems become package managers — but mod ecosystems generate the request early and it is worth having the answer ready.
-11. Is there a story for a plugin that wants to add a *board*, as opposed to a door? It is the most obvious `BoardService` and it collides with §9.2's no-plugin-tables rule.
+1. Does shadow-ban belong in the moderation set, or does it create more confusion than it prevents at small scale?
+2. Board-level read permissions — are all boards visible to guests, or can an operator mark some registered-only?
+3. Retention defaults for `sessions_log` and `moderation_log`. Long enough to investigate, short enough not to be a liability.
+4. Whether presence should show *what screen* a user is on, or only that they are online. The former is more alive, the latter is less surveillant.
+5. Are board services (`PluginKind::BoardService`) actually needed in MVP, or does only `Door` ship in M3? The SDK should define the kind either way; the question is whether any host-side wiring exists for it at first release.
+6. **Signed plugin releases** (§7.9) — `ssh-keygen -Y sign` with an allowed-signers file is cheap and fits the project's existing key model. Post-MVP or M3? It is the difference between an operator trusting a *download* and trusting an *author*, and retrofitting it means every existing manifest entry lacks a signature.
+7. Which plugins make up the first-party demonstration set (§7.10)? The constraint is coverage of the interface — one tier-1 door, one tier-3 door, one verifier, possibly one board service — not entertainment value.
+8. Does the second-party repository build with a *different* compiler than the server's in CI, or the same one? Different is a much stronger test of §7.3 and costs one more CI job.
+9. Should a plugin be able to declare a dependency on another plugin? Almost certainly not in v1 — load-ordering and version-resolution are how plugin systems become package managers — but mod ecosystems generate the request early and it is worth having the answer ready.
+10. Is there a story for a plugin that wants to add a *board*, as opposed to a door? It is the most obvious `BoardService` and it collides with §9.2's no-plugin-tables rule.
 
 ---
 

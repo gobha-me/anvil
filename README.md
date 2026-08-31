@@ -16,7 +16,8 @@ container.
 > identity, live remote resize handling, bounded session lifecycles,
 > supervisor-enforced per-IP admission limits, private health/readiness/metrics,
 > database-backed public-key identities, read-only guest access, pending
-> registration, and the hardened container are implemented. See
+> registration, expiring invite issuance with a durable accountability graph,
+> and the hardened container are implemented. See
 > [`anvil-bbs-design.md`](anvil-bbs-design.md) for the architecture and the issue
 > tracker for the work breakdown.
 
@@ -115,6 +116,10 @@ install -d -m 700 state
   --session-image-bytes 33554432 \
   --database state/anvil.db \
   --registration-mode open \
+  --invites-per-user 5 \
+  --invite-regeneration-seconds 2592000 \
+  --invite-expiration-seconds 604800 \
+  --notify-inviters-on-moderation off \
   --backup-directory state/backups \
   --backup-interval-seconds 86400 \
   --backup-retention-seconds 604800 \
@@ -150,11 +155,15 @@ identities remain gated until versioned TOS acceptance lands in issue #40.
 There is no email or recovery address: losing every registered key loses the
 account.
 
-Invite codes are bounded opaque tokens. Anvil stores only their SHA-256 hashes
-and atomically claims a code with its pending account, so concurrent reuse has
-exactly one winner. Issue #39 adds user-facing invite issuance and economics;
-until then, invite mode consumes already-provisioned rows in the `invites`
-table.
+Active users type `/invite` to issue a 32-character opaque bearer code. Anvil
+displays the raw code once, stores only its SHA-256 hash, and atomically claims
+it with the pending account, so concurrent reuse has exactly one winner. Codes
+expire after seven days by default. Every active account starts with five
+credits; issuance spends one and one credit regenerates every 30 days up to the
+five-credit cap. Expiry, redemption, and revocation do not refund a credit
+early. These values are operator-configurable, including a zero cap that
+disables issuance. The inviter edge is permanent and moderator-facing graph
+reads include tombstoned descendants.
 
 Send `SIGINT` or `SIGTERM`
 to stop accepting connections. Active shells receive a shutdown message and
@@ -265,7 +274,11 @@ ssh -p 2222 demo@127.0.0.1
 512 MiB of memory, 256 PIDs, and a 16 MiB tmpfs; override them with
 `ANVIL_CPU_LIMIT`, `ANVIL_MEMORY_LIMIT`, `ANVIL_PID_LIMIT`, and
 `ANVIL_TMPFS_LIMIT`. `ANVIL_REGISTRATION_MODE` selects `open`, `invite`, or
-`closed` and defaults to `open`.
+`closed` and defaults to `open`. `ANVIL_INVITES_PER_USER`,
+`ANVIL_INVITE_REGENERATION_SECONDS`, and `ANVIL_INVITE_EXPIRATION_SECONDS`
+control invite economics. `ANVIL_NOTIFY_INVITERS_ON_MODERATION` accepts `on`
+or `off` and defaults to `off`; issue #55 will consume that privacy-sensitive
+policy when moderation actions and user notifications exist.
 
 The default Docker bridge disables IP masquerading, so sessions and future
 plugins have no outbound Internet route while the published SSH port remains
@@ -550,9 +563,11 @@ applies every pending migration in one transaction before opening either
 listener or forking. Migrations are compiled into the binary, strictly
 forward-only, and tracked with SQLite's `user_version`. Schema version 1 claims
 the otherwise empty file with application ID `ANVL`; version 2 adds the exact
-17-table domain schema. An unknown application ID, a non-empty unclaimed file,
-corrupt data, or a schema newer than the binary stops startup. There is no
-migration metadata table, private-chat table, or plugin-owned table.
+17-table domain schema, and version 3 adds invite balances, expiry, and the
+single-edge graph constraint without adding a table. Legacy unclaimed codes
+expire during that migration. An unknown application ID, a non-empty unclaimed
+file, corrupt data, or a schema newer than the binary stops startup. There is
+no migration metadata table, private-chat table, or plugin-owned table.
 
 The schema stores local users with a null origin and carries `(handle, origin)`
 through every user reference. Boards use canonical lowercase UUIDs, messages
@@ -731,6 +746,11 @@ makes the policy calls. The software provides registration modes, an invite
 graph for accountability, versioned TOS gating, a report action on every
 user-generated surface, a moderation queue with an append-only audit log,
 configurable retention, and a hook interface for external scanning.
+
+The shipped invite defaults are five credits per active account, one regenerated
+every 30 days, a seven-day code lifetime, and no disclosure of moderation
+actions to the inviter. Operators may change every value. Notification remains
+off unless an operator explicitly chooses accountability over invitee privacy.
 
 It does not decide policy, ship a TOS, bundle a scanner, vet plugins, or assume
 a jurisdiction. Get actual legal input before running a public instance.

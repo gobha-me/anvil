@@ -71,7 +71,7 @@ void clear_secret(char *data, std::size_t size) noexcept {
 }
 
 class FileDescriptor {
- public:
+public:
   explicit FileDescriptor(int descriptor = -1) noexcept
       : descriptor_(descriptor) {}
   ~FileDescriptor() {
@@ -99,12 +99,12 @@ class FileDescriptor {
     return std::exchange(descriptor_, -1);
   }
 
- private:
+private:
   int descriptor_;
 };
 
 class TemporaryDirectoryEntry {
- public:
+public:
   TemporaryDirectoryEntry(int directory, std::string name)
       : directory_(directory), name_(std::move(name)) {}
   ~TemporaryDirectoryEntry() {
@@ -123,7 +123,7 @@ class TemporaryDirectoryEntry {
     present_ = false;
   }
 
- private:
+private:
   int directory_;
   std::string name_;
   bool present_{true};
@@ -803,7 +803,7 @@ void await_peer_channel_close(ssh_event event, ssh_session session,
 enum class SessionEnd { normal, idle_timeout, resource_limit, shutdown };
 
 class CpuProgressWatchdog {
- public:
+public:
   explicit CpuProgressWatchdog(std::chrono::nanoseconds burst)
       : burst_(burst) {}
 
@@ -821,7 +821,7 @@ class CpuProgressWatchdog {
     return progress.consumed - baseline_ > burst_;
   }
 
- private:
+private:
   std::chrono::nanoseconds burst_;
   std::chrono::nanoseconds baseline_{};
   std::uint64_t generation_{};
@@ -999,8 +999,8 @@ int run_session(ssh_session session, store::Store &identity_store,
         terminal_session = std::make_unique<TerminalSession>(
             application_descriptor.get(), state.terminal_type, dimensions,
             state.channel_opened_at, config.session_resources,
-            config.registration_mode, state.identity, *state.identity_store,
-            config.session_input_hook_for_testing);
+            config.registration_mode, config.invite_policy, state.identity,
+            *state.identity_store, config.session_input_hook_for_testing);
         state.terminal_session = terminal_session.get();
         auto armed =
             WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
@@ -1441,6 +1441,26 @@ void await_children(ChildMap &children, int signal_descriptor,
   return parse_bounded_count(text, "session limit", 4096);
 }
 
+[[nodiscard]] std::uint32_t parse_invite_count(std::string_view text) {
+  if (text.empty()) {
+    throw std::runtime_error("invites per user must not be empty");
+  }
+  std::uint64_t value = 0;
+  constexpr std::uint64_t maximum = 1'000'000;
+  for (const char character : text) {
+    if (character < '0' || character > '9') {
+      throw std::runtime_error("invites per user must be a decimal number");
+    }
+    const auto digit = static_cast<std::uint64_t>(character - '0');
+    if (value > (maximum - digit) / 10U) {
+      throw std::runtime_error(
+          "invites per user must be between 0 and 1000000");
+    }
+    value = value * 10U + digit;
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
 [[nodiscard]] std::uint64_t parse_bounded_bytes(std::string_view text,
                                                 std::string_view name,
                                                 std::uint64_t maximum) {
@@ -1508,7 +1528,7 @@ void await_children(ChildMap &children, int signal_descriptor,
   return std::chrono::seconds(value);
 }
 
-}  // namespace
+} // namespace
 
 std::string_view usage() noexcept {
   return "usage: anvil --host-key PATH [options]\n"
@@ -1520,6 +1540,12 @@ std::string_view usage() noexcept {
          "  --health-port PORT      private HTTP port (default 8080)\n"
          "  --database PATH        SQLite database (default anvil.db)\n"
          "  --registration-mode M  open, invite, or closed (default open)\n"
+         "  --invites-per-user N   invite balance cap (default 5; 0 disables)\n"
+         "  --invite-regeneration-seconds S\n"
+         "                          one-credit period (default 2592000)\n"
+         "  --invite-expiration-seconds S\n"
+         "                          bearer-code lifetime (default 604800)\n"
+         "  --notify-inviters-on-moderation on|off (default off)\n"
          "  --backup-directory P  enable snapshots in directory P\n"
          "  --backup-interval-seconds S\n"
          "                          snapshot period (default 86400)\n"
@@ -1571,6 +1597,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   bool backup_retention_explicit = false;
   bool backup_directory_explicit = false;
   bool registration_mode_explicit = false;
+  bool invite_policy_explicit = false;
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const auto argument = arguments[index];
     if (argument == "--help") {
@@ -1580,6 +1607,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     if (argument != "--bind-address" && argument != "--port" &&
         argument != "--health-bind-address" && argument != "--health-port" &&
         argument != "--database" && argument != "--registration-mode" &&
+        argument != "--invites-per-user" &&
+        argument != "--invite-regeneration-seconds" &&
+        argument != "--invite-expiration-seconds" &&
+        argument != "--notify-inviters-on-moderation" &&
         argument != "--backup-directory" &&
         argument != "--backup-interval-seconds" &&
         argument != "--backup-retention-seconds" &&
@@ -1629,6 +1660,27 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
             "registration mode must be open, invite, or closed");
       }
       registration_mode_explicit = true;
+    } else if (argument == "--invites-per-user") {
+      result.config.invite_policy.per_user = parse_invite_count(value);
+      invite_policy_explicit = true;
+    } else if (argument == "--invite-regeneration-seconds") {
+      result.config.invite_policy.regeneration =
+          parse_duration(value, "invite regeneration period");
+      invite_policy_explicit = true;
+    } else if (argument == "--invite-expiration-seconds") {
+      result.config.invite_policy.expiration =
+          parse_duration(value, "invite expiration");
+      invite_policy_explicit = true;
+    } else if (argument == "--notify-inviters-on-moderation") {
+      if (value == "on") {
+        result.config.invite_policy.notify_inviters_on_moderation = true;
+      } else if (value == "off") {
+        result.config.invite_policy.notify_inviters_on_moderation = false;
+      } else {
+        throw std::runtime_error(
+            "notify inviters on moderation must be on or off");
+      }
+      invite_policy_explicit = true;
     } else if (argument == "--backup-directory") {
       result.config.backup_directory = value;
       backup_directory_explicit = true;
@@ -1716,6 +1768,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       if (registration_mode_explicit) {
         throw std::runtime_error(
             "--registration-mode is not valid in backup or restore mode");
+      }
+      if (invite_policy_explicit) {
+        throw std::runtime_error(
+            "invite policy options are not valid in backup or restore mode");
       }
       if (backup_directory_explicit || backup_interval_explicit ||
           backup_retention_explicit) {
@@ -2073,4 +2129,4 @@ int run(const Config &config) {
   return health_failed ? 1 : 0;
 }
 
-}  // namespace anvil::server
+} // namespace anvil::server

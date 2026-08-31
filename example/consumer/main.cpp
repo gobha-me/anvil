@@ -57,8 +57,8 @@ private:
     return std::vector<anvil::store::MessageRecord>{};
   }
 
-  [[nodiscard]] auto find_local_credential_impl(
-      anvil::store::Transaction &, std::string_view)
+  [[nodiscard]] auto find_local_credential_impl(anvil::store::Transaction &,
+                                                std::string_view)
       -> std::expected<std::optional<anvil::store::CredentialRecord>,
                        anvil::store::Error> override {
     return std::nullopt;
@@ -73,9 +73,36 @@ private:
                             "consumer fixture has no identity backend"});
   }
 
-  [[nodiscard]] auto claim_invite_impl(
-      anvil::store::Transaction &, const anvil::store::InviteClaim &)
+  [[nodiscard]] auto claim_invite_impl(anvil::store::Transaction &,
+                                       const anvil::store::InviteClaim &)
       -> std::expected<void, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no invite backend"});
+  }
+
+  [[nodiscard]] auto issue_invite_impl(anvil::store::Transaction &,
+                                       const anvil::store::InviteIssue &)
+      -> std::expected<anvil::store::InviteIssueResult,
+                       anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no invite backend"});
+  }
+
+  [[nodiscard]] auto find_inviter_impl(anvil::store::Transaction &,
+                                       std::string_view)
+      -> std::expected<std::optional<anvil::store::InviteUser>,
+                       anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no invite backend"});
+  }
+
+  [[nodiscard]] auto list_invite_subtree_impl(anvil::store::Transaction &,
+                                              std::string_view)
+      -> std::expected<std::vector<anvil::store::InviteDescendant>,
+                       anvil::store::Error> override {
     return std::unexpected(
         anvil::store::Error{anvil::store::ErrorCode::unavailable,
                             "consumer fixture has no invite backend"});

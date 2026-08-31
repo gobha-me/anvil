@@ -59,7 +59,7 @@ constexpr auto sink_stall_timeout = 5s;
 }
 
 class SocketSink final : public termforge::ByteSink {
- public:
+public:
   SocketSink(int descriptor, SessionResources &resources,
              const std::atomic<bool> &stop_requested) noexcept
       : descriptor_(descriptor), resources_(resources),
@@ -131,7 +131,7 @@ class SocketSink final : public termforge::ByteSink {
     return {};
   }
 
- private:
+private:
   int descriptor_;
   SessionResources &resources_;
   const std::atomic<bool> &stop_requested_;
@@ -152,17 +152,17 @@ struct SharedState {
 };
 
 class EchoApp final : public termforge::App {
- public:
+public:
   EchoApp(int descriptor, std::string terminal_type,
           TerminalDimensions dimensions,
           std::chrono::steady_clock::time_point channel_opened,
           SharedState &shared, SessionIdentity identity,
           store::Store &identity_store, RegistrationMode registration_mode,
-          SessionInputHook input_hook_for_testing)
+          InvitePolicy invite_policy, SessionInputHook input_hook_for_testing)
       : sink_(descriptor, shared.resources, shared.stop_requested),
         channel_opened_(channel_opened), shared_(shared),
         identity_(std::move(identity)), identity_store_(identity_store),
-        registration_mode_(registration_mode) {
+        registration_mode_(registration_mode), invite_policy_(invite_policy) {
     const auto io =
         terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
     if (!io) {
@@ -191,6 +191,7 @@ class EchoApp final : public termforge::App {
     input_.set_focused(true);
     input_.set_placeholder("Type here");
     input_.on_change([this, input_hook_for_testing](const std::string &text) {
+      clear_issued_invite_code();
       auto sanitized = sanitize_prose_for_render(text);
       if (text.size() <= max_echo_size && sanitized.size() <= max_echo_size) {
         accepted_input_ = std::move(sanitized);
@@ -235,7 +236,10 @@ class EchoApp final : public termforge::App {
     });
   }
 
-  ~EchoApp() override { clear_invite_code(); }
+  ~EchoApp() override {
+    clear_invite_code();
+    clear_issued_invite_code();
+  }
 
   auto on_start() -> void override { driver().set_output(&sink_); }
 
@@ -260,6 +264,8 @@ class EchoApp final : public termforge::App {
                           key->ch == U'm' || key->ch == U'M')))) {
         if (identity_.kind == IdentityKind::registration) {
           submit_registration();
+        } else if (identity_.kind == IdentityKind::active) {
+          submit_active_command();
         }
         return;
       }
@@ -344,14 +350,24 @@ class EchoApp final : public termforge::App {
       static_cast<void>(
           screen.write_text(0, 2,
                             "Signed in as " + identity_.handle +
-                                ". Type to echo; boards follow in #46.",
+                                ". Type /invite to issue an invite code.",
                             foreground, background));
       if (screen.rows() > 3) {
         input_.set_geometry(termforge::Rect{0, 3, screen.cols(), 1});
         input_.draw(screen);
       }
     }
-    const auto &message = notice_.empty() ? status_ : notice_;
+    auto issued_message =
+        issued_invite_code_.empty()
+            ? std::string{}
+            : "Invite: " + issued_invite_code_ + " (" +
+                  std::to_string(issued_invite_balance_) +
+                  " remaining; expires in " +
+                  std::to_string(invite_policy_.expiration.count()) +
+                  " seconds)";
+    const auto &message = !notice_.empty()          ? notice_
+                          : !issued_message.empty() ? issued_message
+                                                    : status_;
     if (!message.empty() && screen.rows() > 4) {
       const auto status = sanitize_prose_for_render(message);
       static_cast<void>(
@@ -359,7 +375,7 @@ class EchoApp final : public termforge::App {
     }
   }
 
- private:
+private:
   enum class RegistrationStep { invite_code, handle };
 
   void render_registration(termforge::Screen &screen, termforge::Rgb foreground,
@@ -450,9 +466,36 @@ class EchoApp final : public termforge::App {
     status_ = "Key saved. Registration awaits TOS acceptance.";
   }
 
+  void submit_active_command() {
+    if (input_.text() != "/invite") {
+      return;
+    }
+    input_.set_text({});
+    const auto now = store::UtcEpochSeconds{
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count()};
+    auto issued = issue_invite_code(identity_store_, identity_.handle, now,
+                                    invite_policy_);
+    if (!issued) {
+      status_ = issued.error() == AuthenticationError::conflict
+                    ? "No invite credit is currently available."
+                    : "Invite issuance is temporarily unavailable.";
+      return;
+    }
+    issued_invite_code_ = std::move(issued->code);
+    issued_invite_balance_ = issued->remaining_balance;
+    status_.clear();
+  }
+
   void clear_invite_code() noexcept {
     std::fill(invite_code_.begin(), invite_code_.end(), '\0');
     invite_code_.clear();
+  }
+
+  void clear_issued_invite_code() noexcept {
+    std::fill(issued_invite_code_.begin(), issued_invite_code_.end(), '\0');
+    issued_invite_code_.clear();
   }
 
   SocketSink sink_;
@@ -461,15 +504,18 @@ class EchoApp final : public termforge::App {
   SessionIdentity identity_;
   store::Store &identity_store_;
   RegistrationMode registration_mode_{RegistrationMode::open};
+  InvitePolicy invite_policy_;
   RegistrationStep registration_step_{RegistrationStep::invite_code};
   termforge::TextInput input_;
   std::string invite_code_;
+  std::string issued_invite_code_;
+  std::uint32_t issued_invite_balance_{};
   std::string accepted_input_;
   std::string status_;
   std::string notice_;
 };
 
-}  // namespace
+} // namespace
 
 TerminalDimensions normalize_initial_dimensions(int columns, int rows,
                                                 int pixel_width,
@@ -510,17 +556,18 @@ std::string normalize_terminal_type(RemoteBytes remote_terminal_type) {
 }
 
 class TerminalSession::Impl {
- public:
+public:
   Impl(int io_descriptor, std::string terminal_type,
        TerminalDimensions dimensions,
        std::chrono::steady_clock::time_point channel_opened,
        SessionResourceLimits resource_limits,
-       RegistrationMode registration_mode, SessionIdentity identity,
-       store::Store &identity_store, SessionInputHook input_hook_for_testing)
+       RegistrationMode registration_mode, InvitePolicy invite_policy,
+       SessionIdentity identity, store::Store &identity_store,
+       SessionInputHook input_hook_for_testing)
       : shared_(dimensions, resource_limits),
         app_(io_descriptor, std::move(terminal_type), dimensions,
              channel_opened, shared_, std::move(identity), identity_store,
-             registration_mode, input_hook_for_testing) {}
+             registration_mode, invite_policy, input_hook_for_testing) {}
 
   ~Impl() {
     request_stop();
@@ -642,7 +689,7 @@ class TerminalSession::Impl {
     return shared_.telemetry;
   }
 
- private:
+private:
   [[nodiscard]] static SessionFailureReason
   failure_reason_for(ResourceLimitReason reason) noexcept {
     switch (reason) {
@@ -673,12 +720,12 @@ TerminalSession::TerminalSession(
     int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
     std::chrono::steady_clock::time_point channel_opened,
     SessionResourceLimits resource_limits, RegistrationMode registration_mode,
-    SessionIdentity identity, store::Store &identity_store,
-    SessionInputHook input_hook_for_testing)
-    : impl_(std::make_unique<Impl>(io_descriptor, std::move(terminal_type),
-                                   dimensions, channel_opened, resource_limits,
-                                   registration_mode, std::move(identity),
-                                   identity_store, input_hook_for_testing)) {}
+    const InvitePolicy &invite_policy, SessionIdentity identity,
+    store::Store &identity_store, SessionInputHook input_hook_for_testing)
+    : impl_(std::make_unique<Impl>(
+          io_descriptor, std::move(terminal_type), dimensions, channel_opened,
+          resource_limits, registration_mode, invite_policy,
+          std::move(identity), identity_store, input_hook_for_testing)) {}
 
 TerminalSession::~TerminalSession() = default;
 
@@ -716,4 +763,4 @@ SessionTelemetry TerminalSession::telemetry() const noexcept {
   return impl_->telemetry();
 }
 
-}  // namespace anvil::server
+} // namespace anvil::server

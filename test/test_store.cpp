@@ -67,7 +67,7 @@ constexpr std::string_view board_id = "00000000-0000-0000-0000-000000000001";
   return transaction->commit();
 }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("the store boundary uses explicit UTC epoch seconds") {
   constexpr anvil::store::UtcEpochSeconds before_epoch{-1};
@@ -422,13 +422,12 @@ TEST_CASE("credential provisioning enforces transaction and identity rules") {
 
   provision.fingerprint = "SHA256:key";
   provision.public_key = std::string{"ssh-ed25519 BAD\0tail", 20};
-  const auto embedded_nul =
-      first.provision_local_credential(*write, provision);
+  const auto embedded_nul = first.provision_local_credential(*write, provision);
   REQUIRE_FALSE(embedded_nul.has_value());
   CHECK(embedded_nul.error().code == ErrorCode::invalid_data);
 
-  const auto invalid_lookup = first.find_local_credential(
-      *write, std::string{"SHA256:key\0tail", 15});
+  const auto invalid_lookup =
+      first.find_local_credential(*write, std::string{"SHA256:key\0tail", 15});
   REQUIRE_FALSE(invalid_lookup.has_value());
   CHECK(invalid_lookup.error().code == ErrorCode::invalid_data);
 }
@@ -475,4 +474,150 @@ TEST_CASE(
   malformed.code_hash = "not-a-sha256-hash";
   CHECK(first.claim_invite(*invalid, malformed).error().code ==
         ErrorCode::invalid_data);
+}
+
+TEST_CASE("invite economics consume, cap, and regenerate atomic credits") {
+  anvil::testing::MemoryStore store;
+  auto provision = store.begin(TransactionMode::read_write);
+  REQUIRE(provision.has_value());
+  REQUIRE(store
+              .provision_local_credential(*provision,
+                                          {.handle = "operator",
+                                           .fingerprint = "SHA256:operator",
+                                           .public_key = "ssh-ed25519 OPERATOR",
+                                           .created_at = {1},
+                                           .user_status = UserStatus::active})
+              .has_value());
+  REQUIRE(provision->commit().has_value());
+
+  const auto issue = [&](char digit, std::int64_t now) {
+    auto transaction = store.begin(TransactionMode::read_write);
+    REQUIRE(transaction.has_value());
+    auto result =
+        store.issue_invite(*transaction, {.code_hash = std::string(64, digit),
+                                          .inviter_handle = "operator",
+                                          .created_at = {now},
+                                          .expires_at = {now + 100},
+                                          .balance_cap = 2,
+                                          .regeneration_seconds = 10});
+    if (result) {
+      REQUIRE(transaction->commit().has_value());
+    }
+    return result;
+  };
+
+  const auto first = issue('a', 100);
+  REQUIRE(first.has_value());
+  CHECK(first->remaining_balance == 1);
+  CHECK(first->next_regeneration == anvil::store::UtcEpochSeconds{110});
+  const auto second = issue('b', 100);
+  REQUIRE(second.has_value());
+  CHECK(second->remaining_balance == 0);
+  CHECK(issue('c', 109).error().code == ErrorCode::conflict);
+  const auto regenerated = issue('d', 110);
+  REQUIRE(regenerated.has_value());
+  CHECK(regenerated->remaining_balance == 0);
+  CHECK(regenerated->next_regeneration == anvil::store::UtcEpochSeconds{120});
+
+  auto invalid = store.begin(TransactionMode::read_write);
+  REQUIRE(invalid.has_value());
+  auto malformed = anvil::store::InviteIssue{.code_hash = std::string(64, 'e'),
+                                             .inviter_handle = "operator",
+                                             .created_at = {20},
+                                             .expires_at = {20},
+                                             .balance_cap = 2,
+                                             .regeneration_seconds = 10};
+  CHECK(store.issue_invite(*invalid, malformed).error().code ==
+        ErrorCode::invalid_data);
+}
+
+TEST_CASE("invite graph reads retain tombstoned descendants by depth") {
+  anvil::testing::MemoryStore store;
+  auto seed = store.begin(TransactionMode::read_write);
+  REQUIRE(seed.has_value());
+  REQUIRE(store
+              .provision_local_credential(*seed,
+                                          {.handle = "operator",
+                                           .fingerprint = "SHA256:operator",
+                                           .public_key = "ssh-ed25519 OPERATOR",
+                                           .created_at = {1},
+                                           .user_status = UserStatus::active})
+              .has_value());
+  REQUIRE(store
+              .issue_invite(*seed, {.code_hash = std::string(64, 'a'),
+                                    .inviter_handle = "operator",
+                                    .created_at = {2},
+                                    .expires_at = {100},
+                                    .balance_cap = 5,
+                                    .regeneration_seconds = 10})
+              .has_value());
+  REQUIRE(store
+              .provision_local_credential(*seed,
+                                          {.handle = "alice",
+                                           .fingerprint = "SHA256:alice",
+                                           .public_key = "ssh-ed25519 ALICE",
+                                           .created_at = {3},
+                                           .user_status = UserStatus::pending})
+              .has_value());
+  REQUIRE(store
+              .claim_invite(*seed, {.code_hash = std::string(64, 'a'),
+                                    .claimed_by_handle = "alice",
+                                    .claimed_at = {3}})
+              .has_value());
+  REQUIRE(seed->commit().has_value());
+  store.seed_credential({.handle = "alice",
+                         .fingerprint = "SHA256:alice",
+                         .public_key = "ssh-ed25519 ALICE",
+                         .status = CredentialStatus::active});
+
+  auto child = store.begin(TransactionMode::read_write);
+  REQUIRE(child.has_value());
+  REQUIRE(store
+              .issue_invite(*child, {.code_hash = std::string(64, 'b'),
+                                     .inviter_handle = "alice",
+                                     .created_at = {4},
+                                     .expires_at = {100},
+                                     .balance_cap = 5,
+                                     .regeneration_seconds = 10})
+              .has_value());
+  REQUIRE(store
+              .provision_local_credential(*child,
+                                          {.handle = "bob",
+                                           .fingerprint = "SHA256:bob",
+                                           .public_key = "ssh-ed25519 BOB",
+                                           .created_at = {5},
+                                           .user_status = UserStatus::pending})
+              .has_value());
+  REQUIRE(store
+              .claim_invite(*child, {.code_hash = std::string(64, 'b'),
+                                     .claimed_by_handle = "bob",
+                                     .claimed_at = {5}})
+              .has_value());
+  REQUIRE(child->commit().has_value());
+  store.seed_credential({.handle = "bob",
+                         .fingerprint = "SHA256:bob",
+                         .public_key = "ssh-ed25519 BOB",
+                         .status = CredentialStatus::tombstoned});
+
+  auto read = store.begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  const auto inviter = store.find_inviter(*read, "alice");
+  REQUIRE(inviter.has_value());
+  REQUIRE(inviter->has_value());
+  CHECK((*inviter)->handle == "operator");
+  const auto subtree = store.list_invite_subtree(*read, "operator");
+  REQUIRE(subtree.has_value());
+  REQUIRE(subtree->size() == 2);
+  CHECK((*subtree)[0] ==
+        anvil::store::InviteDescendant{.user = {.handle = "alice",
+                                                .origin = std::nullopt,
+                                                .status = UserStatus::active},
+                                       .depth = 1});
+  CHECK((*subtree)[1] == anvil::store::InviteDescendant{
+                             .user = {.handle = "bob",
+                                      .origin = std::nullopt,
+                                      .status = UserStatus::tombstoned},
+                             .depth = 2});
+  CHECK(store.list_invite_subtree(*read, "missing").error().code ==
+        ErrorCode::not_found);
 }

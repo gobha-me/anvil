@@ -183,6 +183,19 @@ def assert_compose_posture(configuration: dict[str, object], inspection: dict[st
         raise AssertionError("Compose does not keep the health listener on loopback")
     if "--backup-directory" not in command or "/var/lib/anvil/backups" not in command:
         raise AssertionError("Compose does not keep backups on the persistent volume")
+    invite_defaults = {
+        "--invites-per-user": "5",
+        "--invite-regeneration-seconds": "2592000",
+        "--invite-expiration-seconds": "604800",
+        "--notify-inviters-on-moderation": "off",
+    }
+    for option, expected in invite_defaults.items():
+        if (
+            option not in command
+            or command.index(option) + 1 >= len(command)
+            or command[command.index(option) + 1] != expected
+        ):
+            raise AssertionError(f"Compose invite default is wrong for {option}")
     published = service.get("ports")
     if not isinstance(published, list) or any(
         isinstance(item, dict) and item.get("target") != 2222 for item in published
@@ -327,6 +340,23 @@ def main(runtime_target: str = "runtime") -> int:
         override_configuration = json.loads(
             compose(["config", "--format", "json"], env, egress=True).stdout
         )
+        invite_env = env | {
+            "ANVIL_INVITES_PER_USER": "9",
+            "ANVIL_INVITE_REGENERATION_SECONDS": "60",
+            "ANVIL_INVITE_EXPIRATION_SECONDS": "120",
+            "ANVIL_NOTIFY_INVITERS_ON_MODERATION": "on",
+        }
+        invite_configuration = json.loads(
+            compose(["config", "--format", "json"], invite_env).stdout
+        )
+        invite_command = invite_configuration["services"]["anvil"]["command"]
+        for option, expected in {
+            "--invites-per-user": "9",
+            "--invite-regeneration-seconds": "60",
+            "--invite-expiration-seconds": "120",
+            "--notify-inviters-on-moderation": "on",
+        }.items():
+            assert invite_command[invite_command.index(option) + 1] == expected
         masquerade_option = "com.docker.network.bridge.enable_ip_masquerade"
         default_options = default_configuration["networks"]["default"].get("driver_opts", {})
         override_options = override_configuration["networks"]["default"].get("driver_opts", {})

@@ -290,6 +290,27 @@ def main() -> int:
             assert_shell(first, b"first-session\n")
             assert b"Signed in as tester" in first.stdout, first.stdout
 
+            issued = shell_session(base, b"/invite\n\x1b")
+            assert issued.returncode == 0, issued
+            token_match = re.search(
+                rb"Invite: ([A-Za-z0-9_-]{32}) \(4 remaining; expires in "
+                rb"604800 seconds",
+                issued.stdout,
+            )
+            assert token_match is not None, issued.stdout
+            issued_token = token_match.group(1).decode("ascii")
+            database = directory / f"anvil-{port}.db"
+            with sqlite3.connect(database) as connection:
+                dump = "\n".join(connection.iterdump())
+                assert issued_token not in dump
+                assert connection.execute(
+                    "SELECT count(*), length(code_hash), expires_at-created_at "
+                    "FROM invites"
+                ).fetchone() == (1, 64, 604800)
+
+            reconnected = shell_session(base, b"\x1b")
+            assert issued_token.encode("ascii") not in reconnected.stdout
+
             spoofed = shell_session(ssh_command(port, client_key, "mallory"),
                                     b"same-key\n")
             assert_shell(spoofed, b"same-key\n")
@@ -335,7 +356,6 @@ def main() -> int:
             assert b"Registration pending for new_user" in pending.stdout, pending.stdout
             assert b"ignored" not in pending.stdout, pending.stdout
 
-            database = directory / f"anvil-{port}.db"
             with sqlite3.connect(database) as connection:
                 connection.execute(
                     "UPDATE user_keys SET revoked_at=99 WHERE user_handle='new_user'"
@@ -379,8 +399,8 @@ def main() -> int:
         )
         with sqlite3.connect(invite_database) as connection:
             connection.execute(
-                "INSERT INTO invites(code_hash,inviter_handle,status,created_at) "
-                "VALUES(?, 'tester', 'active', 10)",
+                "INSERT INTO invites(code_hash,inviter_handle,status,created_at,"
+                "expires_at) VALUES(?, 'tester', 'active', 10, 4102444800)",
                 (invite_hash,),
             )
 

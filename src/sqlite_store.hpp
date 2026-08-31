@@ -22,13 +22,13 @@ struct SqliteMigration {
   std::string_view sql;
 };
 
-}  // namespace detail
+} // namespace detail
 
 // Server-private SQLite implementation. It intentionally retains only the
 // database path and configuration: every Transaction owns a fresh connection,
 // so no SQLite handle is inherited by a forked session worker.
 class SqliteStore final : public Store {
- public:
+public:
   [[nodiscard]] static auto open(const std::filesystem::path &path)
       -> std::expected<std::unique_ptr<SqliteStore>, Error>;
 
@@ -64,7 +64,7 @@ class SqliteStore final : public Store {
                                              std::string_view sql)
       -> std::expected<std::string, Error>;
 
- private:
+private:
   [[nodiscard]] auto tombstone_impl(Transaction &transaction,
                                     const ContentRef &content)
       -> std::expected<void, Error> final;
@@ -86,6 +86,15 @@ class SqliteStore final : public Store {
   [[nodiscard]] auto claim_invite_impl(Transaction &transaction,
                                        const InviteClaim &claim)
       -> std::expected<void, Error> final;
+  [[nodiscard]] auto issue_invite_impl(Transaction &transaction,
+                                       const InviteIssue &issue)
+      -> std::expected<InviteIssueResult, Error> final;
+  [[nodiscard]] auto find_inviter_impl(Transaction &transaction,
+                                       std::string_view invitee_handle)
+      -> std::expected<std::optional<InviteUser>, Error> final;
+  [[nodiscard]] auto list_invite_subtree_impl(Transaction &transaction,
+                                              std::string_view root_handle)
+      -> std::expected<std::vector<InviteDescendant>, Error> final;
 
   std::filesystem::path path_;
   SqliteOptions options_;
@@ -100,6 +109,6 @@ open_sqlite_store(const std::filesystem::path &path,
                   SqliteOptions options = {})
     -> std::expected<std::unique_ptr<SqliteStore>, Error>;
 
-}  // namespace detail
+} // namespace detail
 
-}  // namespace anvil::store
+} // namespace anvil::store

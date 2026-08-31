@@ -1,5 +1,6 @@
 #include <anvil/store.hpp>
 #include <cstddef>
+#include <limits>
 #include <utility>
 
 namespace anvil::store {
@@ -171,7 +172,38 @@ namespace {
   return {};
 }
 
-}  // namespace
+[[nodiscard]] auto validate_invite_issue(const InviteIssue &issue)
+    -> std::expected<void, Error> {
+  if (!valid_sha256_hex(issue.code_hash)) {
+    return std::unexpected(invalid_identifier(
+        "invite code hash must be lowercase hexadecimal SHA256"));
+  }
+  if (!valid_handle(issue.inviter_handle)) {
+    return std::unexpected(invalid_identifier(
+        "invite issuer violates the M1 handle grammar or is reserved"));
+  }
+  if (issue.balance_cap > 1'000'000U) {
+    return std::unexpected(
+        invalid_identifier("invite balance cap exceeds 1000000"));
+  }
+  if (issue.regeneration_seconds == 0U) {
+    return std::unexpected(
+        invalid_identifier("invite regeneration period must be positive"));
+  }
+  if (issue.expires_at <= issue.created_at) {
+    return std::unexpected(
+        invalid_identifier("invite expiry must be after creation"));
+  }
+  if (issue.created_at.value >
+      std::numeric_limits<std::int64_t>::max() -
+          static_cast<std::int64_t>(issue.regeneration_seconds)) {
+    return std::unexpected(
+        invalid_identifier("invite regeneration time would overflow"));
+  }
+  return {};
+}
+
+} // namespace
 
 Transaction::Transaction(const Store *owner, TransactionMode mode,
                          std::unique_ptr<TransactionBackend> backend) noexcept
@@ -362,4 +394,46 @@ auto Store::claim_invite(Transaction &transaction, const InviteClaim &claim)
   return claim_invite_impl(transaction, claim);
 }
 
-}  // namespace anvil::store
+auto Store::issue_invite(Transaction &transaction, const InviteIssue &issue)
+    -> std::expected<InviteIssueResult, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "invite issuance requires a write transaction"});
+  }
+  if (auto valid = validate_invite_issue(issue); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return issue_invite_impl(transaction, issue);
+}
+
+auto Store::find_inviter(Transaction &transaction,
+                         std::string_view invitee_handle)
+    -> std::expected<std::optional<InviteUser>, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (!valid_handle(invitee_handle)) {
+    return std::unexpected(invalid_identifier(
+        "invitee violates the M1 handle grammar or is reserved"));
+  }
+  return find_inviter_impl(transaction, invitee_handle);
+}
+
+auto Store::list_invite_subtree(Transaction &transaction,
+                                std::string_view root_handle)
+    -> std::expected<std::vector<InviteDescendant>, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (!valid_handle(root_handle)) {
+    return std::unexpected(invalid_identifier(
+        "invite subtree root violates the M1 handle grammar or is reserved"));
+  }
+  return list_invite_subtree_impl(transaction, root_handle);
+}
+
+} // namespace anvil::store

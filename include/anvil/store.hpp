@@ -118,6 +118,41 @@ struct InviteClaim {
   [[nodiscard]] auto operator==(const InviteClaim &) const -> bool = default;
 };
 
+struct InviteIssue {
+  std::string code_hash;
+  std::string inviter_handle;
+  UtcEpochSeconds created_at;
+  UtcEpochSeconds expires_at;
+  std::uint32_t balance_cap{5};
+  std::uint32_t regeneration_seconds{2'592'000};
+
+  [[nodiscard]] auto operator==(const InviteIssue &) const -> bool = default;
+};
+
+struct InviteIssueResult {
+  std::uint32_t remaining_balance{};
+  std::optional<UtcEpochSeconds> next_regeneration;
+
+  [[nodiscard]] auto operator==(const InviteIssueResult &) const
+      -> bool = default;
+};
+
+struct InviteUser {
+  std::string handle;
+  std::optional<std::string> origin;
+  UserStatus status{UserStatus::pending};
+
+  [[nodiscard]] auto operator==(const InviteUser &) const -> bool = default;
+};
+
+struct InviteDescendant {
+  InviteUser user;
+  std::uint32_t depth{};
+
+  [[nodiscard]] auto operator==(const InviteDescendant &) const
+      -> bool = default;
+};
+
 struct MessageRecord {
   std::string message_id;
   std::string board_id;
@@ -140,7 +175,7 @@ class TransactionBackend;
 // every active transaction. Transactions are move-only and roll back on
 // destruction unless a commit or explicit rollback completed them.
 class Transaction final {
- public:
+public:
   ~Transaction() noexcept;
 
   Transaction(const Transaction &) = delete;
@@ -153,7 +188,7 @@ class Transaction final {
   [[nodiscard]] auto active() const noexcept -> bool;
   [[nodiscard]] auto mode() const noexcept -> TransactionMode;
 
- private:
+private:
   friend class Store;
 
   Transaction(const Store *owner, TransactionMode mode,
@@ -167,7 +202,7 @@ class Transaction final {
 // Implementations keep backend-flavoured transaction state behind this seam.
 // rollback() is noexcept because Transaction invokes it during stack unwinding.
 class TransactionBackend {
- public:
+public:
   virtual ~TransactionBackend() noexcept;
 
   [[nodiscard]] virtual auto commit() -> std::expected<void, Error> = 0;
@@ -175,7 +210,7 @@ class TransactionBackend {
 };
 
 class Store {
- public:
+public:
   virtual ~Store() noexcept;
 
   [[nodiscard]] virtual auto begin(TransactionMode mode)
@@ -227,7 +262,23 @@ class Store {
                                   const InviteClaim &claim)
       -> std::expected<void, Error>;
 
- protected:
+  // Issuance consumes and regenerates invite balance atomically. Only the
+  // SHA-256 digest crosses this boundary; callers retain the raw bearer code
+  // just long enough to display it once.
+  [[nodiscard]] auto issue_invite(Transaction &transaction,
+                                  const InviteIssue &issue)
+      -> std::expected<InviteIssueResult, Error>;
+
+  // These moderation-facing reads retain tombstoned identities. The subtree
+  // excludes its root and is ordered by depth, handle, then origin.
+  [[nodiscard]] auto find_inviter(Transaction &transaction,
+                                  std::string_view invitee_handle)
+      -> std::expected<std::optional<InviteUser>, Error>;
+  [[nodiscard]] auto list_invite_subtree(Transaction &transaction,
+                                         std::string_view root_handle)
+      -> std::expected<std::vector<InviteDescendant>, Error>;
+
+protected:
   // Store implementations use this factory so null backends fail as data,
   // rather than producing an apparently active transaction that later crashes.
   [[nodiscard]] auto
@@ -270,6 +321,16 @@ class Store {
   [[nodiscard]] virtual auto claim_invite_impl(Transaction &transaction,
                                                const InviteClaim &claim)
       -> std::expected<void, Error> = 0;
+  [[nodiscard]] virtual auto issue_invite_impl(Transaction &transaction,
+                                               const InviteIssue &issue)
+      -> std::expected<InviteIssueResult, Error> = 0;
+  [[nodiscard]] virtual auto find_inviter_impl(Transaction &transaction,
+                                               std::string_view invitee_handle)
+      -> std::expected<std::optional<InviteUser>, Error> = 0;
+  [[nodiscard]] virtual auto
+  list_invite_subtree_impl(Transaction &transaction,
+                           std::string_view root_handle)
+      -> std::expected<std::vector<InviteDescendant>, Error> = 0;
 };
 
-}  // namespace anvil::store
+} // namespace anvil::store

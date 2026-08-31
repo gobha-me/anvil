@@ -17,6 +17,7 @@ class Store;
 namespace anvil::server {
 
 struct SessionIdentity;
+struct InvitePolicy;
 enum class RegistrationMode : std::uint8_t;
 
 struct TerminalDimensions {
@@ -73,12 +74,13 @@ normalize_resize_dimensions(int columns, int rows, int pixel_width,
 [[nodiscard]] std::string normalize_terminal_type(RemoteBytes terminal_type);
 
 class TerminalSession {
- public:
+public:
   TerminalSession(int io_descriptor, std::string terminal_type,
                   TerminalDimensions dimensions,
                   std::chrono::steady_clock::time_point channel_opened,
                   SessionResourceLimits resource_limits,
-                  RegistrationMode registration_mode, SessionIdentity identity,
+                  RegistrationMode registration_mode,
+                  const InvitePolicy &invite_policy, SessionIdentity identity,
                   store::Store &identity_store,
                   SessionInputHook input_hook_for_testing = nullptr);
   ~TerminalSession();
@@ -101,9 +103,9 @@ class TerminalSession {
   [[nodiscard]] SessionCpuProgress cpu_progress() const noexcept;
   [[nodiscard]] SessionTelemetry telemetry() const noexcept;
 
- private:
+private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace anvil::server
+} // namespace anvil::server

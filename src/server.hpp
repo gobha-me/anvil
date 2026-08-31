@@ -24,6 +24,16 @@ struct RateLimit {
 enum class Operation : std::uint8_t { serve, backup_once, restore };
 enum class RegistrationMode : std::uint8_t { open, invite, closed };
 
+struct InvitePolicy {
+  std::uint32_t per_user{5};
+  std::chrono::seconds regeneration{2'592'000};
+  std::chrono::seconds expiration{604'800};
+  bool notify_inviters_on_moderation{};
+
+  [[nodiscard]] auto operator==(const InvitePolicy &) const noexcept
+      -> bool = default;
+};
+
 struct Config {
   Operation operation{Operation::serve};
   std::string bind_address{"127.0.0.1"};
@@ -32,6 +42,7 @@ struct Config {
   std::uint16_t health_port{8080};
   std::string database_path{"anvil.db"};
   RegistrationMode registration_mode{RegistrationMode::open};
+  InvitePolicy invite_policy;
   std::string backup_directory;
   std::chrono::seconds backup_interval{86'400};
   std::chrono::seconds backup_retention{604'800};
@@ -46,7 +57,8 @@ struct Config {
   std::chrono::seconds idle_warning{30};
   std::chrono::seconds session_cap{86'400};
   SessionResourceLimits session_resources;
-  void (*session_input_hook_for_testing)(std::string_view, SessionResources &){};
+  void (*session_input_hook_for_testing)(std::string_view,
+                                         SessionResources &){};
   std::string host_key_path;
   std::vector<AuthorizedKeySpec> authorized_keys;
 };
@@ -56,8 +68,9 @@ struct ParseResult {
   bool show_help{};
 };
 
-[[nodiscard]] ParseResult parse_arguments(std::span<const std::string_view> arguments);
+[[nodiscard]] ParseResult
+parse_arguments(std::span<const std::string_view> arguments);
 [[nodiscard]] std::string_view usage() noexcept;
-int run(const Config& config);
+int run(const Config &config);
 
-}  // namespace anvil::server
+} // namespace anvil::server
