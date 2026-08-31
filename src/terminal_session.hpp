@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "remote_bytes.hpp"
+#include "session_resources.hpp"
 
 namespace anvil::server {
 
@@ -41,9 +42,18 @@ enum class SessionFailureReason {
   app_returned_failure,
   standard_exception,
   unknown_exception,
+  memory_limit,
+  output_limit,
+  image_limit,
 };
 
-using SessionInputHook = void (*)(std::string_view);
+struct SessionCpuProgress {
+  bool ready{};
+  std::uint64_t generation{};
+  std::chrono::nanoseconds consumed{};
+};
+
+using SessionInputHook = void (*)(std::string_view, SessionResources &);
 
 [[nodiscard]] TerminalDimensions normalize_initial_dimensions(int columns, int rows,
                                                               int pixel_width,
@@ -56,6 +66,7 @@ class TerminalSession {
  public:
   TerminalSession(int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
                   std::chrono::steady_clock::time_point channel_opened,
+                  SessionResourceLimits resource_limits,
                   SessionInputHook input_hook_for_testing = nullptr);
   ~TerminalSession();
 
@@ -73,6 +84,8 @@ class TerminalSession {
   [[nodiscard]] bool finished() const noexcept;
   [[nodiscard]] bool failed() const noexcept;
   [[nodiscard]] SessionFailureReason failure_reason() const noexcept;
+  [[nodiscard]] ResourceLimitReason limit_reason() const noexcept;
+  [[nodiscard]] SessionCpuProgress cpu_progress() const noexcept;
   [[nodiscard]] SessionTelemetry telemetry() const noexcept;
 
  private:

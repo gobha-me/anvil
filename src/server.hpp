@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include "session_resources.hpp"
+
 namespace anvil::server {
 
 struct AuthorizedKeySpec {
@@ -41,7 +43,8 @@ struct Config {
   std::chrono::seconds idle_timeout{300};
   std::chrono::seconds idle_warning{30};
   std::chrono::seconds session_cap{86'400};
-  void (*session_input_hook_for_testing)(std::string_view){};
+  SessionResourceLimits session_resources;
+  void (*session_input_hook_for_testing)(std::string_view, SessionResources &){};
   std::string host_key_path;
   std::vector<AuthorizedKeySpec> authorized_keys;
 };

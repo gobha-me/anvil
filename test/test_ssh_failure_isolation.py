@@ -16,6 +16,12 @@ from test_ssh_server import reserve_port, run_checked, ssh_command, wait_until_l
 
 
 FAILURE_MARKER = b"anvil-test-throw"
+RESOURCE_CASES = {
+    b"anvil-test-memory": (b"exceeded its memory limit", "memory"),
+    b"anvil-test-cpu": (b"exceeded its CPU time slice", "cpu"),
+    b"anvil-test-output": (b"exceeded its output limit", "output"),
+    b"anvil-test-image": (b"exceeded its terminal image quota", "image"),
+}
 
 
 def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
@@ -170,6 +176,34 @@ def exercise_signal(supervisor: subprocess.Popen[bytes], port: int,
             stop_session(replacement)
 
 
+def exercise_resource(supervisor: subprocess.Popen[bytes], port: int,
+                      client_key: pathlib.Path, marker: bytes,
+                      expected: bytes) -> int:
+    failing, failing_pid = open_session(port, client_key)
+    survivor, _ = open_session(port, client_key)
+    replacement: subprocess.Popen[bytes] | None = None
+    try:
+        send(failing, marker)
+        output = read_until(failing, expected, 8)
+        failing.wait(timeout=3)
+        assert failing.returncode != 0, (failing.returncode, output)
+
+        send(survivor, b"resource-survivor")
+        read_until(survivor, b"resource-survivor")
+        assert supervisor.poll() is None
+
+        wait_for_worker_gone(supervisor, failing_pid)
+        replacement, _ = open_session(port, client_key)
+        send(replacement, b"resource-replacement")
+        read_until(replacement, b"resource-replacement")
+        return failing_pid
+    finally:
+        stop_session(failing)
+        stop_session(survivor)
+        if replacement is not None:
+            stop_session(replacement)
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_ssh_failure_isolation.py TEST_SERVER_EXECUTABLE")
@@ -192,6 +226,10 @@ def main() -> int:
         try:
             exception_pid = exercise_exception(supervisor, port, client_key)
             signal_pid = exercise_signal(supervisor, port, client_key, fatal_signal)
+            resource_pids = {
+                name: exercise_resource(supervisor, port, client_key, marker, expected)
+                for marker, (expected, name) in RESOURCE_CASES.items()
+            }
         finally:
             if supervisor.poll() is None:
                 supervisor.send_signal(signal.SIGTERM)
@@ -203,6 +241,8 @@ def main() -> int:
                 raise AssertionError(
                     f"supervisor did not shut down; stdout={stdout!r}; stderr={stderr!r}"
                 )
+            if sys.exc_info()[0] is not None:
+                print(stderr.decode(errors="replace"), file=sys.stderr)
 
         assert supervisor.returncode == 0, (supervisor.returncode, stdout, stderr)
         assert (
@@ -212,6 +252,10 @@ def main() -> int:
         assert (
             f"anvil: session worker {signal_pid} terminated by signal {fatal_signal}"
         ).encode() in stderr, stderr
+        for name, worker in resource_pids.items():
+            assert (
+                f"anvil: session {worker} exceeded its {name} limit"
+            ).encode() in stderr, stderr
     return 0
 
 

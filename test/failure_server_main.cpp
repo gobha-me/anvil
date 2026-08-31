@@ -1,5 +1,6 @@
 #include "server.hpp"
 
+#include <atomic>
 #include <exception>
 #include <iostream>
 #include <stdexcept>
@@ -9,10 +10,35 @@
 namespace {
 
 constexpr std::string_view failure_marker{"anvil-test-throw"};
+constexpr std::string_view memory_marker{"anvil-test-memory"};
+constexpr std::string_view cpu_marker{"anvil-test-cpu"};
+constexpr std::string_view output_marker{"anvil-test-output"};
+constexpr std::string_view image_marker{"anvil-test-image"};
 
-void inject_failure(std::string_view input) {
+void inject_failure(std::string_view input, anvil::server::SessionResources &resources) {
   if (input == failure_marker) {
     throw std::runtime_error("injected terminal session failure");
+  }
+  if (input == memory_marker &&
+      !resources.reserve_memory(resources.limits().memory_bytes + 1U)) {
+    throw anvil::server::ResourceLimitError(anvil::server::ResourceLimitReason::memory);
+  }
+  if (input == output_marker) {
+    const auto result = resources.output_delay(
+        static_cast<std::size_t>(resources.limits().output_bytes_per_second + 1U),
+        anvil::server::SessionResources::Clock::now());
+    if (!result) {
+      throw anvil::server::ResourceLimitError(result.error());
+    }
+  }
+  if (input == image_marker &&
+      !resources.reserve_image(resources.limits().image_bytes + 1U)) {
+    throw anvil::server::ResourceLimitError(anvil::server::ResourceLimitReason::image);
+  }
+  if (input == cpu_marker) {
+    for (;;) {
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
   }
 }
 

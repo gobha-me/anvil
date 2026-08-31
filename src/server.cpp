@@ -730,7 +730,31 @@ void await_peer_channel_close(ssh_event event, ssh_session session, SessionState
   }
 }
 
-enum class SessionEnd { normal, idle_timeout, session_cap, shutdown };
+enum class SessionEnd { normal, idle_timeout, resource_limit, shutdown };
+
+class CpuProgressWatchdog {
+ public:
+  explicit CpuProgressWatchdog(std::chrono::nanoseconds burst) : burst_(burst) {}
+
+  [[nodiscard]] bool exceeded(SessionCpuProgress progress) noexcept {
+    if (!progress.ready) {
+      return false;
+    }
+    if (!ready_ || progress.generation != generation_ || progress.consumed < baseline_) {
+      ready_ = true;
+      generation_ = progress.generation;
+      baseline_ = progress.consumed;
+      return false;
+    }
+    return progress.consumed - baseline_ > burst_;
+  }
+
+ private:
+  std::chrono::nanoseconds burst_;
+  std::chrono::nanoseconds baseline_{};
+  std::uint64_t generation_{};
+  bool ready_{};
+};
 
 [[nodiscard]] std::string_view failure_reason_name(SessionFailureReason reason) noexcept {
   switch (reason) {
@@ -742,6 +766,12 @@ enum class SessionEnd { normal, idle_timeout, session_cap, shutdown };
       return "standard exception escaped terminal session";
     case SessionFailureReason::unknown_exception:
       return "unknown exception escaped terminal session";
+    case SessionFailureReason::memory_limit:
+      return "session memory limit exceeded";
+    case SessionFailureReason::output_limit:
+      return "session output limit exceeded";
+    case SessionFailureReason::image_limit:
+      return "session terminal image quota exceeded";
   }
   return "unknown terminal session failure";
 }
@@ -802,9 +832,13 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
   FileDescriptor application_descriptor;
   FileDescriptor server_descriptor;
   std::unique_ptr<TerminalSession> terminal_session;
+  std::optional<WorkerMemoryGuard> memory_guard;
+  CpuProgressWatchdog cpu_watchdog(config.session_resources.cpu_burst);
   std::vector<std::byte> session_output_buffer(16U * 1024U);
   SessionTelemetry reported_telemetry;
   auto session_end = SessionEnd::normal;
+  auto resource_limit = ResourceLimitReason::none;
+  bool force_worker_exit = false;
 
   while (ssh_is_connected(session) != 0 && !state.close_requested) {
     if (ssh_event_dopoll(event.get(), terminal_session ? 10 : 100) == SSH_ERROR) {
@@ -821,7 +855,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     }
     if (state.authenticated) {
       if (now - state.authenticated_at >= config.session_cap) {
-        session_end = SessionEnd::session_cap;
+        session_end = SessionEnd::resource_limit;
+        resource_limit = ResourceLimitReason::duration;
         break;
       }
       if (now - state.last_activity >= config.idle_timeout) {
@@ -879,8 +914,18 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
                                             state.pixel_height};
         terminal_session = std::make_unique<TerminalSession>(
             application_descriptor.get(), state.terminal_type, dimensions, state.channel_opened_at,
-            config.session_input_hook_for_testing);
+            config.session_resources, config.session_input_hook_for_testing);
         state.terminal_session = terminal_session.get();
+        auto armed = WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
+        if (!armed) {
+          std::cerr << "anvil: cannot arm session memory limit: " << armed.error() << '\n';
+          session_end = SessionEnd::resource_limit;
+          resource_limit = ResourceLimitReason::memory;
+          terminal_session.reset();
+          state.terminal_session = nullptr;
+          break;
+        }
+        memory_guard.emplace(std::move(*armed));
         terminal_session->start();
       } catch (const std::exception &error) {
         std::cerr << "anvil: cannot start terminal session: " << error.what() << '\n';
@@ -894,6 +939,22 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     }
 
     if (terminal_session) {
+      if (memory_guard && memory_guard->exceeded()) {
+        memory_guard->release_emergency_reserve();
+        session_end = SessionEnd::resource_limit;
+        resource_limit = ResourceLimitReason::memory;
+        force_worker_exit = true;
+        break;
+      }
+      if (cpu_watchdog.exceeded(terminal_session->cpu_progress())) {
+        if (memory_guard) {
+          memory_guard->release_emergency_reserve();
+        }
+        session_end = SessionEnd::resource_limit;
+        resource_limit = ResourceLimitReason::cpu;
+        force_worker_exit = true;
+        break;
+      }
       if (!forward_session_input(server_descriptor.get(), state.pending_input)) {
         application_failed = true;
         break;
@@ -904,6 +965,11 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
       }
       if (terminal_session->finished()) {
         application_failed = terminal_session->failed();
+        if (const auto limit = terminal_session->limit_reason();
+            limit != ResourceLimitReason::none) {
+          session_end = SessionEnd::resource_limit;
+          resource_limit = limit;
+        }
         break;
       }
       const auto telemetry = terminal_session->telemetry();
@@ -937,6 +1003,25 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     if (ssh_channel_is_open(state.channel) == 0) {
       break;
     }
+  }
+
+  if (force_worker_exit) {
+    const auto telemetry = terminal_session ? terminal_session->telemetry() : SessionTelemetry{};
+    report_telemetry(worker_report_descriptor, session_id, telemetry);
+    std::cerr << "anvil: session " << ::getpid() << " exceeded its "
+              << resource_limit_name(resource_limit) << " limit\n";
+    if (state.channel != nullptr && ssh_channel_is_open(state.channel) != 0) {
+      const auto message = resource_limit_message(resource_limit);
+      static_cast<void>(write_channel(state.channel, message.data(), message.size()));
+      static_cast<void>(ssh_blocking_flush(session, 500));
+      close_channel(state.channel, 124);
+      await_peer_channel_close(event.get(), session, state);
+    }
+    std::_Exit(124);
+  }
+
+  if (session_end == SessionEnd::resource_limit && memory_guard) {
+    memory_guard->release_emergency_reserve();
   }
 
   if (terminal_session) {
@@ -973,6 +1058,11 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
               << " first-frame-ms=" << telemetry.first_frame_latency.count() << '\n';
   }
 
+  if (session_end == SessionEnd::resource_limit) {
+    std::cerr << "anvil: session " << ::getpid() << " exceeded its "
+              << resource_limit_name(resource_limit) << " limit\n";
+  }
+
   if (state.channel != nullptr && ssh_channel_is_open(state.channel) != 0) {
     std::string_view message;
     int status = 0;
@@ -981,8 +1071,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
         message = "Anvil: session closed after the idle timeout.\r\n";
         status = 124;
         break;
-      case SessionEnd::session_cap:
-        message = "Anvil: maximum session duration reached; closing.\r\n";
+      case SessionEnd::resource_limit:
+        message = resource_limit_message(resource_limit);
         status = 124;
         break;
       case SessionEnd::shutdown:
@@ -1240,6 +1330,31 @@ void await_children(ChildMap &children, int signal_descriptor, int worker_report
   return parse_bounded_count(text, "session limit", 4096);
 }
 
+[[nodiscard]] std::uint64_t parse_bounded_bytes(std::string_view text,
+                                                std::string_view name,
+                                                std::uint64_t maximum) {
+  if (text.empty()) {
+    throw std::runtime_error(std::string(name) + " must not be empty");
+  }
+  std::uint64_t value = 0U;
+  for (const char character : text) {
+    if (character < '0' || character > '9') {
+      throw std::runtime_error(std::string(name) + " must be a decimal byte count");
+    }
+    const auto digit = static_cast<std::uint64_t>(character - '0');
+    if (value > (maximum - digit) / 10U) {
+      throw std::runtime_error(std::string(name) + " must be between 1 and " +
+                               std::to_string(maximum));
+    }
+    value = value * 10U + digit;
+  }
+  if (value == 0U) {
+    throw std::runtime_error(std::string(name) + " must be between 1 and " +
+                             std::to_string(maximum));
+  }
+  return value;
+}
+
 [[nodiscard]] std::chrono::seconds parse_duration(std::string_view text, std::string_view name);
 
 [[nodiscard]] RateLimit parse_rate_limit(std::string_view text, std::string_view name) {
@@ -1311,6 +1426,14 @@ std::string_view usage() noexcept {
          "                          warning lead time in seconds (default 30)\n"
          "  --session-cap-seconds S absolute session limit in seconds (default "
          "86400)\n"
+         "  --session-memory-bytes B\n"
+         "                          allocation headroom per worker (default 67108864)\n"
+         "  --session-cpu-burst-ms M\n"
+         "                          uninterrupted CPU burst (default 50)\n"
+         "  --session-output-bytes-per-second B\n"
+         "                          output rate and one-second burst (default 1000000)\n"
+         "  --session-image-bytes B\n"
+         "                          resident image payload quota (default 33554432)\n"
          "  --host-key PATH         unencrypted OpenSSH private host key\n"
          "  --authorized-key U=P    authorize public key file P for user U; "
          "repeatable\n"
@@ -1343,7 +1466,11 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
         argument != "--max-tracked-ips" &&
         argument != "--idle-timeout-seconds" &&
         argument != "--idle-warning-seconds" &&
-        argument != "--session-cap-seconds" && argument != "--host-key" &&
+        argument != "--session-cap-seconds" &&
+        argument != "--session-memory-bytes" &&
+        argument != "--session-cpu-burst-ms" &&
+        argument != "--session-output-bytes-per-second" &&
+        argument != "--session-image-bytes" && argument != "--host-key" &&
         argument != "--authorized-key") {
       throw std::runtime_error("unknown option: " + std::string(argument));
     }
@@ -1408,6 +1535,19 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       result.config.idle_warning = parse_duration(value, "idle warning");
     } else if (argument == "--session-cap-seconds") {
       result.config.session_cap = parse_duration(value, "session cap");
+    } else if (argument == "--session-memory-bytes") {
+      result.config.session_resources.memory_bytes =
+          parse_bounded_bytes(value, "session memory limit", 1ULL << 40U);
+    } else if (argument == "--session-cpu-burst-ms") {
+      const auto milliseconds =
+          parse_bounded_count(value, "session CPU burst", 60'000U);
+      result.config.session_resources.cpu_burst = std::chrono::milliseconds(milliseconds);
+    } else if (argument == "--session-output-bytes-per-second") {
+      result.config.session_resources.output_bytes_per_second =
+          parse_bounded_bytes(value, "session output rate", 1'000'000'000U);
+    } else if (argument == "--session-image-bytes") {
+      result.config.session_resources.image_bytes =
+          parse_bounded_bytes(value, "session image quota", 1ULL << 40U);
     } else if (argument == "--host-key") {
       result.config.host_key_path = value;
       host_key_explicit = true;

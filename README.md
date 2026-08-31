@@ -105,6 +105,10 @@ install -d -m 700 state
   --idle-timeout-seconds 300 \
   --idle-warning-seconds 30 \
   --session-cap-seconds 86400 \
+  --session-memory-bytes 67108864 \
+  --session-cpu-burst-ms 50 \
+  --session-output-bytes-per-second 1000000 \
+  --session-image-bytes 33554432 \
   --database state/anvil.db \
   --backup-directory state/backups \
   --backup-interval-seconds 86400 \
@@ -150,6 +154,17 @@ count as activity. A separate 24-hour cap applies even to active sessions.
 Operators can set all three positive durations in whole seconds with
 `--idle-timeout-seconds`, `--idle-warning-seconds`, and
 `--session-cap-seconds`; the warning must remain shorter than the idle timeout.
+Each worker also receives 64 MiB of address-space headroom, a 50 ms maximum
+uninterrupted application CPU burst, a 1,000,000-byte-per-second output bucket
+with a one-second burst, and a 32 MiB resident terminal-image source-payload
+quota. Operators can set positive values with `--session-memory-bytes`,
+`--session-cpu-burst-ms`, `--session-output-bytes-per-second`, and
+`--session-image-bytes`. Output is delayed to the configured rate; a single
+frame larger than its one-second burst is rejected. Anvil-mediated image
+uploads must reserve their source payload before transmission and the renderer
+reconciles that reservation against the driver's per-session residency counter.
+Exceeding any cap closes only that connection with a specific message and is
+logged with the resource class.
 Each completed shell logs its rendered-frame count, accepted frames, byte
 breakdown, and channel-open-to-first-frame latency. These are the internal M0
 measurements exposed by the private metrics endpoint.
@@ -159,8 +174,12 @@ architecture. An exception escaping the terminal application closes only that
 session with a generic apology, while the worker logs a fixed failure class and
 its process id. A fatal signal likewise terminates only its worker; the
 supervisor reaps it, releases its admission slot, and continues serving other
-and new sessions. A future transition to pooled in-process sessions must prove
-this isolation contract again before replacing the worker boundary.
+and new sessions. The worker process is also the hard boundary for the memory
+ceiling and for terminating an application that exceeds its uninterrupted CPU
+slice. These controls contain accidental failures in cooperative code; they are
+not a sandbox for a malicious in-process plugin. A future transition to pooled
+in-process sessions must prove this isolation contract again before replacing
+the worker boundary.
 
 ## Private health and metrics
 

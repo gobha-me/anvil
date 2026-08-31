@@ -1,5 +1,6 @@
 #include <array>
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <stdexcept>
 #include <string_view>
 
@@ -41,6 +42,14 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"45"},
       std::string_view{"--session-cap-seconds"},
       std::string_view{"7200"},
+      std::string_view{"--session-memory-bytes"},
+      std::string_view{"134217728"},
+      std::string_view{"--session-cpu-burst-ms"},
+      std::string_view{"75"},
+      std::string_view{"--session-output-bytes-per-second"},
+      std::string_view{"2000000"},
+      std::string_view{"--session-image-bytes"},
+      std::string_view{"67108864"},
       std::string_view{"--host-key"},
       std::string_view{"host_key"},
       std::string_view{"--authorized-key"},
@@ -68,6 +77,10 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.idle_timeout.count() == 600);
   CHECK(parsed.config.idle_warning.count() == 45);
   CHECK(parsed.config.session_cap.count() == 7200);
+  CHECK(parsed.config.session_resources.memory_bytes == 134'217'728U);
+  CHECK(parsed.config.session_resources.cpu_burst == std::chrono::milliseconds(75));
+  CHECK(parsed.config.session_resources.output_bytes_per_second == 2'000'000U);
+  CHECK(parsed.config.session_resources.image_bytes == 67'108'864U);
   REQUIRE(parsed.config.authorized_keys.size() == 2);
   CHECK(parsed.config.authorized_keys[0].user == "alice");
   CHECK(parsed.config.authorized_keys[0].path == "alice.pub");
@@ -109,6 +122,14 @@ TEST_CASE("server CLI rejects malformed hostile values") {
   CHECK_THROWS_AS(parse("--idle-timeout-seconds", "4294967296"), std::runtime_error);
   CHECK_THROWS_AS(parse("--idle-warning-seconds", "0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--session-cap-seconds", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-memory-bytes", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-memory-bytes", "1099511627777"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-cpu-burst-ms", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-cpu-burst-ms", "60001"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-output-bytes-per-second", "0"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-output-bytes-per-second", "1000000001"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--session-image-bytes", "1x"), std::runtime_error);
   CHECK_THROWS_AS(parse("--authorized-key", "=key.pub"), std::runtime_error);
   CHECK_THROWS_AS(parse("--authorized-key", "user="), std::runtime_error);
   CHECK_THROWS_AS(parse("--unknown", "value"), std::runtime_error);
@@ -125,6 +146,10 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.idle_timeout.count() == 300);
   CHECK(parsed.config.idle_warning.count() == 30);
   CHECK(parsed.config.session_cap.count() == 86'400);
+  CHECK(parsed.config.session_resources.memory_bytes == (64U << 20U));
+  CHECK(parsed.config.session_resources.cpu_burst == std::chrono::milliseconds(50));
+  CHECK(parsed.config.session_resources.output_bytes_per_second == 1'000'000U);
+  CHECK(parsed.config.session_resources.image_bytes == (32U << 20U));
   CHECK(parsed.config.max_sessions == 64);
   CHECK(parsed.config.health_bind_address == "127.0.0.1");
   CHECK(parsed.config.health_port == 8080);
