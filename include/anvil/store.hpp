@@ -110,6 +110,14 @@ struct LocalCredentialProvision {
       -> bool = default;
 };
 
+struct InviteClaim {
+  std::string code_hash;
+  std::string claimed_by_handle;
+  UtcEpochSeconds claimed_at;
+
+  [[nodiscard]] auto operator==(const InviteClaim &) const -> bool = default;
+};
+
 struct MessageRecord {
   std::string message_id;
   std::string board_id;
@@ -212,6 +220,13 @@ class Store {
                              const LocalCredentialProvision &provision)
       -> std::expected<void, Error>;
 
+  // Invite redemption participates in the caller's write transaction so a
+  // pending account and its single-use invite become visible together. The
+  // raw bearer code never reaches the storage boundary.
+  [[nodiscard]] auto claim_invite(Transaction &transaction,
+                                  const InviteClaim &claim)
+      -> std::expected<void, Error>;
+
  protected:
   // Store implementations use this factory so null backends fail as data,
   // rather than producing an apparently active transaction that later crashes.
@@ -251,6 +266,9 @@ class Store {
   [[nodiscard]] virtual auto
   provision_local_credential_impl(Transaction &transaction,
                                   const LocalCredentialProvision &provision)
+      -> std::expected<void, Error> = 0;
+  [[nodiscard]] virtual auto claim_invite_impl(Transaction &transaction,
+                                               const InviteClaim &claim)
       -> std::expected<void, Error> = 0;
 };
 

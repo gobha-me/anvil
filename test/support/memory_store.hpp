@@ -98,6 +98,31 @@ class MemoryStore final : public store::Store {
     }
   }
 
+  void seed_invite(std::string code_hash, bool active = true) {
+    const auto existing =
+        std::ranges::find(state_->invites, code_hash, &InviteEntry::code_hash);
+    if (existing == state_->invites.end()) {
+      state_->invites.push_back({.code_hash = std::move(code_hash),
+                                 .claimed_by_handle = {},
+                                 .claimed_at = std::nullopt,
+                                 .active = active});
+    } else {
+      existing->active = active;
+      existing->claimed_by_handle.clear();
+      existing->claimed_at.reset();
+    }
+  }
+
+  [[nodiscard]] auto invite_claimant(std::string_view code_hash) const
+      -> std::optional<std::string> {
+    const auto invite =
+        std::ranges::find(state_->invites, code_hash, &InviteEntry::code_hash);
+    if (invite == state_->invites.end() || invite->claimed_by_handle.empty()) {
+      return std::nullopt;
+    }
+    return invite->claimed_by_handle;
+  }
+
   [[nodiscard]] auto content_status(const store::ContentRef &content) const
       -> std::optional<store::ContentStatus> {
     return status_of(state_->contents, content);
@@ -129,6 +154,13 @@ class MemoryStore final : public store::Store {
     store::UserStatus status{store::UserStatus::pending};
   };
 
+  struct InviteEntry {
+    std::string code_hash;
+    std::string claimed_by_handle;
+    std::optional<store::UtcEpochSeconds> claimed_at;
+    bool active{true};
+  };
+
   struct State {
     std::vector<TransactionObservation> observations;
     std::optional<store::Error> next_commit_error;
@@ -136,6 +168,7 @@ class MemoryStore final : public store::Store {
     std::vector<store::MessageRecord> messages;
     std::vector<UserEntry> users;
     std::vector<store::CredentialRecord> credentials;
+    std::vector<InviteEntry> invites;
   };
 
   static void upsert_content(std::vector<ContentEntry> &contents,
@@ -174,7 +207,8 @@ class MemoryStore final : public store::Store {
             store::TransactionMode mode)
         : state_(std::move(state)), index_(index), mode_(mode),
           contents_(state_->contents), messages_(state_->messages),
-          users_(state_->users), credentials_(state_->credentials) {}
+          users_(state_->users), credentials_(state_->credentials),
+          invites_(state_->invites) {}
 
     [[nodiscard]] auto commit() -> std::expected<void, store::Error> override {
       ++state_->observations.at(index_).commit_attempts;
@@ -188,6 +222,7 @@ class MemoryStore final : public store::Store {
         state_->messages = messages_;
         state_->users = users_;
         state_->credentials = credentials_;
+        state_->invites = invites_;
       }
       return {};
     }
@@ -219,6 +254,10 @@ class MemoryStore final : public store::Store {
       return credentials_;
     }
 
+    [[nodiscard]] auto invites() noexcept -> std::vector<InviteEntry> & {
+      return invites_;
+    }
+
    private:
     std::shared_ptr<State> state_;
     std::size_t index_;
@@ -227,6 +266,7 @@ class MemoryStore final : public store::Store {
     std::vector<store::MessageRecord> messages_;
     std::vector<UserEntry> users_;
     std::vector<store::CredentialRecord> credentials_;
+    std::vector<InviteEntry> invites_;
   };
 
   [[nodiscard]] auto backend(store::Transaction &transaction) const noexcept
@@ -381,6 +421,36 @@ class MemoryStore final : public store::Store {
                             : store::CredentialStatus::pending;
     credentials.push_back({provision.handle, provision.fingerprint,
                            provision.public_key, status});
+    return {};
+  }
+
+  [[nodiscard]] auto claim_invite_impl(store::Transaction &transaction,
+                                       const store::InviteClaim &claim)
+      -> std::expected<void, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto user = std::ranges::find(
+        active->users(), claim.claimed_by_handle, &UserEntry::handle);
+    if (user == active->users().end() ||
+        user->status != store::UserStatus::pending) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "invite claimant is not pending"});
+    }
+    auto &invites = active->invites();
+    const auto invite =
+        std::ranges::find(invites, claim.code_hash, &InviteEntry::code_hash);
+    if (invite == invites.end() || !invite->active ||
+        !invite->claimed_by_handle.empty() || invite->claimed_at.has_value()) {
+      return std::unexpected(
+          store::Error{store::ErrorCode::conflict,
+                       "invite is invalid or no longer available"});
+    }
+    invite->active = false;
+    invite->claimed_by_handle = claim.claimed_by_handle;
+    invite->claimed_at = claim.claimed_at;
     return {};
   }
 

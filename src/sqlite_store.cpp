@@ -1148,6 +1148,56 @@ auto SqliteStore::provision_local_credential_impl(
   return {};
 }
 
+auto SqliteStore::claim_invite_impl(Transaction &transaction,
+                                    const InviteClaim &claim)
+    -> std::expected<void, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+
+  constexpr std::string_view sql =
+      "UPDATE invites SET claimed_by_handle=?2,claimed_by_origin=NULL,"
+      "status='claimed',claimed_at=?3 WHERE code_hash=?1 AND status='active' "
+      "AND claimed_by_handle IS NULL AND claimed_by_origin IS NULL AND "
+      "claimed_at IS NULL AND EXISTS(SELECT 1 FROM users WHERE handle=?2 "
+      "AND origin IS NULL AND status='pending')";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare invite claim");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 1,
+                             claim.code_hash, "cannot bind invite code hash");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound =
+          bind_text(backend->database(), statement->get(), 2,
+                    claim.claimed_by_handle, "cannot bind invite claimant");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound =
+          bind_integer(backend->database(), statement->get(), 3,
+                       claim.claimed_at.value, "cannot bind invite claim time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto updated = sqlite3_step(statement->get());
+  if (updated != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(backend->database(), updated, "cannot claim invite"));
+  }
+  if (sqlite3_changes64(backend->database()) != 1) {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "invite is invalid or no longer available"});
+  }
+  return {};
+}
+
 auto SqliteStore::execute_for_testing(Transaction &transaction,
                                       std::string_view sql)
     -> std::expected<void, Error> {

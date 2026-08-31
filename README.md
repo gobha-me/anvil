@@ -114,6 +114,7 @@ install -d -m 700 state
   --session-output-bytes-per-second 1000000 \
   --session-image-bytes 33554432 \
   --database state/anvil.db \
+  --registration-mode open \
   --backup-directory state/backups \
   --backup-interval-seconds 86400 \
   --backup-retention-seconds 604800 \
@@ -140,10 +141,20 @@ private keys accessible by group or others.
 
 Connect anonymously with `ssh guest@HOST`. Guest sessions can see the board
 and door-menu shell but have no writable controls. Any signed key not yet in
-the database reaches handle selection under the temporary open-registration
-behavior; the key and chosen handle are stored as pending. Pending identities
-remain gated until versioned TOS acceptance lands in issue #40. There is no
-email or recovery address: losing every registered key loses the account.
+the database is governed by `--registration-mode`: `open` permits handle
+selection, `invite` requires a valid single-use invite before handle selection,
+and `closed` explains that the board is not accepting registrations while
+preserving guest browsing. The default is `open`, and mode changes affect only
+new registrations. The key and chosen handle are stored as pending; pending
+identities remain gated until versioned TOS acceptance lands in issue #40.
+There is no email or recovery address: losing every registered key loses the
+account.
+
+Invite codes are bounded opaque tokens. Anvil stores only their SHA-256 hashes
+and atomically claims a code with its pending account, so concurrent reuse has
+exactly one winner. Issue #39 adds user-facing invite issuance and economics;
+until then, invite mode consumes already-provisioned rows in the `invites`
+table.
 
 Send `SIGINT` or `SIGTERM`
 to stop accepting connections. Active shells receive a shutdown message and
@@ -253,7 +264,8 @@ ssh -p 2222 demo@127.0.0.1
 `CAP_NET_BIND_SERVICE`. The container-level backstops default to two CPUs,
 512 MiB of memory, 256 PIDs, and a 16 MiB tmpfs; override them with
 `ANVIL_CPU_LIMIT`, `ANVIL_MEMORY_LIMIT`, `ANVIL_PID_LIMIT`, and
-`ANVIL_TMPFS_LIMIT`.
+`ANVIL_TMPFS_LIMIT`. `ANVIL_REGISTRATION_MODE` selects `open`, `invite`, or
+`closed` and defaults to `open`.
 
 The default Docker bridge disables IP masquerading, so sessions and future
 plugins have no outbound Internet route while the published SSH port remains

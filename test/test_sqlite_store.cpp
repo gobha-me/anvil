@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 #include "sqlite_store.hpp"
 
@@ -243,6 +245,90 @@ TEST_CASE("SQLite revoked credentials never become unknown registrations") {
       (*store)->provision_local_credential(*attempt, conflicting);
   REQUIRE_FALSE(reprovision.has_value());
   CHECK(reprovision.error().code == ErrorCode::conflict);
+}
+
+TEST_CASE("SQLite serializes concurrent redemption of one invite") {
+  TemporaryDatabase database;
+  auto seed_store = SqliteStore::open(database.path());
+  REQUIRE(seed_store.has_value());
+  auto seed = (*seed_store)->begin(TransactionMode::read_write);
+  REQUIRE(seed.has_value());
+  REQUIRE((*seed_store)
+              ->execute_for_testing(
+                  *seed, "INSERT INTO users(handle,status,created_at) "
+                         "VALUES('operator','active',1);"
+                         "INSERT INTO invites(code_hash,inviter_handle,status,"
+                         "created_at) VALUES("
+                         "'fbaf7ba4264e2392988d8b5863e0a080bfe65b2a48d9b9f042f7"
+                         "cc7d4f711bb9',"
+                         "'operator','active',2)")
+              .has_value());
+  REQUIRE(seed->commit().has_value());
+  seed_store->reset();
+
+  auto first_store = SqliteStore::open(database.path());
+  auto second_store = SqliteStore::open(database.path());
+  REQUIRE(first_store.has_value());
+  REQUIRE(second_store.has_value());
+  std::barrier start(2);
+  std::atomic<int> successes{};
+  std::atomic<int> conflicts{};
+  const auto redeem = [&](SqliteStore &store, std::string handle,
+                          std::string fingerprint) {
+    start.arrive_and_wait();
+    auto transaction = store.begin(TransactionMode::read_write);
+    if (!transaction) {
+      return;
+    }
+    const LocalCredentialProvision pending{
+        .handle = handle,
+        .fingerprint = fingerprint,
+        .public_key = "ssh-ed25519 " + handle,
+        .created_at = {10},
+        .user_status = UserStatus::pending,
+    };
+    if (!store.provision_local_credential(*transaction, pending)) {
+      return;
+    }
+    const auto claimed = store.claim_invite(
+        *transaction, anvil::store::InviteClaim{
+                          .code_hash = "fbaf7ba4264e2392988d8b5863e0a080bfe65b2"
+                                       "a48d9b9f042f7cc7d4f711bb9",
+                          .claimed_by_handle = handle,
+                          .claimed_at = {11},
+                      });
+    if (!claimed) {
+      if (claimed.error().code == ErrorCode::conflict) {
+        ++conflicts;
+      }
+      return;
+    }
+    if (transaction->commit()) {
+      ++successes;
+    }
+  };
+
+  std::jthread first(redeem, std::ref(**first_store), "alice", "SHA256:alice");
+  std::jthread second(redeem, std::ref(**second_store), "bob", "SHA256:bob");
+  first.join();
+  second.join();
+  CHECK(successes == 1);
+  CHECK(conflicts == 1);
+
+  auto verify = (*first_store)->begin(TransactionMode::read_only);
+  REQUIRE(verify.has_value());
+  CHECK((*first_store)
+            ->scalar_for_testing(
+                *verify, "SELECT count(*) FROM users WHERE status='pending'") ==
+        1);
+  CHECK((*first_store)
+            ->scalar_for_testing(*verify, "SELECT count(*) FROM user_keys") ==
+        1);
+  CHECK((*first_store)
+            ->scalar_for_testing(
+                *verify,
+                "SELECT count(*) FROM invites WHERE status='claimed' AND "
+                "claimed_by_handle IS NOT NULL") == 1);
 }
 
 TEST_CASE("SQLite upgrades the claimed version-one database") {

@@ -35,6 +35,8 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"22023"},
       std::string_view{"--database"},
       std::string_view{"state/anvil.db"},
+      std::string_view{"--registration-mode"},
+      std::string_view{"invite"},
       std::string_view{"--max-sessions"},
       std::string_view{"12"},
       std::string_view{"--max-sessions-per-ip"},
@@ -77,6 +79,8 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.health_bind_address == "127.0.0.2");
   CHECK(parsed.config.health_port == 22023);
   CHECK(parsed.config.database_path == "state/anvil.db");
+  CHECK(parsed.config.registration_mode ==
+        anvil::server::RegistrationMode::invite);
   CHECK(parsed.config.max_sessions == 12);
   CHECK(parsed.config.max_sessions_per_ip == 3);
   CHECK(parsed.config.connection_rate.count == 20);
@@ -128,6 +132,7 @@ TEST_CASE("server CLI rejects malformed hostile values") {
   CHECK_THROWS_AS(parse("--max-auth-attempts-per-session", "0"),
                   std::runtime_error);
   CHECK_THROWS_AS(parse("--max-tracked-ips", "65537"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--registration-mode", "OPEN"), std::runtime_error);
   CHECK_THROWS_AS(
       parse("--max-tracked-ips", "18446744073709551616000000000000000000"),
       std::runtime_error);
@@ -172,6 +177,8 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.health_bind_address == "127.0.0.1");
   CHECK(parsed.config.health_port == 8080);
   CHECK(parsed.config.database_path == "anvil.db");
+  CHECK(parsed.config.registration_mode ==
+        anvil::server::RegistrationMode::open);
   CHECK(parsed.config.backup_directory.empty());
   CHECK(parsed.config.backup_interval.count() == 86'400);
   CHECK(parsed.config.backup_retention.count() == 604'800);
@@ -244,6 +251,19 @@ TEST_CASE("server CLI separates scheduled and offline backup modes") {
   CHECK(anvil::server::parse_arguments(one_shot).config.operation ==
         anvil::server::Operation::backup_once);
 
+  const std::array maintenance_registration{
+      std::string_view{"--backup-now"},
+      std::string_view{"backups"},
+      std::string_view{"--database"},
+      std::string_view{"state/anvil.db"},
+      std::string_view{"--host-key"},
+      std::string_view{"state/host_key"},
+      std::string_view{"--registration-mode"},
+      std::string_view{"closed"},
+  };
+  CHECK_THROWS_AS(anvil::server::parse_arguments(maintenance_registration),
+                  std::runtime_error);
+
   const std::array restore{
       std::string_view{"--restore-backup"}, std::string_view{"snapshot"},
       std::string_view{"--database"},       std::string_view{"state/anvil.db"},
@@ -277,6 +297,8 @@ TEST_CASE("server CLI help does not require operational arguments") {
   const std::array arguments{std::string_view{"--help"}};
   const auto parsed = anvil::server::parse_arguments(arguments);
   CHECK(parsed.show_help);
+  CHECK(anvil::server::usage().find("--registration-mode") !=
+        std::string_view::npos);
 }
 
 TEST_CASE("SSH terminal dimensions bound hostile peer claims") {

@@ -998,8 +998,9 @@ int run_session(ssh_session session, store::Store &identity_store,
             state.columns, state.rows, state.pixel_width, state.pixel_height};
         terminal_session = std::make_unique<TerminalSession>(
             application_descriptor.get(), state.terminal_type, dimensions,
-            state.channel_opened_at, config.session_resources, state.identity,
-            *state.identity_store, config.session_input_hook_for_testing);
+            state.channel_opened_at, config.session_resources,
+            config.registration_mode, state.identity, *state.identity_store,
+            config.session_input_hook_for_testing);
         state.terminal_session = terminal_session.get();
         auto armed =
             WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
@@ -1518,6 +1519,7 @@ std::string_view usage() noexcept {
          "  --health-bind-address A private HTTP address (default 127.0.0.1)\n"
          "  --health-port PORT      private HTTP port (default 8080)\n"
          "  --database PATH        SQLite database (default anvil.db)\n"
+         "  --registration-mode M  open, invite, or closed (default open)\n"
          "  --backup-directory P  enable snapshots in directory P\n"
          "  --backup-interval-seconds S\n"
          "                          snapshot period (default 86400)\n"
@@ -1568,6 +1570,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   bool backup_interval_explicit = false;
   bool backup_retention_explicit = false;
   bool backup_directory_explicit = false;
+  bool registration_mode_explicit = false;
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const auto argument = arguments[index];
     if (argument == "--help") {
@@ -1576,7 +1579,8 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
     if (argument != "--bind-address" && argument != "--port" &&
         argument != "--health-bind-address" && argument != "--health-port" &&
-        argument != "--database" && argument != "--backup-directory" &&
+        argument != "--database" && argument != "--registration-mode" &&
+        argument != "--backup-directory" &&
         argument != "--backup-interval-seconds" &&
         argument != "--backup-retention-seconds" &&
         argument != "--backup-now" && argument != "--restore-backup" &&
@@ -1613,6 +1617,18 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     } else if (argument == "--database") {
       result.config.database_path = value;
       database_explicit = true;
+    } else if (argument == "--registration-mode") {
+      if (value == "open") {
+        result.config.registration_mode = RegistrationMode::open;
+      } else if (value == "invite") {
+        result.config.registration_mode = RegistrationMode::invite;
+      } else if (value == "closed") {
+        result.config.registration_mode = RegistrationMode::closed;
+      } else {
+        throw std::runtime_error(
+            "registration mode must be open, invite, or closed");
+      }
+      registration_mode_explicit = true;
     } else if (argument == "--backup-directory") {
       result.config.backup_directory = value;
       backup_directory_explicit = true;
@@ -1696,6 +1712,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       if (!result.config.authorized_keys.empty()) {
         throw std::runtime_error(
             "--authorized-key is not valid in backup or restore mode");
+      }
+      if (registration_mode_explicit) {
+        throw std::runtime_error(
+            "--registration-mode is not valid in backup or restore mode");
       }
       if (backup_directory_explicit || backup_interval_explicit ||
           backup_retention_explicit) {

@@ -28,6 +28,7 @@
 #include <variant>
 
 #include "authentication.hpp"
+#include "server.hpp"
 #include "text_sanitization.hpp"
 
 namespace anvil::server {
@@ -156,10 +157,12 @@ class EchoApp final : public termforge::App {
           TerminalDimensions dimensions,
           std::chrono::steady_clock::time_point channel_opened,
           SharedState &shared, SessionIdentity identity,
-          store::Store &identity_store, SessionInputHook input_hook_for_testing)
+          store::Store &identity_store, RegistrationMode registration_mode,
+          SessionInputHook input_hook_for_testing)
       : sink_(descriptor, shared.resources, shared.stop_requested),
         channel_opened_(channel_opened), shared_(shared),
-        identity_(std::move(identity)), identity_store_(identity_store) {
+        identity_(std::move(identity)), identity_store_(identity_store),
+        registration_mode_(registration_mode) {
     const auto io =
         terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
     if (!io) {
@@ -232,6 +235,8 @@ class EchoApp final : public termforge::App {
     });
   }
 
+  ~EchoApp() override { clear_invite_code(); }
+
   auto on_start() -> void override { driver().set_output(&sink_); }
 
   auto on_event(const termforge::Event &event) -> void override {
@@ -281,7 +286,7 @@ class EchoApp final : public termforge::App {
     if (const auto *error = std::get_if<termforge::ErrorEvent>(&event)) {
       if (error->source == "ssh") {
         std::lock_guard lock(shared_.mutex);
-        status_ = shared_.notice;
+        notice_ = shared_.notice;
         return;
       }
       status_ = error->message;
@@ -291,7 +296,8 @@ class EchoApp final : public termforge::App {
       return;
     }
 
-    if ((identity_.kind == IdentityKind::registration ||
+    if (((identity_.kind == IdentityKind::registration &&
+          registration_mode_ != RegistrationMode::closed) ||
          identity_.kind == IdentityKind::active) &&
         input_.on_event(event)) {
       return;
@@ -324,18 +330,7 @@ class EchoApp final : public termforge::App {
             screen.write_text(0, 4, "Doors   (none yet)", accent, background));
       }
     } else if (identity_.kind == IdentityKind::registration) {
-      static_cast<void>(screen.write_text(
-          0, 2, "Choose a handle, then press Enter.", foreground, background));
-      if (screen.rows() > 3) {
-        static_cast<void>(screen.write_text(
-            0, 3,
-            "There is no email recovery. Losing every key loses the account.",
-            foreground, background));
-      }
-      if (screen.rows() > 4) {
-        input_.set_geometry(termforge::Rect{0, 4, screen.cols(), 1});
-        input_.draw(screen);
-      }
+      render_registration(screen, foreground, accent, background);
     } else if (identity_.kind == IdentityKind::pending) {
       static_cast<void>(screen.write_text(
           0, 2, "Registration pending for " + identity_.handle + '.', accent,
@@ -356,15 +351,70 @@ class EchoApp final : public termforge::App {
         input_.draw(screen);
       }
     }
-    if (!status_.empty() && screen.rows() > 4) {
-      const auto status = sanitize_prose_for_render(status_);
+    const auto &message = notice_.empty() ? status_ : notice_;
+    if (!message.empty() && screen.rows() > 4) {
+      const auto status = sanitize_prose_for_render(message);
       static_cast<void>(
           screen.write_text(0, screen.rows() - 1, status, accent, background));
     }
   }
 
  private:
+  enum class RegistrationStep { invite_code, handle };
+
+  void render_registration(termforge::Screen &screen, termforge::Rgb foreground,
+                           termforge::Rgb accent, termforge::Rgb background) {
+    if (registration_mode_ == RegistrationMode::closed) {
+      static_cast<void>(screen.write_text(
+          0, 2, "This board is not accepting new registrations.", accent,
+          background));
+      if (screen.rows() > 3) {
+        static_cast<void>(screen.write_text(
+            0, 3, "Guest browsing remains available with: ssh guest@HOST",
+            foreground, background));
+      }
+      return;
+    }
+
+    const auto invite_prompt =
+        registration_mode_ == RegistrationMode::invite &&
+        registration_step_ == RegistrationStep::invite_code;
+    const std::string_view prompt =
+        invite_prompt ? "Enter an invite code, then press Enter."
+                      : "Choose a handle, then press Enter.";
+    static_cast<void>(screen.write_text(0, 2, prompt, foreground, background));
+    if (screen.rows() > 3) {
+      const std::string_view detail =
+          invite_prompt
+              ? "Invite codes are single-use. Invalid codes reveal no details."
+              : "There is no email recovery. Losing every key loses the "
+                "account.";
+      static_cast<void>(
+          screen.write_text(0, 3, detail, foreground, background));
+    }
+    if (screen.rows() > 4) {
+      input_.set_geometry(termforge::Rect{0, 4, screen.cols(), 1});
+      input_.draw(screen);
+    }
+  }
+
   void submit_registration() {
+    if (registration_mode_ == RegistrationMode::closed) {
+      return;
+    }
+    if (registration_mode_ == RegistrationMode::invite &&
+        registration_step_ == RegistrationStep::invite_code) {
+      if (!hash_invite_code(input_.text())) {
+        status_ = "Invite code is invalid or no longer available.";
+        return;
+      }
+      invite_code_ = input_.text();
+      input_.set_text({});
+      registration_step_ = RegistrationStep::handle;
+      status_.clear();
+      return;
+    }
+
     const auto prepared = prepare_user_text_for_ingest(
         UserTextField::handle, RemoteBytes::from_text(input_.text()));
     if (!prepared) {
@@ -375,17 +425,34 @@ class EchoApp final : public termforge::App {
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count()};
-    auto provisioned =
-        provision_pending_identity(identity_store_, identity_, *prepared, now);
+    const auto invite = registration_mode_ == RegistrationMode::invite
+                            ? std::optional<std::string_view>{invite_code_}
+                            : std::nullopt;
+    auto provisioned = provision_pending_identity(identity_store_, identity_,
+                                                  *prepared, now, invite);
     if (!provisioned) {
-      status_ = provisioned.error() == AuthenticationError::conflict
-                    ? "That handle is unavailable."
-                    : "Registration is temporarily unavailable.";
+      if (provisioned.error() == AuthenticationError::conflict) {
+        status_ = "That handle is unavailable.";
+      } else if (provisioned.error() ==
+                 AuthenticationError::invite_unavailable) {
+        clear_invite_code();
+        input_.set_text({});
+        registration_step_ = RegistrationStep::invite_code;
+        status_ = "Invite code is invalid or no longer available.";
+      } else {
+        status_ = "Registration is temporarily unavailable.";
+      }
       return;
     }
     identity_ = std::move(*provisioned);
+    clear_invite_code();
     input_.set_text({});
     status_ = "Key saved. Registration awaits TOS acceptance.";
+  }
+
+  void clear_invite_code() noexcept {
+    std::fill(invite_code_.begin(), invite_code_.end(), '\0');
+    invite_code_.clear();
   }
 
   SocketSink sink_;
@@ -393,9 +460,13 @@ class EchoApp final : public termforge::App {
   SharedState &shared_;
   SessionIdentity identity_;
   store::Store &identity_store_;
+  RegistrationMode registration_mode_{RegistrationMode::open};
+  RegistrationStep registration_step_{RegistrationStep::invite_code};
   termforge::TextInput input_;
+  std::string invite_code_;
   std::string accepted_input_;
   std::string status_;
+  std::string notice_;
 };
 
 }  // namespace
@@ -443,12 +514,13 @@ class TerminalSession::Impl {
   Impl(int io_descriptor, std::string terminal_type,
        TerminalDimensions dimensions,
        std::chrono::steady_clock::time_point channel_opened,
-       SessionResourceLimits resource_limits, SessionIdentity identity,
+       SessionResourceLimits resource_limits,
+       RegistrationMode registration_mode, SessionIdentity identity,
        store::Store &identity_store, SessionInputHook input_hook_for_testing)
       : shared_(dimensions, resource_limits),
         app_(io_descriptor, std::move(terminal_type), dimensions,
              channel_opened, shared_, std::move(identity), identity_store,
-             input_hook_for_testing) {}
+             registration_mode, input_hook_for_testing) {}
 
   ~Impl() {
     request_stop();
@@ -600,12 +672,13 @@ class TerminalSession::Impl {
 TerminalSession::TerminalSession(
     int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
     std::chrono::steady_clock::time_point channel_opened,
-    SessionResourceLimits resource_limits, SessionIdentity identity,
-    store::Store &identity_store, SessionInputHook input_hook_for_testing)
+    SessionResourceLimits resource_limits, RegistrationMode registration_mode,
+    SessionIdentity identity, store::Store &identity_store,
+    SessionInputHook input_hook_for_testing)
     : impl_(std::make_unique<Impl>(io_descriptor, std::move(terminal_type),
                                    dimensions, channel_opened, resource_limits,
-                                   std::move(identity), identity_store,
-                                   input_hook_for_testing)) {}
+                                   registration_mode, std::move(identity),
+                                   identity_store, input_hook_for_testing)) {}
 
 TerminalSession::~TerminalSession() = default;
 

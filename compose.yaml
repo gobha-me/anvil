@@ -37,6 +37,8 @@ services:
       - "8080"
       - --database
       - /var/lib/anvil/anvil.db
+      - --registration-mode
+      - "${ANVIL_REGISTRATION_MODE:-open}"
       - --backup-directory
       - /var/lib/anvil/backups
       - --backup-interval-seconds

@@ -22,6 +22,7 @@ struct RateLimit {
 };
 
 enum class Operation : std::uint8_t { serve, backup_once, restore };
+enum class RegistrationMode : std::uint8_t { open, invite, closed };
 
 struct Config {
   Operation operation{Operation::serve};
@@ -30,6 +31,7 @@ struct Config {
   std::string health_bind_address{"127.0.0.1"};
   std::uint16_t health_port{8080};
   std::string database_path{"anvil.db"};
+  RegistrationMode registration_mode{RegistrationMode::open};
   std::string backup_directory;
   std::chrono::seconds backup_interval{86'400};
   std::chrono::seconds backup_retention{604'800};
