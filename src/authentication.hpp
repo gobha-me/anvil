@@ -4,7 +4,9 @@
 
 #include <anvil/store.hpp>
 #include <expected>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace anvil::server {
 
@@ -41,6 +43,7 @@ enum class AuthenticationError {
   unavailable,
   invalid_key,
   conflict,
+  invite_unavailable,
 };
 
 [[nodiscard]] auto canonical_public_key(ssh_key key)
@@ -48,10 +51,13 @@ enum class AuthenticationError {
 [[nodiscard]] auto resolve_public_key(store::Store &store,
                                       const PublicKeyMaterial &key)
     -> std::expected<SessionIdentity, AuthenticationError>;
-[[nodiscard]] auto
-provision_pending_identity(store::Store &store, const SessionIdentity &identity,
-                           std::string handle, store::UtcEpochSeconds now)
+[[nodiscard]] auto provision_pending_identity(
+    store::Store &store, const SessionIdentity &identity, std::string handle,
+    store::UtcEpochSeconds now,
+    std::optional<std::string_view> invite_code = std::nullopt)
     -> std::expected<SessionIdentity, AuthenticationError>;
+[[nodiscard]] auto hash_invite_code(std::string_view code)
+    -> std::expected<std::string, AuthenticationError>;
 [[nodiscard]] auto bootstrap_active_identity(store::Store &store,
                                              std::string handle,
                                              const PublicKeyMaterial &key,

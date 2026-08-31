@@ -432,3 +432,47 @@ TEST_CASE("credential provisioning enforces transaction and identity rules") {
   REQUIRE_FALSE(invalid_lookup.has_value());
   CHECK(invalid_lookup.error().code == ErrorCode::invalid_data);
 }
+
+TEST_CASE(
+    "invite claims require a pending local user and a write transaction") {
+  anvil::testing::MemoryStore first;
+  anvil::testing::MemoryStore second;
+  constexpr std::string_view code_hash =
+      "fbaf7ba4264e2392988d8b5863e0a080bfe65b2a48d9b9f042f7cc7d4f711bb9";
+  const anvil::store::InviteClaim claim{
+      .code_hash = std::string(code_hash),
+      .claimed_by_handle = "alice",
+      .claimed_at = {11},
+  };
+  first.seed_invite(std::string(code_hash));
+
+  auto read = first.begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  CHECK(first.claim_invite(*read, claim).error().code ==
+        ErrorCode::invalid_state);
+  CHECK(second.claim_invite(*read, claim).error().code ==
+        ErrorCode::invalid_state);
+  read->rollback();
+
+  auto write = first.begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  CHECK(first.claim_invite(*write, claim).error().code == ErrorCode::conflict);
+  const LocalCredentialProvision pending{
+      .handle = "alice",
+      .fingerprint = "SHA256:alice",
+      .public_key = "ssh-ed25519 ALICE",
+      .created_at = {10},
+      .user_status = UserStatus::pending,
+  };
+  REQUIRE(first.provision_local_credential(*write, pending).has_value());
+  REQUIRE(first.claim_invite(*write, claim).has_value());
+  REQUIRE(write->commit().has_value());
+  CHECK(first.invite_claimant(code_hash) == "alice");
+
+  auto invalid = first.begin(TransactionMode::read_write);
+  REQUIRE(invalid.has_value());
+  auto malformed = claim;
+  malformed.code_hash = "not-a-sha256-hash";
+  CHECK(first.claim_invite(*invalid, malformed).error().code ==
+        ErrorCode::invalid_data);
+}

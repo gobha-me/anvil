@@ -83,6 +83,9 @@ class SqliteStore final : public Store {
   provision_local_credential_impl(Transaction &transaction,
                                   const LocalCredentialProvision &provision)
       -> std::expected<void, Error> final;
+  [[nodiscard]] auto claim_invite_impl(Transaction &transaction,
+                                       const InviteClaim &claim)
+      -> std::expected<void, Error> final;
 
   std::filesystem::path path_;
   SqliteOptions options_;

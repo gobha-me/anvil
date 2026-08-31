@@ -1,6 +1,9 @@
 #include "authentication.hpp"
 
+#include <array>
+#include <cstddef>
 #include <memory>
+#include <openssl/evp.h>
 #include <utility>
 
 namespace anvil::server {
@@ -40,6 +43,37 @@ struct StringDeleter {
 }
 
 }  // namespace
+
+auto hash_invite_code(std::string_view code)
+    -> std::expected<std::string, AuthenticationError> {
+  constexpr std::size_t max_invite_code_size = 256;
+  if (code.empty() || code.size() > max_invite_code_size) {
+    return std::unexpected(AuthenticationError::invite_unavailable);
+  }
+  for (const auto character : code) {
+    const auto byte = static_cast<unsigned char>(character);
+    if (byte < 0x21U || byte > 0x7EU) {
+      return std::unexpected(AuthenticationError::invite_unavailable);
+    }
+  }
+
+  std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+  unsigned int digest_size = 0;
+  if (EVP_Digest(code.data(), code.size(), digest.data(), &digest_size,
+                 EVP_sha256(), nullptr) != 1 ||
+      digest_size != 32U) {
+    return std::unexpected(AuthenticationError::unavailable);
+  }
+  constexpr std::string_view hexadecimal = "0123456789abcdef";
+  std::string result;
+  result.reserve(64);
+  for (std::size_t index = 0; index < digest_size; ++index) {
+    const auto byte = digest[index];
+    result.push_back(hexadecimal[byte >> 4U]);
+    result.push_back(hexadecimal[byte & 0x0FU]);
+  }
+  return result;
+}
 
 auto canonical_public_key(ssh_key key)
     -> std::expected<PublicKeyMaterial, AuthenticationError> {
@@ -113,11 +147,20 @@ auto resolve_public_key(store::Store &store, const PublicKeyMaterial &key)
 
 auto provision_pending_identity(store::Store &store,
                                 const SessionIdentity &identity,
-                                std::string handle, store::UtcEpochSeconds now)
+                                std::string handle, store::UtcEpochSeconds now,
+                                std::optional<std::string_view> invite_code)
     -> std::expected<SessionIdentity, AuthenticationError> {
   if (identity.kind != IdentityKind::registration ||
       identity.key.fingerprint.empty() || identity.key.public_key.empty()) {
     return std::unexpected(AuthenticationError::denied);
+  }
+  std::optional<std::string> invite_hash;
+  if (invite_code) {
+    auto hashed = hash_invite_code(*invite_code);
+    if (!hashed) {
+      return std::unexpected(hashed.error());
+    }
+    invite_hash = std::move(*hashed);
   }
   auto transaction = store.begin(store::TransactionMode::read_write);
   if (!transaction) {
@@ -133,6 +176,18 @@ auto provision_pending_identity(store::Store &store,
                     });
   if (!provisioned) {
     return std::unexpected(authentication_error(provisioned.error()));
+  }
+  if (invite_hash) {
+    const auto claimed = store.claim_invite(
+        *transaction, store::InviteClaim{.code_hash = *invite_hash,
+                                         .claimed_by_handle = handle,
+                                         .claimed_at = now});
+    if (!claimed) {
+      return std::unexpected(
+          claimed.error().code == store::ErrorCode::conflict
+              ? AuthenticationError::invite_unavailable
+              : authentication_error(claimed.error()));
+    }
   }
   if (auto committed = transaction->commit(); !committed) {
     return std::unexpected(authentication_error(committed.error()));

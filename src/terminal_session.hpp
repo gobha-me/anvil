@@ -17,6 +17,7 @@ class Store;
 namespace anvil::server {
 
 struct SessionIdentity;
+enum class RegistrationMode : std::uint8_t;
 
 struct TerminalDimensions {
   int columns{80};
@@ -77,7 +78,8 @@ class TerminalSession {
                   TerminalDimensions dimensions,
                   std::chrono::steady_clock::time_point channel_opened,
                   SessionResourceLimits resource_limits,
-                  SessionIdentity identity, store::Store &identity_store,
+                  RegistrationMode registration_mode, SessionIdentity identity,
+                  store::Store &identity_store,
                   SessionInputHook input_hook_for_testing = nullptr);
   ~TerminalSession();
 

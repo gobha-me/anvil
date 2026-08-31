@@ -72,6 +72,14 @@ private:
         anvil::store::Error{anvil::store::ErrorCode::unavailable,
                             "consumer fixture has no identity backend"});
   }
+
+  [[nodiscard]] auto claim_invite_impl(
+      anvil::store::Transaction &, const anvil::store::InviteClaim &)
+      -> std::expected<void, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no invite backend"});
+  }
 };
 
 } // namespace

@@ -11,6 +11,9 @@ using anvil::server::PublicKeyMaterial;
 using anvil::server::SessionIdentity;
 
 const PublicKeyMaterial alice_key{"SHA256:alice", "ssh-ed25519 ALICE"};
+constexpr std::string_view invite_code = "invite-123";
+constexpr std::string_view invite_hash =
+    "fbaf7ba4264e2392988d8b5863e0a080bfe65b2a48d9b9f042f7cc7d4f711bb9";
 
 }  // namespace
 
@@ -41,6 +44,37 @@ TEST_CASE("unknown, pending, and active keys resolve to explicit identities") {
   CHECK(active->kind == IdentityKind::active);
   CHECK(active->handle == "operator");
   CHECK(active->can_write());
+}
+
+TEST_CASE("invite codes are bounded opaque tokens with stable SHA256 hashes") {
+  CHECK(anvil::server::hash_invite_code(invite_code) == invite_hash);
+  CHECK_FALSE(anvil::server::hash_invite_code("").has_value());
+  CHECK_FALSE(anvil::server::hash_invite_code("contains space").has_value());
+  CHECK_FALSE(
+      anvil::server::hash_invite_code(std::string(257, 'x')).has_value());
+}
+
+TEST_CASE("invite registration claims once and rolls back the losing account") {
+  anvil::testing::MemoryStore store;
+  store.seed_invite(std::string(invite_hash));
+  const SessionIdentity first{
+      .kind = IdentityKind::registration, .handle = {}, .key = alice_key};
+  auto registered = anvil::server::provision_pending_identity(
+      store, first, "alice", anvil::store::UtcEpochSeconds{10}, invite_code);
+  REQUIRE(registered.has_value());
+  CHECK(store.invite_claimant(invite_hash) == "alice");
+
+  const PublicKeyMaterial bob_key{"SHA256:bob", "ssh-ed25519 BOB"};
+  const SessionIdentity second{
+      .kind = IdentityKind::registration, .handle = {}, .key = bob_key};
+  const auto refused = anvil::server::provision_pending_identity(
+      store, second, "bob", anvil::store::UtcEpochSeconds{11}, invite_code);
+  REQUIRE_FALSE(refused.has_value());
+  CHECK(refused.error() == AuthenticationError::invite_unavailable);
+  CHECK(store.invite_claimant(invite_hash) == "alice");
+  const auto unresolved = anvil::server::resolve_public_key(store, bob_key);
+  REQUIRE(unresolved.has_value());
+  CHECK(unresolved->kind == IdentityKind::registration);
 }
 
 TEST_CASE("revoked and mismatched credentials fail closed") {

@@ -49,8 +49,10 @@ def wait_until_listening(process: subprocess.Popen[bytes]) -> None:
 
 
 def server_command(executable: pathlib.Path, port: int, host_key: pathlib.Path,
-                   client_key: pathlib.Path) -> list[str]:
-    return [
+                   client_key: pathlib.Path, *,
+                   database: pathlib.Path | None = None,
+                   registration_mode: str = "open") -> list[str]:
+    command = [
         str(executable),
         "--bind-address", "127.0.0.1",
         "--port", str(port),
@@ -59,16 +61,21 @@ def server_command(executable: pathlib.Path, port: int, host_key: pathlib.Path,
         "--max-sessions-per-ip", "8",
         "--connection-rate-limit", "1000/1",
         "--auth-attempt-rate-limit", "1000/1",
-        "--database", str(client_key.with_name(f"anvil-{port}.db")),
+        "--database", str(database or client_key.with_name(f"anvil-{port}.db")),
+        "--registration-mode", registration_mode,
         "--host-key", str(host_key),
         "--authorized-key", f"tester={client_key}.pub",
     ]
+    return command
 
 
 def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
-                 client_key: pathlib.Path) -> subprocess.Popen[bytes]:
+                 client_key: pathlib.Path, *,
+                 database: pathlib.Path | None = None,
+                 registration_mode: str = "open") -> subprocess.Popen[bytes]:
     process = subprocess.Popen(
-        server_command(executable, port, host_key, client_key),
+        server_command(executable, port, host_key, client_key,
+                       database=database, registration_mode=registration_mode),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -167,8 +174,12 @@ def main() -> int:
         host_key = directory / "host_key"
         client_key = directory / "client_key"
         wrong_key = directory / "wrong_key"
+        invite_key = directory / "invite_key"
+        losing_invite_key = directory / "losing_invite_key"
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)])
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(wrong_key)])
+        run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(invite_key)])
+        run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(losing_invite_key)])
 
         provided_host_key = directory / "provided_host_key"
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
@@ -334,6 +345,77 @@ def main() -> int:
             assert b"revoked" not in revoked.stdout, revoked.stdout
         finally:
             stop_server(process)
+
+        closed_port = reserve_port()
+        closed = start_server(
+            executable, closed_port, host_key, client_key,
+            registration_mode="closed",
+        )
+        try:
+            closed_registration = shell_session(
+                ssh_command(closed_port, invite_key), b"cannot-register\n"
+            )
+            assert closed_registration.returncode == 0, closed_registration
+            assert b"not accepting new registrations" in closed_registration.stdout
+            assert b"cannot-register" not in closed_registration.stdout
+            closed_guest = shell_session(guest_command(closed_port), b"cannot-post\n")
+            assert closed_guest.returncode == 0, closed_guest
+            assert b"Guest access" in closed_guest.stdout, closed_guest.stdout
+            known = shell_session(ssh_command(closed_port, client_key), b"known\n")
+            assert b"Signed in as tester" in known.stdout, known.stdout
+        finally:
+            stop_server(closed)
+
+        invite_database = directory / "invite-mode.db"
+        bootstrap_port = reserve_port()
+        bootstrap = start_server(
+            executable, bootstrap_port, host_key, client_key,
+            database=invite_database,
+        )
+        stop_server(bootstrap)
+        invite_hash = (
+            "fbaf7ba4264e2392988d8b5863e0a080"
+            "bfe65b2a48d9b9f042f7cc7d4f711bb9"
+        )
+        with sqlite3.connect(invite_database) as connection:
+            connection.execute(
+                "INSERT INTO invites(code_hash,inviter_handle,status,created_at) "
+                "VALUES(?, 'tester', 'active', 10)",
+                (invite_hash,),
+            )
+
+        invite_port = reserve_port()
+        invite_server = start_server(
+            executable, invite_port, host_key, client_key,
+            database=invite_database, registration_mode="invite",
+        )
+        try:
+            invited = shell_session(
+                ssh_command(invite_port, invite_key),
+                b"invite-123\ninvited_user\n",
+            )
+            assert invited.returncode == 0, invited
+            assert b"Registration pending for invited_user" in invited.stdout
+
+            losing = shell_session(
+                ssh_command(invite_port, losing_invite_key),
+                b"invite-123\nlosing_user\nx",
+            )
+            assert losing.returncode == 0, losing
+            assert b"Invite code is invalid or no longer available" in losing.stdout, losing.stdout
+            assert b"Registration pending for losing_user" not in losing.stdout
+        finally:
+            stop_server(invite_server)
+
+        with sqlite3.connect(invite_database) as connection:
+            invite = connection.execute(
+                "SELECT code_hash,status,claimed_by_handle FROM invites"
+            ).fetchone()
+            assert invite == (invite_hash, "claimed", "invited_user"), invite
+            assert connection.execute(
+                "SELECT count(*) FROM users WHERE handle='losing_user'"
+            ).fetchone() == (0,)
+            assert "invite-123" not in "\n".join(connection.iterdump())
 
         persisted_contents = host_key.read_bytes()
         restarted_port = reserve_port()

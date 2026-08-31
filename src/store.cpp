@@ -145,6 +145,32 @@ namespace {
   return {};
 }
 
+[[nodiscard]] auto valid_sha256_hex(std::string_view value) -> bool {
+  if (value.size() != 64) {
+    return false;
+  }
+  for (const auto character : value) {
+    if (!((character >= '0' && character <= '9') ||
+          (character >= 'a' && character <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] auto validate_invite_claim(const InviteClaim &claim)
+    -> std::expected<void, Error> {
+  if (!valid_sha256_hex(claim.code_hash)) {
+    return std::unexpected(invalid_identifier(
+        "invite code hash must be lowercase hexadecimal SHA256"));
+  }
+  if (!valid_handle(claim.claimed_by_handle)) {
+    return std::unexpected(invalid_identifier(
+        "invite claimant violates the M1 handle grammar or is reserved"));
+  }
+  return {};
+}
+
 }  // namespace
 
 Transaction::Transaction(const Store *owner, TransactionMode mode,
@@ -319,6 +345,21 @@ auto Store::provision_local_credential(
     return std::unexpected(valid.error());
   }
   return provision_local_credential_impl(transaction, provision);
+}
+
+auto Store::claim_invite(Transaction &transaction, const InviteClaim &claim)
+    -> std::expected<void, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(Error{ErrorCode::invalid_state,
+                                 "invite claim requires a write transaction"});
+  }
+  if (auto valid = validate_invite_claim(claim); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return claim_invite_impl(transaction, claim);
 }
 
 }  // namespace anvil::store
