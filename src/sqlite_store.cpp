@@ -27,6 +27,7 @@ constexpr std::int64_t anvil_application_id = 0x414E564C;
 constexpr std::array production_migrations{
     detail::SqliteMigration{1, {}},
     detail::SqliteMigration{2, detail::domain_schema_v2},
+    detail::SqliteMigration{3, detail::invite_economics_v3},
 };
 
 struct DatabaseDeleter {
@@ -209,6 +210,16 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
   return {};
 }
 
+[[nodiscard]] auto bind_null(sqlite3 *database, sqlite3_stmt *statement,
+                             int parameter, std::string_view operation)
+    -> std::expected<void, Error> {
+  const auto result = sqlite3_bind_null(statement, parameter);
+  if (result != SQLITE_OK) {
+    return std::unexpected(sqlite_error(database, result, operation));
+  }
+  return {};
+}
+
 [[nodiscard]] auto column_text(sqlite3_stmt *statement, int column,
                                std::string_view field)
     -> std::expected<std::string, Error> {
@@ -240,6 +251,19 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
     return std::unexpected(value.error());
   }
   return std::optional<std::string>{std::move(*value)};
+}
+
+[[nodiscard]] auto parse_user_status(std::string_view value)
+    -> std::optional<UserStatus> {
+  if (value == "pending")
+    return UserStatus::pending;
+  if (value == "active")
+    return UserStatus::active;
+  if (value == "suspended")
+    return UserStatus::suspended;
+  if (value == "tombstoned")
+    return UserStatus::tombstoned;
+  return std::nullopt;
 }
 
 [[nodiscard]] auto column_integer(sqlite3_stmt *statement, int column,
@@ -682,7 +706,7 @@ constexpr std::string_view message_columns =
 }
 
 class SqliteTransactionBackend final : public TransactionBackend {
- public:
+public:
   explicit SqliteTransactionBackend(Database database) noexcept
       : database_(std::move(database)) {}
 
@@ -708,12 +732,12 @@ class SqliteTransactionBackend final : public TransactionBackend {
     return database_.get();
   }
 
- private:
+private:
   Database database_;
   bool active_{true};
 };
 
-}  // namespace
+} // namespace
 
 SqliteStore::SqliteStore(std::filesystem::path path, SqliteOptions options,
                          std::uint32_t schema_version)
@@ -1162,7 +1186,8 @@ auto SqliteStore::claim_invite_impl(Transaction &transaction,
       "UPDATE invites SET claimed_by_handle=?2,claimed_by_origin=NULL,"
       "status='claimed',claimed_at=?3 WHERE code_hash=?1 AND status='active' "
       "AND claimed_by_handle IS NULL AND claimed_by_origin IS NULL AND "
-      "claimed_at IS NULL AND EXISTS(SELECT 1 FROM users WHERE handle=?2 "
+      "claimed_at IS NULL AND expires_at>?3 AND "
+      "EXISTS(SELECT 1 FROM users WHERE handle=?2 "
       "AND origin IS NULL AND status='pending')";
   auto statement =
       prepare(backend->database(), sql, "cannot prepare invite claim");
@@ -1196,6 +1221,329 @@ auto SqliteStore::claim_invite_impl(Transaction &transaction,
         Error{ErrorCode::conflict, "invite is invalid or no longer available"});
   }
   return {};
+}
+
+auto SqliteStore::issue_invite_impl(Transaction &transaction,
+                                    const InviteIssue &issue)
+    -> std::expected<InviteIssueResult, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+
+  constexpr std::string_view lookup_sql =
+      "SELECT status,invite_balance,invite_next_regeneration FROM users "
+      "WHERE handle=?1 AND origin_key=''";
+  auto lookup = prepare(backend->database(), lookup_sql,
+                        "cannot prepare invite balance lookup");
+  if (!lookup) {
+    return std::unexpected(lookup.error());
+  }
+  if (auto bound = bind_text(backend->database(), lookup->get(), 1,
+                             issue.inviter_handle, "cannot bind invite issuer");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto found = sqlite3_step(lookup->get());
+  if (found == SQLITE_DONE) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "invite issuer does not exist"});
+  }
+  if (found != SQLITE_ROW) {
+    return std::unexpected(sqlite_error(backend->database(), found,
+                                        "cannot look up invite issuer"));
+  }
+  auto status = column_text(lookup->get(), 0, "invite issuer status");
+  if (!status) {
+    return std::unexpected(status.error());
+  }
+  if (*status != "active") {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "only active accounts may issue invites"});
+  }
+  const auto stored_balance =
+      static_cast<std::int64_t>(sqlite3_column_int64(lookup->get(), 1));
+  if (stored_balance < 0) {
+    return std::unexpected(invalid_data("invite balance is negative"));
+  }
+
+  const auto cap = static_cast<std::int64_t>(issue.balance_cap);
+  auto balance = std::min(stored_balance, cap);
+  std::optional<std::int64_t> next_regeneration;
+  if (sqlite3_column_type(lookup->get(), 2) != SQLITE_NULL) {
+    next_regeneration = sqlite3_column_int64(lookup->get(), 2);
+  } else {
+    balance = cap;
+  }
+
+  const auto period = static_cast<std::int64_t>(issue.regeneration_seconds);
+  if (next_regeneration && issue.created_at.value >= *next_regeneration) {
+    const auto elapsed = static_cast<std::uint64_t>(issue.created_at.value) -
+                         static_cast<std::uint64_t>(*next_regeneration);
+    const auto elapsed_intervals = elapsed / static_cast<std::uint64_t>(period);
+    const auto credits_needed = static_cast<std::uint64_t>(cap - balance);
+    if (credits_needed == 0U || elapsed_intervals >= credits_needed - 1U) {
+      balance = cap;
+      next_regeneration.reset();
+    } else {
+      const auto intervals = 1 + static_cast<std::int64_t>(elapsed_intervals);
+      balance += intervals;
+      *next_regeneration += intervals * period;
+    }
+  }
+  if (balance == 0) {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "invite balance is exhausted"});
+  }
+  --balance;
+  if (balance < cap && !next_regeneration) {
+    next_regeneration = issue.created_at.value + period;
+  }
+
+  if (auto saved = exec(backend->database(), "SAVEPOINT issue_invite",
+                        "cannot start invite issuance");
+      !saved) {
+    return std::unexpected(saved.error());
+  }
+  const auto rollback =
+      [&](Error error) -> std::expected<InviteIssueResult, Error> {
+    static_cast<void>(exec(backend->database(),
+                           "ROLLBACK TO issue_invite; RELEASE issue_invite",
+                           "cannot roll back invite issuance"));
+    return std::unexpected(std::move(error));
+  };
+
+  constexpr std::string_view insert_sql =
+      "INSERT INTO invites(code_hash,inviter_handle,status,created_at,"
+      "expires_at) VALUES(?1,?2,'active',?3,?4)";
+  auto insert = prepare(backend->database(), insert_sql,
+                        "cannot prepare invite issuance");
+  if (!insert)
+    return rollback(insert.error());
+  if (auto bound = bind_text(backend->database(), insert->get(), 1,
+                             issue.code_hash, "cannot bind invite code hash");
+      !bound) {
+    return rollback(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), insert->get(), 2,
+                             issue.inviter_handle, "cannot bind invite issuer");
+      !bound) {
+    return rollback(bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), insert->get(), 3,
+                                issue.created_at.value,
+                                "cannot bind invite creation time");
+      !bound) {
+    return rollback(bound.error());
+  }
+  if (auto bound =
+          bind_integer(backend->database(), insert->get(), 4,
+                       issue.expires_at.value, "cannot bind invite expiry");
+      !bound) {
+    return rollback(bound.error());
+  }
+  const auto inserted = sqlite3_step(insert->get());
+  if (inserted != SQLITE_DONE) {
+    auto error =
+        sqlite_error(backend->database(), inserted, "cannot issue invite");
+    if (error.code == ErrorCode::constraint_violation) {
+      error.code = ErrorCode::conflict;
+    }
+    return rollback(std::move(error));
+  }
+
+  constexpr std::string_view update_sql =
+      "UPDATE users SET invite_balance=?2,invite_next_regeneration=?3 "
+      "WHERE handle=?1 AND origin_key='' AND status='active'";
+  auto update = prepare(backend->database(), update_sql,
+                        "cannot prepare invite balance update");
+  if (!update)
+    return rollback(update.error());
+  if (auto bound =
+          bind_text(backend->database(), update->get(), 1, issue.inviter_handle,
+                    "cannot bind invite balance owner");
+      !bound) {
+    return rollback(bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), update->get(), 2, balance,
+                                "cannot bind invite balance");
+      !bound) {
+    return rollback(bound.error());
+  }
+  const auto next_result =
+      next_regeneration
+          ? bind_integer(backend->database(), update->get(), 3,
+                         *next_regeneration, "cannot bind next regeneration")
+          : bind_null(backend->database(), update->get(), 3,
+                      "cannot bind next regeneration");
+  if (!next_result) {
+    return rollback(next_result.error());
+  }
+  const auto updated = sqlite3_step(update->get());
+  if (updated != SQLITE_DONE || sqlite3_changes64(backend->database()) != 1) {
+    return rollback(updated == SQLITE_DONE
+                        ? Error{ErrorCode::conflict,
+                                "invite issuer changed during issuance"}
+                        : sqlite_error(backend->database(), updated,
+                                       "cannot update invite balance"));
+  }
+  if (auto released = exec(backend->database(), "RELEASE issue_invite",
+                           "cannot finish invite issuance");
+      !released) {
+    return rollback(released.error());
+  }
+  return InviteIssueResult{
+      .remaining_balance = static_cast<std::uint32_t>(balance),
+      .next_regeneration =
+          next_regeneration
+              ? std::optional<UtcEpochSeconds>{{*next_regeneration}}
+              : std::nullopt,
+  };
+}
+
+auto SqliteStore::find_inviter_impl(Transaction &transaction,
+                                    std::string_view invitee_handle)
+    -> std::expected<std::optional<InviteUser>, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql =
+      "SELECT u.handle,u.origin,u.status FROM invites i JOIN users u ON "
+      "u.handle=i.inviter_handle AND u.origin_key=i.inviter_origin_key "
+      "WHERE i.claimed_by_handle=?1 AND i.claimed_by_origin_key='' AND "
+      "i.status='claimed'";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare inviter lookup");
+  if (!statement)
+    return std::unexpected(statement.error());
+  if (auto bound = bind_text(backend->database(), statement->get(), 1,
+                             invitee_handle, "cannot bind invitee handle");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto row = sqlite3_step(statement->get());
+  if (row == SQLITE_DONE)
+    return std::optional<InviteUser>{};
+  if (row != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(backend->database(), row, "cannot look up inviter"));
+  }
+  auto handle = column_text(statement->get(), 0, "inviter handle");
+  auto origin = column_optional_text(statement->get(), 1, "inviter origin");
+  auto status_text = column_text(statement->get(), 2, "inviter status");
+  if (!handle || !origin || !status_text) {
+    return std::unexpected(!handle   ? handle.error()
+                           : !origin ? origin.error()
+                                     : status_text.error());
+  }
+  const auto status = parse_user_status(*status_text);
+  if (!status) {
+    return std::unexpected(invalid_data("inviter has an unknown status"));
+  }
+  return std::optional<InviteUser>{InviteUser{.handle = std::move(*handle),
+                                              .origin = std::move(*origin),
+                                              .status = *status}};
+}
+
+auto SqliteStore::list_invite_subtree_impl(Transaction &transaction,
+                                           std::string_view root_handle)
+    -> std::expected<std::vector<InviteDescendant>, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view exists_sql =
+      "SELECT 1 FROM users WHERE handle=?1 AND origin_key=''";
+  auto exists = prepare(backend->database(), exists_sql,
+                        "cannot prepare invite subtree root lookup");
+  if (!exists)
+    return std::unexpected(exists.error());
+  if (auto bound = bind_text(backend->database(), exists->get(), 1, root_handle,
+                             "cannot bind invite subtree root");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto found = sqlite3_step(exists->get());
+  if (found == SQLITE_DONE) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "invite subtree root does not exist"});
+  }
+  if (found != SQLITE_ROW) {
+    return std::unexpected(sqlite_error(backend->database(), found,
+                                        "cannot look up invite subtree root"));
+  }
+
+  constexpr std::string_view sql = R"sql(
+WITH RECURSIVE descendants(handle,origin_key,depth,path) AS (
+  SELECT i.claimed_by_handle,i.claimed_by_origin_key,1,
+         ',' || hex(?1) || ':,' || hex(i.claimed_by_handle) || ':' ||
+         hex(i.claimed_by_origin_key) || ','
+    FROM invites i
+   WHERE i.inviter_handle=?1 AND i.inviter_origin_key='' AND
+         i.status='claimed'
+  UNION ALL
+  SELECT i.claimed_by_handle,i.claimed_by_origin_key,d.depth+1,
+         d.path || hex(i.claimed_by_handle) || ':' ||
+         hex(i.claimed_by_origin_key) || ','
+    FROM descendants d JOIN invites i
+      ON i.inviter_handle=d.handle AND i.inviter_origin_key=d.origin_key
+   WHERE i.status='claimed' AND
+         instr(d.path, ',' || hex(i.claimed_by_handle) || ':' ||
+                       hex(i.claimed_by_origin_key) || ',')=0
+)
+SELECT u.handle,u.origin,u.status,d.depth
+  FROM descendants d JOIN users u
+    ON u.handle=d.handle AND u.origin_key=d.origin_key
+ ORDER BY d.depth,u.handle,u.origin_key
+)sql";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare invite subtree query");
+  if (!statement)
+    return std::unexpected(statement.error());
+  if (auto bound = bind_text(backend->database(), statement->get(), 1,
+                             root_handle, "cannot bind invite subtree root");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+
+  std::vector<InviteDescendant> result;
+  auto row = sqlite3_step(statement->get());
+  for (; row == SQLITE_ROW; row = sqlite3_step(statement->get())) {
+    auto handle = column_text(statement->get(), 0, "descendant handle");
+    auto origin =
+        column_optional_text(statement->get(), 1, "descendant origin");
+    auto status_text = column_text(statement->get(), 2, "descendant status");
+    const auto depth = sqlite3_column_int64(statement->get(), 3);
+    if (!handle || !origin || !status_text || depth <= 0 ||
+        depth > std::numeric_limits<std::uint32_t>::max()) {
+      return std::unexpected(
+          !handle        ? handle.error()
+          : !origin      ? origin.error()
+          : !status_text ? status_text.error()
+                         : invalid_data("invite subtree depth is invalid"));
+    }
+    const auto status = parse_user_status(*status_text);
+    if (!status) {
+      return std::unexpected(
+          invalid_data("invite descendant has an unknown status"));
+    }
+    result.push_back({.user = {.handle = std::move(*handle),
+                               .origin = std::move(*origin),
+                               .status = *status},
+                      .depth = static_cast<std::uint32_t>(depth)});
+  }
+  if (row != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(backend->database(), row, "cannot read invite subtree"));
+  }
+  return result;
 }
 
 auto SqliteStore::execute_for_testing(Transaction &transaction,
@@ -1354,5 +1702,5 @@ auto open_sqlite_store(const std::filesystem::path &path,
       new SqliteStore(path, options, current_version));
 }
 
-}  // namespace detail
-}  // namespace anvil::store
+} // namespace detail
+} // namespace anvil::store

@@ -377,4 +377,21 @@ CREATE TABLE presence(
 );
 )sql";
 
+// Version 3 keeps the original 17-table domain shape. Invite balance belongs
+// to the account and each issued bearer code carries an explicit deadline.
+// Existing active codes fail closed at expiry 0; claimed rows remain as graph
+// evidence. The unique partial index makes "who invited this account" singular.
+inline constexpr std::string_view invite_economics_v3 = R"sql(
+ALTER TABLE users ADD COLUMN invite_balance INTEGER NOT NULL DEFAULT 0
+  CHECK(typeof(invite_balance) = 'integer' AND invite_balance >= 0);
+ALTER TABLE users ADD COLUMN invite_next_regeneration INTEGER
+  CHECK(invite_next_regeneration IS NULL OR
+        typeof(invite_next_regeneration) = 'integer');
+ALTER TABLE invites ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0
+  CHECK(typeof(expires_at) = 'integer');
+CREATE UNIQUE INDEX invites_one_edge_per_account
+  ON invites(claimed_by_handle, claimed_by_origin_key)
+  WHERE claimed_by_handle IS NOT NULL;
+)sql";
+
 } // namespace anvil::store::detail

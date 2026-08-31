@@ -4,6 +4,7 @@
 #include <anvil/store.hpp>
 #include <cstddef>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,7 +23,7 @@ struct TransactionObservation {
 // tests. Each transaction owns a snapshot so rollback and failed commits have
 // the same observable semantics as a database backend.
 class MemoryStore final : public store::Store {
- public:
+public:
   MemoryStore() : state_(std::make_shared<State>()) {}
 
   [[nodiscard]] auto begin(store::TransactionMode mode)
@@ -92,7 +93,10 @@ class MemoryStore final : public store::Store {
     const auto user =
         std::ranges::find(state_->users, credential.handle, &UserEntry::handle);
     if (user == state_->users.end()) {
-      state_->users.push_back({credential.handle, status});
+      state_->users.push_back({.handle = credential.handle,
+                               .status = status,
+                               .invite_balance = 0,
+                               .next_regeneration = std::nullopt});
     } else if (credential.status != store::CredentialStatus::revoked) {
       user->status = status;
     }
@@ -102,10 +106,13 @@ class MemoryStore final : public store::Store {
     const auto existing =
         std::ranges::find(state_->invites, code_hash, &InviteEntry::code_hash);
     if (existing == state_->invites.end()) {
-      state_->invites.push_back({.code_hash = std::move(code_hash),
-                                 .claimed_by_handle = {},
-                                 .claimed_at = std::nullopt,
-                                 .active = active});
+      state_->invites.push_back(
+          {.code_hash = std::move(code_hash),
+           .inviter_handle = "operator",
+           .claimed_by_handle = {},
+           .claimed_at = std::nullopt,
+           .expires_at = {std::numeric_limits<std::int64_t>::max()},
+           .active = active});
     } else {
       existing->active = active;
       existing->claimed_by_handle.clear();
@@ -143,7 +150,7 @@ class MemoryStore final : public store::Store {
     return make_transaction(store::TransactionMode::read_only, nullptr);
   }
 
- private:
+private:
   struct ContentEntry {
     store::ContentRef content;
     store::ContentStatus status{store::ContentStatus::active};
@@ -152,12 +159,16 @@ class MemoryStore final : public store::Store {
   struct UserEntry {
     std::string handle;
     store::UserStatus status{store::UserStatus::pending};
+    std::uint32_t invite_balance{};
+    std::optional<store::UtcEpochSeconds> next_regeneration;
   };
 
   struct InviteEntry {
     std::string code_hash;
+    std::string inviter_handle;
     std::string claimed_by_handle;
     std::optional<store::UtcEpochSeconds> claimed_at;
+    store::UtcEpochSeconds expires_at;
     bool active{true};
   };
 
@@ -202,7 +213,7 @@ class MemoryStore final : public store::Store {
   }
 
   class Backend final : public store::TransactionBackend {
-   public:
+  public:
     Backend(std::shared_ptr<State> state, std::size_t index,
             store::TransactionMode mode)
         : state_(std::move(state)), index_(index), mode_(mode),
@@ -258,7 +269,7 @@ class MemoryStore final : public store::Store {
       return invites_;
     }
 
-   private:
+  private:
     std::shared_ptr<State> state_;
     std::size_t index_;
     store::TransactionMode mode_;
@@ -414,7 +425,10 @@ class MemoryStore final : public store::Store {
             store::ErrorCode::conflict, "local handle is already provisioned"});
       }
     } else {
-      users.push_back({provision.handle, provision.user_status});
+      users.push_back({.handle = provision.handle,
+                       .status = provision.user_status,
+                       .invite_balance = 0,
+                       .next_regeneration = std::nullopt});
     }
     const auto status = provision.user_status == store::UserStatus::active
                             ? store::CredentialStatus::active
@@ -443,7 +457,8 @@ class MemoryStore final : public store::Store {
     const auto invite =
         std::ranges::find(invites, claim.code_hash, &InviteEntry::code_hash);
     if (invite == invites.end() || !invite->active ||
-        !invite->claimed_by_handle.empty() || invite->claimed_at.has_value()) {
+        !invite->claimed_by_handle.empty() || invite->claimed_at.has_value() ||
+        invite->expires_at <= claim.claimed_at) {
       return std::unexpected(
           store::Error{store::ErrorCode::conflict,
                        "invite is invalid or no longer available"});
@@ -454,8 +469,158 @@ class MemoryStore final : public store::Store {
     return {};
   }
 
+  [[nodiscard]] auto issue_invite_impl(store::Transaction &transaction,
+                                       const store::InviteIssue &issue)
+      -> std::expected<store::InviteIssueResult, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    auto &users = active->users();
+    const auto user =
+        std::ranges::find(users, issue.inviter_handle, &UserEntry::handle);
+    if (user == users.end()) {
+      return std::unexpected(store::Error{store::ErrorCode::not_found,
+                                          "invite issuer does not exist"});
+    }
+    if (user->status != store::UserStatus::active) {
+      return std::unexpected(
+          store::Error{store::ErrorCode::conflict,
+                       "only active accounts may issue invites"});
+    }
+    auto &invites = active->invites();
+    if (std::ranges::find(invites, issue.code_hash, &InviteEntry::code_hash) !=
+        invites.end()) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "invite code already exists"});
+    }
+
+    const auto cap = static_cast<std::int64_t>(issue.balance_cap);
+    auto balance = std::min<std::int64_t>(user->invite_balance, cap);
+    auto next = user->next_regeneration;
+    if (!next) {
+      balance = cap;
+    }
+    const auto period = static_cast<std::int64_t>(issue.regeneration_seconds);
+    if (next && issue.created_at >= *next) {
+      const auto elapsed = static_cast<std::uint64_t>(issue.created_at.value) -
+                           static_cast<std::uint64_t>(next->value);
+      const auto elapsed_intervals =
+          elapsed / static_cast<std::uint64_t>(period);
+      const auto credits_needed = static_cast<std::uint64_t>(cap - balance);
+      if (credits_needed == 0U || elapsed_intervals >= credits_needed - 1U) {
+        balance = cap;
+        next.reset();
+      } else {
+        const auto intervals = 1 + static_cast<std::int64_t>(elapsed_intervals);
+        balance += intervals;
+        next->value += intervals * period;
+      }
+    }
+    if (balance == 0) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "invite balance is exhausted"});
+    }
+    --balance;
+    if (balance < cap && !next) {
+      next = store::UtcEpochSeconds{issue.created_at.value + period};
+    }
+    invites.push_back({.code_hash = issue.code_hash,
+                       .inviter_handle = issue.inviter_handle,
+                       .claimed_by_handle = {},
+                       .claimed_at = std::nullopt,
+                       .expires_at = issue.expires_at,
+                       .active = true});
+    user->invite_balance = static_cast<std::uint32_t>(balance);
+    user->next_regeneration = next;
+    return store::InviteIssueResult{.remaining_balance = user->invite_balance,
+                                    .next_regeneration =
+                                        user->next_regeneration};
+  }
+
+  [[nodiscard]] auto find_inviter_impl(store::Transaction &transaction,
+                                       std::string_view invitee_handle)
+      -> std::expected<std::optional<store::InviteUser>,
+                       store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto invite =
+        std::ranges::find(active->invites(), invitee_handle,
+                          [](const InviteEntry &entry) -> const std::string & {
+                            return entry.claimed_by_handle;
+                          });
+    if (invite == active->invites().end()) {
+      return std::optional<store::InviteUser>{};
+    }
+    const auto inviter = std::ranges::find(
+        active->users(), invite->inviter_handle, &UserEntry::handle);
+    if (inviter == active->users().end()) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_data,
+                                          "invite graph has no inviter"});
+    }
+    return std::optional<store::InviteUser>{
+        store::InviteUser{.handle = inviter->handle,
+                          .origin = std::nullopt,
+                          .status = inviter->status}};
+  }
+
+  [[nodiscard]] auto list_invite_subtree_impl(store::Transaction &transaction,
+                                              std::string_view root_handle)
+      -> std::expected<std::vector<store::InviteDescendant>,
+                       store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    if (std::ranges::find(active->users(), root_handle, &UserEntry::handle) ==
+        active->users().end()) {
+      return std::unexpected(store::Error{
+          store::ErrorCode::not_found, "invite subtree root does not exist"});
+    }
+    std::vector<std::string> frontier{std::string(root_handle)};
+    std::vector<std::string> seen{std::string(root_handle)};
+    std::vector<store::InviteDescendant> result;
+    for (std::uint32_t depth = 1; !frontier.empty(); ++depth) {
+      std::vector<std::string> next;
+      for (const auto &parent : frontier) {
+        for (const auto &invite : active->invites()) {
+          if (invite.inviter_handle != parent ||
+              invite.claimed_by_handle.empty())
+            continue;
+          if (std::ranges::find(seen, invite.claimed_by_handle) != seen.end())
+            continue;
+          const auto user = std::ranges::find(
+              active->users(), invite.claimed_by_handle, &UserEntry::handle);
+          if (user == active->users().end()) {
+            return std::unexpected(
+                store::Error{store::ErrorCode::invalid_data,
+                             "invite graph descendant does not exist"});
+          }
+          seen.push_back(user->handle);
+          next.push_back(user->handle);
+          result.push_back({.user = {.handle = user->handle,
+                                     .origin = std::nullopt,
+                                     .status = user->status},
+                            .depth = depth});
+        }
+      }
+      std::ranges::sort(result, [](const auto &left, const auto &right) {
+        if (left.depth != right.depth)
+          return left.depth < right.depth;
+        return left.user.handle < right.user.handle;
+      });
+      frontier = std::move(next);
+    }
+    return result;
+  }
+
   std::shared_ptr<State> state_;
   std::optional<store::Error> next_begin_error_;
 };
 
-}  // namespace anvil::testing
+} // namespace anvil::testing

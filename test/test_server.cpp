@@ -37,6 +37,14 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"state/anvil.db"},
       std::string_view{"--registration-mode"},
       std::string_view{"invite"},
+      std::string_view{"--invites-per-user"},
+      std::string_view{"8"},
+      std::string_view{"--invite-regeneration-seconds"},
+      std::string_view{"60"},
+      std::string_view{"--invite-expiration-seconds"},
+      std::string_view{"120"},
+      std::string_view{"--notify-inviters-on-moderation"},
+      std::string_view{"on"},
       std::string_view{"--max-sessions"},
       std::string_view{"12"},
       std::string_view{"--max-sessions-per-ip"},
@@ -81,6 +89,10 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.database_path == "state/anvil.db");
   CHECK(parsed.config.registration_mode ==
         anvil::server::RegistrationMode::invite);
+  CHECK(parsed.config.invite_policy.per_user == 8);
+  CHECK(parsed.config.invite_policy.regeneration == std::chrono::seconds(60));
+  CHECK(parsed.config.invite_policy.expiration == std::chrono::seconds(120));
+  CHECK(parsed.config.invite_policy.notify_inviters_on_moderation);
   CHECK(parsed.config.max_sessions == 12);
   CHECK(parsed.config.max_sessions_per_ip == 3);
   CHECK(parsed.config.connection_rate.count == 20);
@@ -133,6 +145,14 @@ TEST_CASE("server CLI rejects malformed hostile values") {
                   std::runtime_error);
   CHECK_THROWS_AS(parse("--max-tracked-ips", "65537"), std::runtime_error);
   CHECK_THROWS_AS(parse("--registration-mode", "OPEN"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--invites-per-user", "1000001"), std::runtime_error);
+  CHECK_NOTHROW(parse("--invites-per-user", "0"));
+  CHECK_THROWS_AS(parse("--invite-regeneration-seconds", "0"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--invite-expiration-seconds", "4294967296"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--notify-inviters-on-moderation", "yes"),
+                  std::runtime_error);
   CHECK_THROWS_AS(
       parse("--max-tracked-ips", "18446744073709551616000000000000000000"),
       std::runtime_error);
@@ -179,6 +199,12 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.database_path == "anvil.db");
   CHECK(parsed.config.registration_mode ==
         anvil::server::RegistrationMode::open);
+  CHECK(parsed.config.invite_policy.per_user == 5);
+  CHECK(parsed.config.invite_policy.regeneration ==
+        std::chrono::seconds(2'592'000));
+  CHECK(parsed.config.invite_policy.expiration ==
+        std::chrono::seconds(604'800));
+  CHECK_FALSE(parsed.config.invite_policy.notify_inviters_on_moderation);
   CHECK(parsed.config.backup_directory.empty());
   CHECK(parsed.config.backup_interval.count() == 86'400);
   CHECK(parsed.config.backup_retention.count() == 604'800);
@@ -262,6 +288,19 @@ TEST_CASE("server CLI separates scheduled and offline backup modes") {
       std::string_view{"closed"},
   };
   CHECK_THROWS_AS(anvil::server::parse_arguments(maintenance_registration),
+                  std::runtime_error);
+
+  const std::array maintenance_invites{
+      std::string_view{"--backup-now"},
+      std::string_view{"backups"},
+      std::string_view{"--database"},
+      std::string_view{"state/anvil.db"},
+      std::string_view{"--host-key"},
+      std::string_view{"state/host_key"},
+      std::string_view{"--invites-per-user"},
+      std::string_view{"5"},
+  };
+  CHECK_THROWS_AS(anvil::server::parse_arguments(maintenance_invites),
                   std::runtime_error);
 
   const std::array restore{

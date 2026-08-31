@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "authentication.hpp"
+#include "server.hpp"
 #include "support/memory_store.hpp"
 
 namespace {
@@ -15,7 +16,7 @@ constexpr std::string_view invite_code = "invite-123";
 constexpr std::string_view invite_hash =
     "fbaf7ba4264e2392988d8b5863e0a080bfe65b2a48d9b9f042f7cc7d4f711bb9";
 
-}  // namespace
+} // namespace
 
 TEST_CASE("unknown, pending, and active keys resolve to explicit identities") {
   anvil::testing::MemoryStore store;
@@ -52,6 +53,42 @@ TEST_CASE("invite codes are bounded opaque tokens with stable SHA256 hashes") {
   CHECK_FALSE(anvil::server::hash_invite_code("contains space").has_value());
   CHECK_FALSE(
       anvil::server::hash_invite_code(std::string(257, 'x')).has_value());
+}
+
+TEST_CASE(
+    "issued invite codes are random URL-safe bearer tokens stored by hash") {
+  anvil::testing::MemoryStore store;
+  const PublicKeyMaterial operator_key{"SHA256:operator",
+                                       "ssh-ed25519 OPERATOR"};
+  REQUIRE(anvil::server::bootstrap_active_identity(
+              store, "operator", operator_key, anvil::store::UtcEpochSeconds{1})
+              .has_value());
+  const anvil::server::InvitePolicy policy{
+      .per_user = 1,
+      .regeneration = std::chrono::seconds(100),
+      .expiration = std::chrono::seconds(7),
+      .notify_inviters_on_moderation = false};
+  const auto issued = anvil::server::issue_invite_code(
+      store, "operator", anvil::store::UtcEpochSeconds{10}, policy);
+  REQUIRE(issued.has_value());
+  CHECK(issued->code.size() == 32);
+  CHECK(
+      issued->code.find_first_not_of(
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") ==
+      std::string::npos);
+  CHECK(issued->expires_at == anvil::store::UtcEpochSeconds{17});
+  CHECK(issued->remaining_balance == 0);
+
+  const PublicKeyMaterial invited_key{"SHA256:invited", "ssh-ed25519 INVITED"};
+  const SessionIdentity registration{
+      .kind = IdentityKind::registration, .handle = {}, .key = invited_key};
+  REQUIRE(anvil::server::provision_pending_identity(
+              store, registration, "invited", anvil::store::UtcEpochSeconds{16},
+              issued->code)
+              .has_value());
+  CHECK_FALSE(anvil::server::issue_invite_code(
+                  store, "operator", anvil::store::UtcEpochSeconds{17}, policy)
+                  .has_value());
 }
 
 TEST_CASE("invite registration claims once and rolls back the losing account") {

@@ -10,6 +10,8 @@
 
 namespace anvil::server {
 
+struct InvitePolicy;
+
 enum class IdentityKind {
   guest,
   registration,
@@ -38,6 +40,14 @@ struct SessionIdentity {
       -> bool = default;
 };
 
+struct IssuedInvite {
+  std::string code;
+  store::UtcEpochSeconds expires_at;
+  std::uint32_t remaining_balance{};
+
+  [[nodiscard]] auto operator==(const IssuedInvite &) const -> bool = default;
+};
+
 enum class AuthenticationError {
   denied,
   unavailable,
@@ -58,10 +68,14 @@ enum class AuthenticationError {
     -> std::expected<SessionIdentity, AuthenticationError>;
 [[nodiscard]] auto hash_invite_code(std::string_view code)
     -> std::expected<std::string, AuthenticationError>;
+[[nodiscard]] auto
+issue_invite_code(store::Store &store, std::string_view inviter_handle,
+                  store::UtcEpochSeconds now, const InvitePolicy &policy)
+    -> std::expected<IssuedInvite, AuthenticationError>;
 [[nodiscard]] auto bootstrap_active_identity(store::Store &store,
                                              std::string handle,
                                              const PublicKeyMaterial &key,
                                              store::UtcEpochSeconds now)
     -> std::expected<void, AuthenticationError>;
 
-}  // namespace anvil::server
+} // namespace anvil::server

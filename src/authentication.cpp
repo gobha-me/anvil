@@ -1,10 +1,15 @@
 #include "authentication.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <utility>
+
+#include "server.hpp"
 
 namespace anvil::server {
 namespace {
@@ -42,7 +47,7 @@ struct StringDeleter {
   return AuthenticationError::unavailable;
 }
 
-}  // namespace
+} // namespace
 
 auto hash_invite_code(std::string_view code)
     -> std::expected<std::string, AuthenticationError> {
@@ -73,6 +78,70 @@ auto hash_invite_code(std::string_view code)
     result.push_back(hexadecimal[byte & 0x0FU]);
   }
   return result;
+}
+
+auto issue_invite_code(store::Store &store, std::string_view inviter_handle,
+                       store::UtcEpochSeconds now, const InvitePolicy &policy)
+    -> std::expected<IssuedInvite, AuthenticationError> {
+  constexpr std::size_t raw_size = 24;
+  constexpr std::size_t encoded_size = 32;
+  constexpr unsigned int collision_attempts = 3;
+  if (inviter_handle.empty() || policy.per_user > 1'000'000U ||
+      policy.regeneration.count() <= 0 || policy.expiration.count() <= 0 ||
+      policy.regeneration.count() > std::numeric_limits<std::uint32_t>::max() ||
+      policy.expiration.count() >
+          std::numeric_limits<std::int64_t>::max() - now.value) {
+    return std::unexpected(AuthenticationError::unavailable);
+  }
+  const auto expires_at = store::UtcEpochSeconds{
+      now.value + static_cast<std::int64_t>(policy.expiration.count())};
+  for (unsigned int attempt = 0; attempt < collision_attempts; ++attempt) {
+    std::array<unsigned char, raw_size> raw{};
+    if (RAND_priv_bytes(raw.data(), static_cast<int>(raw.size())) != 1) {
+      return std::unexpected(AuthenticationError::unavailable);
+    }
+    std::array<unsigned char, encoded_size + 1> encoded{};
+    const auto count = EVP_EncodeBlock(encoded.data(), raw.data(),
+                                       static_cast<int>(raw.size()));
+    if (count != static_cast<int>(encoded_size)) {
+      return std::unexpected(AuthenticationError::unavailable);
+    }
+    std::string code(reinterpret_cast<const char *>(encoded.data()),
+                     encoded_size);
+    std::ranges::replace(code, '+', '-');
+    std::ranges::replace(code, '/', '_');
+    auto hash = hash_invite_code(code);
+    if (!hash) {
+      return std::unexpected(hash.error());
+    }
+    auto transaction = store.begin(store::TransactionMode::read_write);
+    if (!transaction) {
+      return std::unexpected(authentication_error(transaction.error()));
+    }
+    auto issued = store.issue_invite(
+        *transaction, store::InviteIssue{
+                          .code_hash = std::move(*hash),
+                          .inviter_handle = std::string(inviter_handle),
+                          .created_at = now,
+                          .expires_at = expires_at,
+                          .balance_cap = policy.per_user,
+                          .regeneration_seconds = static_cast<std::uint32_t>(
+                              policy.regeneration.count()),
+                      });
+    if (!issued) {
+      if (issued.error().code == store::ErrorCode::conflict) {
+        continue;
+      }
+      return std::unexpected(authentication_error(issued.error()));
+    }
+    if (auto committed = transaction->commit(); !committed) {
+      return std::unexpected(authentication_error(committed.error()));
+    }
+    return IssuedInvite{.code = std::move(code),
+                        .expires_at = expires_at,
+                        .remaining_balance = issued->remaining_balance};
+  }
+  return std::unexpected(AuthenticationError::conflict);
 }
 
 auto canonical_public_key(ssh_key key)
@@ -183,10 +252,9 @@ auto provision_pending_identity(store::Store &store,
                                          .claimed_by_handle = handle,
                                          .claimed_at = now});
     if (!claimed) {
-      return std::unexpected(
-          claimed.error().code == store::ErrorCode::conflict
-              ? AuthenticationError::invite_unavailable
-              : authentication_error(claimed.error()));
+      return std::unexpected(claimed.error().code == store::ErrorCode::conflict
+                                 ? AuthenticationError::invite_unavailable
+                                 : authentication_error(claimed.error()));
     }
   }
   if (auto committed = transaction->commit(); !committed) {
@@ -222,4 +290,4 @@ auto bootstrap_active_identity(store::Store &store, std::string handle,
   return {};
 }
 
-}  // namespace anvil::server
+} // namespace anvil::server

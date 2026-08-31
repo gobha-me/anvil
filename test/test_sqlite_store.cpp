@@ -14,6 +14,7 @@
 #include <system_error>
 #include <thread>
 
+#include "sqlite_schema.hpp"
 #include "sqlite_store.hpp"
 
 namespace {
@@ -32,7 +33,7 @@ using anvil::store::detail::SqliteMigration;
 using namespace std::chrono_literals;
 
 class TemporaryDatabase {
- public:
+public:
   TemporaryDatabase() {
     static std::atomic<unsigned int> sequence{};
     directory_ = std::filesystem::temp_directory_path() /
@@ -62,7 +63,7 @@ class TemporaryDatabase {
     return directory_;
   }
 
- private:
+private:
   std::filesystem::path directory_;
   std::filesystem::path path_;
 };
@@ -77,7 +78,7 @@ constexpr std::array probe_migrations{
                                                  options);
 }
 
-}  // namespace
+} // namespace
 
 namespace {
 
@@ -106,7 +107,7 @@ void seed_messages(SqliteStore &store, anvil::store::Transaction &transaction) {
               .has_value());
 }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("SQLite startup creates exactly the domain schema") {
   TemporaryDatabase database;
@@ -114,12 +115,12 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
   auto store = SqliteStore::open(database.path());
 
   REQUIRE(store.has_value());
-  CHECK((*store)->schema_version() == 2);
+  CHECK((*store)->schema_version() == 3);
   auto transaction = (*store)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA application_id") ==
         0x414E564C);
-  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") == 2);
+  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") == 3);
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA synchronous") == 2);
   CHECK((*store)->scalar_for_testing(*transaction,
                                      "PRAGMA wal_autocheckpoint") == 1000);
@@ -139,7 +140,7 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
 
   auto reopened = SqliteStore::open(database.path());
   REQUIRE(reopened.has_value());
-  CHECK((*reopened)->schema_version() == 2);
+  CHECK((*reopened)->schema_version() == 3);
 }
 
 TEST_CASE("SQLite provisions and resolves local credentials atomically") {
@@ -258,10 +259,10 @@ TEST_CASE("SQLite serializes concurrent redemption of one invite") {
                   *seed, "INSERT INTO users(handle,status,created_at) "
                          "VALUES('operator','active',1);"
                          "INSERT INTO invites(code_hash,inviter_handle,status,"
-                         "created_at) VALUES("
+                         "created_at,expires_at) VALUES("
                          "'fbaf7ba4264e2392988d8b5863e0a080bfe65b2a48d9b9f042f7"
                          "cc7d4f711bb9',"
-                         "'operator','active',2)")
+                         "'operator','active',2,100)")
               .has_value());
   REQUIRE(seed->commit().has_value());
   seed_store->reset();
@@ -331,6 +332,178 @@ TEST_CASE("SQLite serializes concurrent redemption of one invite") {
                 "claimed_by_handle IS NOT NULL") == 1);
 }
 
+TEST_CASE("SQLite serializes issuance of the final invite credit") {
+  TemporaryDatabase database;
+  auto seed_store = SqliteStore::open(database.path());
+  REQUIRE(seed_store.has_value());
+  auto seed = (*seed_store)->begin(TransactionMode::read_write);
+  REQUIRE(seed.has_value());
+  REQUIRE((*seed_store)
+              ->execute_for_testing(
+                  *seed, "INSERT INTO users(handle,status,created_at) "
+                         "VALUES('operator','active',1)")
+              .has_value());
+  REQUIRE(seed->commit().has_value());
+  seed_store->reset();
+
+  auto first_store = SqliteStore::open(database.path());
+  auto second_store = SqliteStore::open(database.path());
+  REQUIRE(first_store.has_value());
+  REQUIRE(second_store.has_value());
+  std::barrier start(2);
+  std::atomic<int> successes{};
+  std::atomic<int> conflicts{};
+  const auto issue = [&](SqliteStore &store, char digit) {
+    start.arrive_and_wait();
+    auto transaction = store.begin(TransactionMode::read_write);
+    if (!transaction)
+      return;
+    auto result =
+        store.issue_invite(*transaction, {.code_hash = std::string(64, digit),
+                                          .inviter_handle = "operator",
+                                          .created_at = {10},
+                                          .expires_at = {20},
+                                          .balance_cap = 1,
+                                          .regeneration_seconds = 100});
+    if (!result) {
+      if (result.error().code == ErrorCode::conflict)
+        ++conflicts;
+      return;
+    }
+    if (transaction->commit())
+      ++successes;
+  };
+  std::jthread first(issue, std::ref(**first_store), 'a');
+  std::jthread second(issue, std::ref(**second_store), 'b');
+  first.join();
+  second.join();
+  CHECK(successes == 1);
+  CHECK(conflicts == 1);
+
+  auto verify = (*first_store)->begin(TransactionMode::read_only);
+  REQUIRE(verify.has_value());
+  CHECK((*first_store)
+            ->scalar_for_testing(*verify, "SELECT count(*) FROM invites") == 1);
+  CHECK((*first_store)
+            ->scalar_for_testing(
+                *verify,
+                "SELECT invite_balance FROM users WHERE handle='operator'") ==
+        0);
+}
+
+TEST_CASE("SQLite invite regeneration saturates hostile stored timestamps") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "INSERT INTO users(handle,status,created_at,invite_balance,"
+                  "invite_next_regeneration) VALUES('operator','active',1,0,"
+                  "-9223372036854775807 - 1)")
+              .has_value());
+  REQUIRE(write->commit().has_value());
+
+  auto issue = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(issue.has_value());
+  const auto result =
+      (*store)->issue_invite(*issue, {.code_hash = std::string(64, 'a'),
+                                      .inviter_handle = "operator",
+                                      .created_at = {0},
+                                      .expires_at = {2},
+                                      .balance_cap = 2,
+                                      .regeneration_seconds = 1});
+  REQUIRE(result.has_value());
+  CHECK(result->remaining_balance == 1);
+  CHECK(result->next_regeneration == anvil::store::UtcEpochSeconds{1});
+  REQUIRE(issue->commit().has_value());
+}
+
+TEST_CASE("SQLite invite graph includes tombstones and enforces one edge") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "INSERT INTO users(handle,status,created_at) VALUES"
+                  "('operator','active',1),('alice','active',2),"
+                  "('bob','tombstoned',3);"
+                  "INSERT INTO invites(code_hash,inviter_handle,"
+                  "claimed_by_handle,status,created_at,claimed_at,expires_at) "
+                  "VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                  "aaaaaaaaaaaaaaaa','operator','alice','claimed',2,3,10),"
+                  "('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  "bbbbbbbb','alice','bob','claimed',3,4,10)")
+              .has_value());
+  const auto duplicate = (*store)->execute_for_testing(
+      *write,
+      "INSERT INTO invites(code_hash,inviter_handle,claimed_by_handle,status,"
+      "created_at,claimed_at,expires_at) VALUES('cccccccccccccccccccccccccccc"
+      "cccccccccccccccccccccccccccccccccccc','operator','alice','claimed',"
+      "4,5,10)");
+  REQUIRE_FALSE(duplicate.has_value());
+  CHECK(duplicate.error().code == ErrorCode::constraint_violation);
+  REQUIRE(write->commit().has_value());
+
+  auto read = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  const auto inviter = (*store)->find_inviter(*read, "alice");
+  REQUIRE(inviter.has_value());
+  REQUIRE(inviter->has_value());
+  CHECK((*inviter)->handle == "operator");
+  const auto subtree = (*store)->list_invite_subtree(*read, "operator");
+  REQUIRE(subtree.has_value());
+  REQUIRE(subtree->size() == 2);
+  CHECK((*subtree)[0].user.handle == "alice");
+  CHECK((*subtree)[0].depth == 1);
+  CHECK((*subtree)[1].user.handle == "bob");
+  CHECK((*subtree)[1].user.status == UserStatus::tombstoned);
+  CHECK((*subtree)[1].depth == 2);
+}
+
+TEST_CASE("SQLite version-three migration expires legacy bearer codes") {
+  TemporaryDatabase database;
+  constexpr std::array version_two_migrations{
+      SqliteMigration{1, {}},
+      SqliteMigration{2, anvil::store::detail::domain_schema_v2},
+  };
+  auto old = anvil::store::detail::open_sqlite_store(database.path(),
+                                                     version_two_migrations);
+  REQUIRE(old.has_value());
+  auto seed = (*old)->begin(TransactionMode::read_write);
+  REQUIRE(seed.has_value());
+  REQUIRE((*old)
+              ->execute_for_testing(
+                  *seed,
+                  "INSERT INTO users(handle,status,created_at) VALUES"
+                  "('operator','active',1),('alice','pending',2);"
+                  "INSERT INTO invites(code_hash,inviter_handle,status,"
+                  "created_at) VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                  "aaaaaaaaaaaaaaaaaaaaaaaaaaaa','operator','active',2)")
+              .has_value());
+  REQUIRE(seed->commit().has_value());
+  old->reset();
+
+  auto upgraded = SqliteStore::open(database.path());
+  REQUIRE(upgraded.has_value());
+  CHECK((*upgraded)->schema_version() == 3);
+  auto claim = (*upgraded)->begin(TransactionMode::read_write);
+  REQUIRE(claim.has_value());
+  const auto expired =
+      (*upgraded)->claim_invite(*claim, {.code_hash = std::string(64, 'a'),
+                                         .claimed_by_handle = "alice",
+                                         .claimed_at = {3}});
+  REQUIRE_FALSE(expired.has_value());
+  CHECK(expired.error().code == ErrorCode::conflict);
+  CHECK((*upgraded)->scalar_for_testing(*claim,
+                                        "SELECT expires_at FROM invites") == 0);
+}
+
 TEST_CASE("SQLite upgrades the claimed version-one database") {
   TemporaryDatabase database;
   constexpr std::array claimed{SqliteMigration{1, {}}};
@@ -343,7 +516,7 @@ TEST_CASE("SQLite upgrades the claimed version-one database") {
   auto upgraded = SqliteStore::open(database.path());
 
   REQUIRE(upgraded.has_value());
-  CHECK((*upgraded)->schema_version() == 2);
+  CHECK((*upgraded)->schema_version() == 3);
   auto transaction = (*upgraded)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
   CHECK((*upgraded)->scalar_for_testing(
@@ -718,7 +891,7 @@ TEST_CASE("SQLite startup rejects newer and foreign databases") {
     auto transaction = (*store)->begin(TransactionMode::read_write);
     REQUIRE(transaction.has_value());
     REQUIRE((*store)
-                ->execute_for_testing(*transaction, "PRAGMA user_version=3")
+                ->execute_for_testing(*transaction, "PRAGMA user_version=4")
                 .has_value());
     REQUIRE(transaction->commit().has_value());
 
