@@ -10,7 +10,13 @@
 #include "remote_bytes.hpp"
 #include "session_resources.hpp"
 
+namespace anvil::store {
+class Store;
+}
+
 namespace anvil::server {
+
+struct SessionIdentity;
 
 struct TerminalDimensions {
   int columns{80};
@@ -18,7 +24,8 @@ struct TerminalDimensions {
   int pixel_width{};
   int pixel_height{};
 
-  [[nodiscard]] auto operator==(const TerminalDimensions &) const noexcept -> bool = default;
+  [[nodiscard]] auto operator==(const TerminalDimensions &) const noexcept
+      -> bool = default;
 };
 
 inline constexpr std::size_t max_remote_terminal_type_size = 256U;
@@ -34,7 +41,8 @@ struct SessionTelemetry {
   std::uint64_t last_frame_image_edit_bytes{};
   std::chrono::milliseconds first_frame_latency{};
 
-  [[nodiscard]] auto operator==(const SessionTelemetry &) const noexcept -> bool = default;
+  [[nodiscard]] auto operator==(const SessionTelemetry &) const noexcept
+      -> bool = default;
 };
 
 enum class SessionFailureReason {
@@ -55,18 +63,21 @@ struct SessionCpuProgress {
 
 using SessionInputHook = void (*)(std::string_view, SessionResources &);
 
-[[nodiscard]] TerminalDimensions normalize_initial_dimensions(int columns, int rows,
-                                                              int pixel_width,
-                                                              int pixel_height) noexcept;
-[[nodiscard]] std::optional<TerminalDimensions> normalize_resize_dimensions(
-    int columns, int rows, int pixel_width, int pixel_height) noexcept;
+[[nodiscard]] TerminalDimensions
+normalize_initial_dimensions(int columns, int rows, int pixel_width,
+                             int pixel_height) noexcept;
+[[nodiscard]] std::optional<TerminalDimensions>
+normalize_resize_dimensions(int columns, int rows, int pixel_width,
+                            int pixel_height) noexcept;
 [[nodiscard]] std::string normalize_terminal_type(RemoteBytes terminal_type);
 
 class TerminalSession {
  public:
-  TerminalSession(int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
+  TerminalSession(int io_descriptor, std::string terminal_type,
+                  TerminalDimensions dimensions,
                   std::chrono::steady_clock::time_point channel_opened,
                   SessionResourceLimits resource_limits,
+                  SessionIdentity identity, store::Store &identity_store,
                   SessionInputHook input_hook_for_testing = nullptr);
   ~TerminalSession();
 

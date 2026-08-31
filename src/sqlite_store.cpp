@@ -1,23 +1,24 @@
 #include "sqlite_store.hpp"
-#include "sqlite_schema.hpp"
 
+#include <fcntl.h>
 #include <sqlite3.h>
+#include <unistd.h>
 
 #include <array>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
-#include <fcntl.h>
 #include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
-#include <unistd.h>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "sqlite_schema.hpp"
 
 namespace anvil::store {
 namespace {
@@ -681,7 +682,7 @@ constexpr std::string_view message_columns =
 }
 
 class SqliteTransactionBackend final : public TransactionBackend {
-public:
+ public:
   explicit SqliteTransactionBackend(Database database) noexcept
       : database_(std::move(database)) {}
 
@@ -707,12 +708,12 @@ public:
     return database_.get();
   }
 
-private:
+ private:
   Database database_;
   bool active_{true};
 };
 
-} // namespace
+}  // namespace
 
 SqliteStore::SqliteStore(std::filesystem::path path, SqliteOptions options,
                          std::uint32_t schema_version)
@@ -931,6 +932,222 @@ auto SqliteStore::list_messages_for_board_impl(Transaction &transaction,
   return query_messages(backend->database(), sql, board_id, false);
 }
 
+auto SqliteStore::find_local_credential_impl(Transaction &transaction,
+                                             std::string_view fingerprint)
+    -> std::expected<std::optional<CredentialRecord>, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql =
+      "SELECT u.handle,k.fingerprint,k.public_key,u.status,k.revoked_at,"
+      "u.origin,k.user_origin FROM user_keys AS k JOIN users AS u ON "
+      "u.handle=k.user_handle AND u.origin_key=k.user_origin_key WHERE "
+      "k.fingerprint=?1";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare credential lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 1,
+                             fingerprint, "cannot bind credential lookup");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto result = sqlite3_step(statement->get());
+  if (result == SQLITE_DONE) {
+    return std::nullopt;
+  }
+  if (result != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(backend->database(), result, "cannot look up credential"));
+  }
+  if (sqlite3_column_count(statement->get()) != 7) {
+    return std::unexpected(
+        invalid_data("credential query returned an unexpected shape"));
+  }
+  auto handle = column_text(statement->get(), 0, "credential handle");
+  auto stored_fingerprint =
+      column_text(statement->get(), 1, "credential fingerprint");
+  auto public_key = column_text(statement->get(), 2, "credential public key");
+  auto user_status = column_text(statement->get(), 3, "credential user status");
+  if (!handle || !stored_fingerprint || !public_key || !user_status) {
+    if (!handle)
+      return std::unexpected(handle.error());
+    if (!stored_fingerprint)
+      return std::unexpected(stored_fingerprint.error());
+    if (!public_key)
+      return std::unexpected(public_key.error());
+    return std::unexpected(user_status.error());
+  }
+  if (sqlite3_column_type(statement->get(), 5) != SQLITE_NULL ||
+      sqlite3_column_type(statement->get(), 6) != SQLITE_NULL) {
+    return std::unexpected(
+        invalid_data("credential belongs to a non-local identity"));
+  }
+
+  CredentialStatus status{};
+  if (sqlite3_column_type(statement->get(), 4) != SQLITE_NULL) {
+    if (sqlite3_column_type(statement->get(), 4) != SQLITE_INTEGER) {
+      return std::unexpected(
+          invalid_data("credential revoked_at is not stored as an integer"));
+    }
+    status = CredentialStatus::revoked;
+  } else if (*user_status == "pending") {
+    status = CredentialStatus::pending;
+  } else if (*user_status == "active") {
+    status = CredentialStatus::active;
+  } else if (*user_status == "suspended") {
+    status = CredentialStatus::suspended;
+  } else if (*user_status == "tombstoned") {
+    status = CredentialStatus::tombstoned;
+  } else {
+    return std::unexpected(invalid_data("credential user has unknown status"));
+  }
+  return CredentialRecord{.handle = std::move(*handle),
+                          .fingerprint = std::move(*stored_fingerprint),
+                          .public_key = std::move(*public_key),
+                          .status = status};
+}
+
+auto SqliteStore::provision_local_credential_impl(
+    Transaction &transaction, const LocalCredentialProvision &provision)
+    -> std::expected<void, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+
+  auto credential =
+      find_local_credential_impl(transaction, provision.fingerprint);
+  if (!credential) {
+    return std::unexpected(credential.error());
+  }
+  if (credential->has_value()) {
+    const auto &existing = **credential;
+    if (provision.user_status == UserStatus::active &&
+        existing.handle == provision.handle &&
+        existing.public_key == provision.public_key &&
+        existing.status == CredentialStatus::active) {
+      return {};
+    }
+    return std::unexpected(Error{
+        ErrorCode::conflict, "credential fingerprint is already provisioned"});
+  }
+
+  constexpr std::string_view find_user_sql =
+      "SELECT status,origin FROM users WHERE handle=?1 AND origin_key=''";
+  auto find_user = prepare(backend->database(), find_user_sql,
+                           "cannot prepare local user lookup");
+  if (!find_user) {
+    return std::unexpected(find_user.error());
+  }
+  if (auto bound = bind_text(backend->database(), find_user->get(), 1,
+                             provision.handle, "cannot bind local user lookup");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto found_user = sqlite3_step(find_user->get());
+  if (found_user != SQLITE_ROW && found_user != SQLITE_DONE) {
+    return std::unexpected(sqlite_error(backend->database(), found_user,
+                                        "cannot look up local user"));
+  }
+  if (found_user == SQLITE_ROW) {
+    auto status = column_text(find_user->get(), 0, "local user status");
+    if (!status) {
+      return std::unexpected(status.error());
+    }
+    if (sqlite3_column_type(find_user->get(), 1) != SQLITE_NULL) {
+      return std::unexpected(invalid_data("local user has a non-null origin"));
+    }
+    if (provision.user_status != UserStatus::active || *status != "active") {
+      return std::unexpected(
+          Error{ErrorCode::conflict, "local handle is already provisioned"});
+    }
+  } else {
+    constexpr std::string_view insert_user_sql =
+        "INSERT INTO users(handle,status,created_at) VALUES(?1,?2,?3)";
+    auto insert_user = prepare(backend->database(), insert_user_sql,
+                               "cannot prepare local user provision");
+    if (!insert_user)
+      return std::unexpected(insert_user.error());
+    const auto status = provision.user_status == UserStatus::active
+                            ? std::string_view{"active"}
+                            : std::string_view{"pending"};
+    if (auto bound =
+            bind_text(backend->database(), insert_user->get(), 1,
+                      provision.handle, "cannot bind local user handle");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    if (auto bound = bind_text(backend->database(), insert_user->get(), 2,
+                               status, "cannot bind local user status");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    if (auto bound = bind_integer(backend->database(), insert_user->get(), 3,
+                                  provision.created_at.value,
+                                  "cannot bind local user creation time");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    const auto inserted = sqlite3_step(insert_user->get());
+    if (inserted != SQLITE_DONE) {
+      auto error = sqlite_error(backend->database(), inserted,
+                                "cannot provision local user");
+      if (error.code == ErrorCode::constraint_violation) {
+        error.code = ErrorCode::conflict;
+      }
+      return std::unexpected(std::move(error));
+    }
+  }
+
+  constexpr std::string_view insert_key_sql =
+      "INSERT INTO user_keys(fingerprint,user_handle,public_key,added_at) "
+      "VALUES(?1,?2,?3,?4)";
+  auto insert_key = prepare(backend->database(), insert_key_sql,
+                            "cannot prepare credential provision");
+  if (!insert_key)
+    return std::unexpected(insert_key.error());
+  if (auto bound = bind_text(backend->database(), insert_key->get(), 1,
+                             provision.fingerprint,
+                             "cannot bind credential fingerprint");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), insert_key->get(), 2,
+                             provision.handle, "cannot bind credential handle");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound =
+          bind_text(backend->database(), insert_key->get(), 3,
+                    provision.public_key, "cannot bind credential public key");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), insert_key->get(), 4,
+                                provision.created_at.value,
+                                "cannot bind credential creation time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(insert_key->get());
+  if (inserted != SQLITE_DONE) {
+    auto error = sqlite_error(backend->database(), inserted,
+                              "cannot provision credential");
+    if (error.code == ErrorCode::constraint_violation) {
+      error.code = ErrorCode::conflict;
+    }
+    return std::unexpected(std::move(error));
+  }
+  return {};
+}
+
 auto SqliteStore::execute_for_testing(Transaction &transaction,
                                       std::string_view sql)
     -> std::expected<void, Error> {
@@ -1087,5 +1304,5 @@ auto open_sqlite_store(const std::filesystem::path &path,
       new SqliteStore(path, options, current_version));
 }
 
-} // namespace detail
-} // namespace anvil::store
+}  // namespace detail
+}  // namespace anvil::store

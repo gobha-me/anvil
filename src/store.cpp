@@ -1,5 +1,4 @@
 #include <anvil/store.hpp>
-
 #include <cstddef>
 #include <utility>
 
@@ -91,7 +90,62 @@ namespace {
   return {};
 }
 
-} // namespace
+[[nodiscard]] auto valid_fingerprint(std::string_view fingerprint) -> bool {
+  return fingerprint.starts_with("SHA256:") && fingerprint.size() > 7 &&
+         fingerprint.size() <= 128 &&
+         fingerprint.find('\0') == std::string_view::npos;
+}
+
+[[nodiscard]] auto valid_handle(std::string_view handle) -> bool {
+  if (handle.empty() || handle.size() > 32) {
+    return false;
+  }
+  for (const auto value : handle) {
+    if (!((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+          (value >= '0' && value <= '9') || value == '_' || value == '-')) {
+      return false;
+    }
+  }
+  constexpr std::string_view guest = "guest";
+  if (handle.size() != guest.size()) {
+    return true;
+  }
+  for (std::size_t index = 0; index < handle.size(); ++index) {
+    auto value = handle[index];
+    if (value >= 'A' && value <= 'Z') {
+      value = static_cast<char>(value - 'A' + 'a');
+    }
+    if (value != guest[index]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] auto validate_provision(const LocalCredentialProvision &provision)
+    -> std::expected<void, Error> {
+  if (!valid_handle(provision.handle)) {
+    return std::unexpected(invalid_identifier(
+        "local handle violates the M1 handle grammar or is reserved"));
+  }
+  if (!valid_fingerprint(provision.fingerprint)) {
+    return std::unexpected(
+        invalid_identifier("credential fingerprint is not canonical SHA256"));
+  }
+  if (provision.public_key.empty() || provision.public_key.size() > 65'536 ||
+      provision.public_key.find('\0') != std::string::npos) {
+    return std::unexpected(invalid_identifier(
+        "credential public key must contain 1 to 65536 bytes and no NUL"));
+  }
+  if (provision.user_status != UserStatus::pending &&
+      provision.user_status != UserStatus::active) {
+    return std::unexpected(invalid_identifier(
+        "new local credential requires pending or active user status"));
+  }
+  return {};
+}
+
+}  // namespace
 
 Transaction::Transaction(const Store *owner, TransactionMode mode,
                          std::unique_ptr<TransactionBackend> backend) noexcept
@@ -237,4 +291,34 @@ auto Store::list_messages_for_board_including_tombstones(
                                       ContentVisibility::including_tombstones);
 }
 
-} // namespace anvil::store
+auto Store::find_local_credential(Transaction &transaction,
+                                  std::string_view fingerprint)
+    -> std::expected<std::optional<CredentialRecord>, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (!valid_fingerprint(fingerprint)) {
+    return std::unexpected(
+        invalid_identifier("credential fingerprint is not canonical SHA256"));
+  }
+  return find_local_credential_impl(transaction, fingerprint);
+}
+
+auto Store::provision_local_credential(
+    Transaction &transaction, const LocalCredentialProvision &provision)
+    -> std::expected<void, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "credential provisioning requires a write transaction"});
+  }
+  if (auto valid = validate_provision(provision); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return provision_local_credential_impl(transaction, provision);
+}
+
+}  // namespace anvil::store

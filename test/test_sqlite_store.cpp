@@ -1,9 +1,10 @@
-#include "sqlite_store.hpp"
-
-#include <catch2/catch_test_macros.hpp>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
+#include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -11,24 +12,25 @@
 #include <string_view>
 #include <system_error>
 
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include "sqlite_store.hpp"
 
 namespace {
 
 using anvil::store::ContentKind;
 using anvil::store::ContentRef;
 using anvil::store::ContentStatus;
+using anvil::store::CredentialStatus;
 using anvil::store::ErrorCode;
+using anvil::store::LocalCredentialProvision;
 using anvil::store::SqliteOptions;
 using anvil::store::SqliteStore;
 using anvil::store::TransactionMode;
+using anvil::store::UserStatus;
 using anvil::store::detail::SqliteMigration;
 using namespace std::chrono_literals;
 
 class TemporaryDatabase {
-public:
+ public:
   TemporaryDatabase() {
     static std::atomic<unsigned int> sequence{};
     directory_ = std::filesystem::temp_directory_path() /
@@ -58,7 +60,7 @@ public:
     return directory_;
   }
 
-private:
+ private:
   std::filesystem::path directory_;
   std::filesystem::path path_;
 };
@@ -73,7 +75,7 @@ constexpr std::array probe_migrations{
                                                  options);
 }
 
-} // namespace
+}  // namespace
 
 namespace {
 
@@ -102,7 +104,7 @@ void seed_messages(SqliteStore &store, anvil::store::Transaction &transaction) {
               .has_value());
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("SQLite startup creates exactly the domain schema") {
   TemporaryDatabase database;
@@ -136,6 +138,111 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
   auto reopened = SqliteStore::open(database.path());
   REQUIRE(reopened.has_value());
   CHECK((*reopened)->schema_version() == 2);
+}
+
+TEST_CASE("SQLite provisions and resolves local credentials atomically") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  const LocalCredentialProvision pending{
+      .handle = "alice",
+      .fingerprint = "SHA256:alice",
+      .public_key = "ssh-ed25519 ALICE",
+      .created_at = {10},
+      .user_status = UserStatus::pending,
+  };
+
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)->provision_local_credential(*write, pending).has_value());
+  REQUIRE(write->commit().has_value());
+
+  auto read = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  const auto found =
+      (*store)->find_local_credential(*read, pending.fingerprint);
+  REQUIRE(found.has_value());
+  REQUIRE(found->has_value());
+  CHECK((*found)->handle == "alice");
+  CHECK((*found)->public_key == "ssh-ed25519 ALICE");
+  CHECK((*found)->status == CredentialStatus::pending);
+  CHECK_FALSE(
+      (*store)->find_local_credential(*read, "SHA256:unknown")->has_value());
+}
+
+TEST_CASE("SQLite active bootstrap is idempotent and adds exact-user keys") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  const LocalCredentialProvision first{
+      .handle = "operator",
+      .fingerprint = "SHA256:first",
+      .public_key = "ssh-ed25519 FIRST",
+      .created_at = {10},
+      .user_status = UserStatus::active,
+  };
+  const LocalCredentialProvision second{
+      .handle = "operator",
+      .fingerprint = "SHA256:second",
+      .public_key = "ssh-ed25519 SECOND",
+      .created_at = {11},
+      .user_status = UserStatus::active,
+  };
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  CHECK((*store)->provision_local_credential(*write, first).has_value());
+  CHECK((*store)->provision_local_credential(*write, first).has_value());
+  CHECK((*store)->provision_local_credential(*write, second).has_value());
+  REQUIRE(write->commit().has_value());
+
+  auto read = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  CHECK((*store)->scalar_for_testing(
+            *read, "SELECT count(*) FROM users WHERE handle='operator'") == 1);
+  CHECK((*store)->scalar_for_testing(
+            *read,
+            "SELECT count(*) FROM user_keys WHERE user_handle='operator'") ==
+        2);
+}
+
+TEST_CASE("SQLite revoked credentials never become unknown registrations") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "INSERT INTO users(handle,status,created_at) "
+                  "VALUES('alice','active',10);"
+                  "INSERT INTO user_keys(fingerprint,user_handle,public_key,"
+                  "added_at,revoked_at) VALUES('SHA256:revoked','alice',"
+                  "'ssh-ed25519 REVOKED',10,11)")
+              .has_value());
+  REQUIRE(write->commit().has_value());
+
+  auto read = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  const auto revoked = (*store)->find_local_credential(*read, "SHA256:revoked");
+  REQUIRE(revoked.has_value());
+  REQUIRE(revoked->has_value());
+  CHECK((*revoked)->status == CredentialStatus::revoked);
+
+  auto conflicting = LocalCredentialProvision{
+      .handle = "mallory",
+      .fingerprint = "SHA256:revoked",
+      .public_key = "ssh-ed25519 REVOKED",
+      .created_at = {12},
+      .user_status = UserStatus::pending,
+  };
+  read->rollback();
+  auto attempt = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(attempt.has_value());
+  const auto reprovision =
+      (*store)->provision_local_credential(*attempt, conflicting);
+  REQUIRE_FALSE(reprovision.has_value());
+  CHECK(reprovision.error().code == ErrorCode::conflict);
 }
 
 TEST_CASE("SQLite upgrades the claimed version-one database") {

@@ -238,6 +238,7 @@ if(ANVIL_SERVER)
 
   add_executable(anvil_server_tests
     test_admission.cpp
+    test_authentication.cpp
     test_backup.cpp
     test_canonical_message.cpp
     test_health.cpp

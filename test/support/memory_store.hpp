@@ -1,8 +1,7 @@
 #pragma once
 
-#include <anvil/store.hpp>
-
 #include <algorithm>
+#include <anvil/store.hpp>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -23,7 +22,7 @@ struct TransactionObservation {
 // tests. Each transaction owns a snapshot so rollback and failed commits have
 // the same observable semantics as a database backend.
 class MemoryStore final : public store::Store {
-public:
+ public:
   MemoryStore() : state_(std::make_shared<State>()) {}
 
   [[nodiscard]] auto begin(store::TransactionMode mode)
@@ -73,6 +72,32 @@ public:
                    message.status);
   }
 
+  void seed_credential(store::CredentialRecord credential) {
+    const auto existing =
+        std::ranges::find(state_->credentials, credential.fingerprint,
+                          &store::CredentialRecord::fingerprint);
+    if (existing == state_->credentials.end()) {
+      state_->credentials.push_back(credential);
+    } else {
+      *existing = credential;
+    }
+    const auto status =
+        credential.status == store::CredentialStatus::active
+            ? store::UserStatus::active
+        : credential.status == store::CredentialStatus::pending
+            ? store::UserStatus::pending
+        : credential.status == store::CredentialStatus::suspended
+            ? store::UserStatus::suspended
+            : store::UserStatus::tombstoned;
+    const auto user =
+        std::ranges::find(state_->users, credential.handle, &UserEntry::handle);
+    if (user == state_->users.end()) {
+      state_->users.push_back({credential.handle, status});
+    } else if (credential.status != store::CredentialStatus::revoked) {
+      user->status = status;
+    }
+  }
+
   [[nodiscard]] auto content_status(const store::ContentRef &content) const
       -> std::optional<store::ContentStatus> {
     return status_of(state_->contents, content);
@@ -93,10 +118,15 @@ public:
     return make_transaction(store::TransactionMode::read_only, nullptr);
   }
 
-private:
+ private:
   struct ContentEntry {
     store::ContentRef content;
     store::ContentStatus status{store::ContentStatus::active};
+  };
+
+  struct UserEntry {
+    std::string handle;
+    store::UserStatus status{store::UserStatus::pending};
   };
 
   struct State {
@@ -104,6 +134,8 @@ private:
     std::optional<store::Error> next_commit_error;
     std::vector<ContentEntry> contents;
     std::vector<store::MessageRecord> messages;
+    std::vector<UserEntry> users;
+    std::vector<store::CredentialRecord> credentials;
   };
 
   static void upsert_content(std::vector<ContentEntry> &contents,
@@ -137,11 +169,12 @@ private:
   }
 
   class Backend final : public store::TransactionBackend {
-  public:
+   public:
     Backend(std::shared_ptr<State> state, std::size_t index,
             store::TransactionMode mode)
         : state_(std::move(state)), index_(index), mode_(mode),
-          contents_(state_->contents), messages_(state_->messages) {}
+          contents_(state_->contents), messages_(state_->messages),
+          users_(state_->users), credentials_(state_->credentials) {}
 
     [[nodiscard]] auto commit() -> std::expected<void, store::Error> override {
       ++state_->observations.at(index_).commit_attempts;
@@ -153,6 +186,8 @@ private:
       if (mode_ == store::TransactionMode::read_write) {
         state_->contents = contents_;
         state_->messages = messages_;
+        state_->users = users_;
+        state_->credentials = credentials_;
       }
       return {};
     }
@@ -175,12 +210,23 @@ private:
       return messages_;
     }
 
-  private:
+    [[nodiscard]] auto users() noexcept -> std::vector<UserEntry> & {
+      return users_;
+    }
+
+    [[nodiscard]] auto credentials() noexcept
+        -> std::vector<store::CredentialRecord> & {
+      return credentials_;
+    }
+
+   private:
     std::shared_ptr<State> state_;
     std::size_t index_;
     store::TransactionMode mode_;
     std::vector<ContentEntry> contents_;
     std::vector<store::MessageRecord> messages_;
+    std::vector<UserEntry> users_;
+    std::vector<store::CredentialRecord> credentials_;
   };
 
   [[nodiscard]] auto backend(store::Transaction &transaction) const noexcept
@@ -275,8 +321,71 @@ private:
     return result;
   }
 
+  [[nodiscard]] auto find_local_credential_impl(store::Transaction &transaction,
+                                                std::string_view fingerprint)
+      -> std::expected<std::optional<store::CredentialRecord>,
+                       store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto credential =
+        std::ranges::find(active->credentials(), fingerprint,
+                          &store::CredentialRecord::fingerprint);
+    if (credential == active->credentials().end()) {
+      return std::nullopt;
+    }
+    return *credential;
+  }
+
+  [[nodiscard]] auto provision_local_credential_impl(
+      store::Transaction &transaction,
+      const store::LocalCredentialProvision &provision)
+      -> std::expected<void, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    auto &credentials = active->credentials();
+    const auto credential =
+        std::ranges::find(credentials, provision.fingerprint,
+                          &store::CredentialRecord::fingerprint);
+    if (credential != credentials.end()) {
+      if (provision.user_status == store::UserStatus::active &&
+          credential->handle == provision.handle &&
+          credential->public_key == provision.public_key &&
+          credential->status == store::CredentialStatus::active) {
+        return {};
+      }
+      return std::unexpected(
+          store::Error{store::ErrorCode::conflict,
+                       "credential fingerprint is already provisioned"});
+    }
+
+    auto &users = active->users();
+    const auto user =
+        std::ranges::find(users, provision.handle, &UserEntry::handle);
+    if (user != users.end()) {
+      if (provision.user_status != store::UserStatus::active ||
+          user->status != store::UserStatus::active) {
+        return std::unexpected(store::Error{
+            store::ErrorCode::conflict, "local handle is already provisioned"});
+      }
+    } else {
+      users.push_back({provision.handle, provision.user_status});
+    }
+    const auto status = provision.user_status == store::UserStatus::active
+                            ? store::CredentialStatus::active
+                            : store::CredentialStatus::pending;
+    credentials.push_back({provision.handle, provision.fingerprint,
+                           provision.public_key, status});
+    return {};
+  }
+
   std::shared_ptr<State> state_;
   std::optional<store::Error> next_begin_error_;
 };
 
-} // namespace anvil::testing
+}  // namespace anvil::testing

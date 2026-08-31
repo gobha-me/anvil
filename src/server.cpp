@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "admission.hpp"
+#include "authentication.hpp"
 #include "backup.hpp"
 #include "health.hpp"
 #include "sqlite_store.hpp"
@@ -52,6 +53,7 @@ using namespace std::chrono_literals;
 
 constexpr std::size_t max_key_file_size = 64U * 1024U;
 constexpr std::size_t max_pending_input = 64U * 1024U;
+constexpr std::size_t max_remote_username_size = 256U;
 constexpr auto authentication_timeout = 15s;
 constexpr auto shutdown_timeout = 5s;
 constexpr int auth_report_failure_exit = 75;
@@ -70,7 +72,8 @@ void clear_secret(char *data, std::size_t size) noexcept {
 
 class FileDescriptor {
  public:
-  explicit FileDescriptor(int descriptor = -1) noexcept : descriptor_(descriptor) {}
+  explicit FileDescriptor(int descriptor = -1) noexcept
+      : descriptor_(descriptor) {}
   ~FileDescriptor() {
     if (descriptor_ >= 0) {
       static_cast<void>(::close(descriptor_));
@@ -92,7 +95,9 @@ class FileDescriptor {
   }
 
   [[nodiscard]] int get() const noexcept { return descriptor_; }
-  [[nodiscard]] int release() noexcept { return std::exchange(descriptor_, -1); }
+  [[nodiscard]] int release() noexcept {
+    return std::exchange(descriptor_, -1);
+  }
 
  private:
   int descriptor_;
@@ -145,12 +150,16 @@ struct BindDeleter {
 using UniqueBind = std::unique_ptr<ssh_bind_struct, BindDeleter>;
 
 struct SessionDeleter {
-  void operator()(ssh_session_struct *session) const noexcept { ssh_free(session); }
+  void operator()(ssh_session_struct *session) const noexcept {
+    ssh_free(session);
+  }
 };
 using UniqueSession = std::unique_ptr<ssh_session_struct, SessionDeleter>;
 
 struct EventDeleter {
-  void operator()(ssh_event_struct *event) const noexcept { ssh_event_free(event); }
+  void operator()(ssh_event_struct *event) const noexcept {
+    ssh_event_free(event);
+  }
 };
 using UniqueEvent = std::unique_ptr<ssh_event_struct, EventDeleter>;
 
@@ -162,7 +171,8 @@ struct AuthorizedKey {
 enum class RequestedOperation { none, shell, exec, subsystem };
 
 struct SessionState {
-  const std::vector<AuthorizedKey> *authorized_keys{};
+  store::Store *identity_store{};
+  SessionIdentity identity;
   ssh_channel channel{};
   unsigned int auth_attempts{};
   unsigned int max_auth_attempts{};
@@ -201,11 +211,12 @@ struct WorkerReport {
 static_assert(std::is_trivially_copyable_v<WorkerReport>);
 
 [[noreturn]] void throw_system_error(std::string_view operation) {
-  throw std::system_error(errno, std::generic_category(), std::string(operation));
+  throw std::system_error(errno, std::generic_category(),
+                          std::string(operation));
 }
 
-[[nodiscard]] std::string read_key_file(FileDescriptor file, const std::string &path,
-                                        bool private_key) {
+[[nodiscard]] std::string
+read_key_file(FileDescriptor file, const std::string &path, bool private_key) {
   struct stat metadata{};
   if (::fstat(file.get(), &metadata) != 0) {
     throw_system_error("cannot inspect key file '" + path + "'");
@@ -214,9 +225,11 @@ static_assert(std::is_trivially_copyable_v<WorkerReport>);
     throw std::runtime_error("key file is not a regular file: " + path);
   }
   if (private_key && (metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-    throw std::runtime_error("host key must not be accessible by group or others: " + path);
+    throw std::runtime_error(
+        "host key must not be accessible by group or others: " + path);
   }
-  if (metadata.st_size <= 0 || static_cast<std::uintmax_t>(metadata.st_size) > max_key_file_size) {
+  if (metadata.st_size <= 0 ||
+      static_cast<std::uintmax_t>(metadata.st_size) > max_key_file_size) {
     throw std::runtime_error("key file has an invalid size: " + path);
   }
 
@@ -224,7 +237,8 @@ static_assert(std::is_trivially_copyable_v<WorkerReport>);
   contents.resize(static_cast<std::size_t>(metadata.st_size));
   std::size_t offset = 0;
   while (offset < contents.size()) {
-    const auto count = ::read(file.get(), contents.data() + offset, contents.size() - offset);
+    const auto count =
+        ::read(file.get(), contents.data() + offset, contents.size() - offset);
     if (count < 0 && errno == EINTR) {
       continue;
     }
@@ -242,28 +256,34 @@ static_assert(std::is_trivially_copyable_v<WorkerReport>);
   return contents;
 }
 
-[[nodiscard]] std::string read_key_file(const std::string &path, bool private_key) {
-  const auto descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+[[nodiscard]] std::string read_key_file(const std::string &path,
+                                        bool private_key) {
+  const auto descriptor =
+      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (descriptor < 0) {
     throw_system_error("cannot open key file '" + path + "'");
   }
   return read_key_file(FileDescriptor(descriptor), path, private_key);
 }
 
-[[nodiscard]] std::string read_host_key_at(int directory, const std::string &filename,
+[[nodiscard]] std::string read_host_key_at(int directory,
+                                           const std::string &filename,
                                            const std::string &path) {
   const auto descriptor =
-      ::openat(directory, filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+      ::openat(directory, filename.c_str(),
+               O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (descriptor < 0) {
     throw_system_error("cannot open key file '" + path + "'");
   }
   return read_key_file(FileDescriptor(descriptor), path, true);
 }
 
-void write_all(int descriptor, std::string_view contents, std::string_view path) {
+void write_all(int descriptor, std::string_view contents,
+               std::string_view path) {
   std::size_t offset = 0;
   while (offset < contents.size()) {
-    const auto count = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+    const auto count =
+        ::write(descriptor, contents.data() + offset, contents.size() - offset);
     if (count < 0 && errno == EINTR) {
       continue;
     }
@@ -271,7 +291,8 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
       throw_system_error("cannot write host key '" + std::string(path) + "'");
     }
     if (count == 0) {
-      throw std::runtime_error("short write while creating host key: " + std::string(path));
+      throw std::runtime_error("short write while creating host key: " +
+                               std::string(path));
     }
     offset += static_cast<std::size_t>(count);
   }
@@ -281,15 +302,18 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
   std::array<unsigned char, 16> bytes{};
   std::size_t offset = 0;
   while (offset < bytes.size()) {
-    const auto count = ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
+    const auto count =
+        ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
     if (count < 0 && errno == EINTR) {
       continue;
     }
     if (count < 0) {
-      throw_system_error("cannot obtain randomness for temporary host key name");
+      throw_system_error(
+          "cannot obtain randomness for temporary host key name");
     }
     if (count == 0) {
-      throw std::runtime_error("no randomness returned for temporary host key name");
+      throw std::runtime_error(
+          "no randomness returned for temporary host key name");
     }
     offset += static_cast<std::size_t>(count);
   }
@@ -307,7 +331,8 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
 [[nodiscard]] std::string generate_ed25519_host_key() {
   ssh_key raw_key = nullptr;
 #if LIBSSH_VERSION_INT >= SSH_VERSION_INT(0, 12, 0)
-  const auto generated = ssh_pki_generate_key(SSH_KEYTYPE_ED25519, nullptr, &raw_key);
+  const auto generated =
+      ssh_pki_generate_key(SSH_KEYTYPE_ED25519, nullptr, &raw_key);
 #else
   const auto generated = ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &raw_key);
 #endif
@@ -317,7 +342,8 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
   }
 
   char *raw_export = nullptr;
-  if (ssh_pki_export_privkey_base64(key.get(), nullptr, nullptr, nullptr, &raw_export) != SSH_OK ||
+  if (ssh_pki_export_privkey_base64(key.get(), nullptr, nullptr, nullptr,
+                                    &raw_export) != SSH_OK ||
       raw_export == nullptr) {
     throw std::runtime_error("cannot export generated Ed25519 host key");
   }
@@ -336,14 +362,17 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
     parent = ".";
   }
 
-  const auto directory_descriptor = ::open(parent.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+  const auto directory_descriptor =
+      ::open(parent.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
   if (directory_descriptor < 0) {
-    throw_system_error("cannot open host key directory '" + parent.string() + "'");
+    throw_system_error("cannot open host key directory '" + parent.string() +
+                       "'");
   }
   FileDescriptor directory(directory_descriptor);
 
   const auto existing =
-      ::openat(directory.get(), filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+      ::openat(directory.get(), filename.c_str(),
+               O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (existing >= 0) {
     return read_key_file(FileDescriptor(existing), path, true);
   }
@@ -353,12 +382,13 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
 
   auto generated = generate_ed25519_host_key();
   const auto temporary_name = "." + filename + ".tmp." + random_suffix();
-  const auto temporary_descriptor =
-      ::openat(directory.get(), temporary_name.c_str(),
-               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+  const auto temporary_descriptor = ::openat(
+      directory.get(), temporary_name.c_str(),
+      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
   if (temporary_descriptor < 0) {
     clear_secret(generated.data(), generated.size());
-    throw_system_error("cannot create temporary host key in '" + parent.string() + "'");
+    throw_system_error("cannot create temporary host key in '" +
+                       parent.string() + "'");
   }
   FileDescriptor temporary(temporary_descriptor);
   TemporaryDirectoryEntry temporary_entry(directory.get(), temporary_name);
@@ -372,8 +402,8 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
       throw_system_error("cannot flush temporary host key");
     }
 
-    if (::linkat(directory.get(), temporary_name.c_str(), directory.get(), filename.c_str(), 0) !=
-        0) {
+    if (::linkat(directory.get(), temporary_name.c_str(), directory.get(),
+                 filename.c_str(), 0) != 0) {
       if (errno != EEXIST) {
         throw_system_error("cannot publish host key '" + path + "'");
       }
@@ -384,7 +414,8 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
 
     temporary_entry.remove();
     if (::fsync(directory.get()) != 0) {
-      throw_system_error("cannot flush host key directory '" + parent.string() + "'");
+      throw_system_error("cannot flush host key directory '" + parent.string() +
+                         "'");
     }
     return generated;
   } catch (...) {
@@ -393,14 +424,15 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
   }
 }
 
-[[nodiscard]] std::pair<std::string_view, std::string_view> public_key_tokens(
-    const std::string &contents, const std::string &path) {
+[[nodiscard]] std::pair<std::string_view, std::string_view>
+public_key_tokens(const std::string &contents, const std::string &path) {
   const auto newline = contents.find('\n');
   const auto first_line = std::string_view(contents).substr(0, newline);
   if (newline != std::string::npos) {
     const auto remainder = std::string_view(contents).substr(newline + 1U);
     if (remainder.find_first_not_of(" \t\r\n") != std::string_view::npos) {
-      throw std::runtime_error("authorized key file must contain exactly one key: " + path);
+      throw std::runtime_error(
+          "authorized key file must contain exactly one key: " + path);
     }
   }
 
@@ -411,44 +443,39 @@ void write_all(int descriptor, std::string_view contents, std::string_view path)
   }
   const auto type_end = first_line.find_first_of(whitespace, type_begin);
   if (type_end == std::string_view::npos) {
-    throw std::runtime_error("authorized key file is missing key data: " + path);
+    throw std::runtime_error("authorized key file is missing key data: " +
+                             path);
   }
   const auto data_begin = first_line.find_first_not_of(whitespace, type_end);
   if (data_begin == std::string_view::npos) {
-    throw std::runtime_error("authorized key file is missing key data: " + path);
+    throw std::runtime_error("authorized key file is missing key data: " +
+                             path);
   }
   const auto data_end = first_line.find_first_of(whitespace, data_begin);
   return {first_line.substr(type_begin, type_end - type_begin),
           first_line.substr(data_begin, data_end - data_begin)};
 }
 
-[[nodiscard]] AuthorizedKey load_authorized_key(const AuthorizedKeySpec &specification) {
+[[nodiscard]] AuthorizedKey
+load_authorized_key(const AuthorizedKeySpec &specification) {
   const auto contents = read_key_file(specification.path, false);
-  const auto [type_name, encoded] = public_key_tokens(contents, specification.path);
+  const auto [type_name, encoded] =
+      public_key_tokens(contents, specification.path);
   const std::string type_string(type_name);
   const auto type = ssh_key_type_from_name(type_string.c_str());
   if (type == SSH_KEYTYPE_UNKNOWN) {
-    throw std::runtime_error("unsupported public key type in: " + specification.path);
+    throw std::runtime_error("unsupported public key type in: " +
+                             specification.path);
   }
 
   ssh_key raw_key = nullptr;
   const std::string encoded_string(encoded);
-  if (ssh_pki_import_pubkey_base64(encoded_string.c_str(), type, &raw_key) != SSH_OK ||
+  if (ssh_pki_import_pubkey_base64(encoded_string.c_str(), type, &raw_key) !=
+          SSH_OK ||
       raw_key == nullptr) {
     throw std::runtime_error("invalid public key in: " + specification.path);
   }
   return AuthorizedKey{specification.user, UniqueKey(raw_key)};
-}
-
-[[nodiscard]] bool key_is_authorized(const SessionState &state, const char *user,
-                                     ssh_key offered_key) {
-  if (user == nullptr || offered_key == nullptr || state.authorized_keys == nullptr) {
-    return false;
-  }
-  return std::ranges::any_of(*state.authorized_keys, [&](const AuthorizedKey &candidate) {
-    return candidate.user == user &&
-           ssh_key_cmp(candidate.key.get(), offered_key, SSH_KEY_CMP_PUBLIC) == 0;
-  });
 }
 
 void report_denied_auth_attempt(SessionState &state) noexcept {
@@ -462,8 +489,8 @@ void report_denied_auth_attempt(SessionState &state) noexcept {
                            .worker = ::getpid(),
                            .telemetry = {}};
   for (;;) {
-    const auto count =
-        ::send(state.worker_report_descriptor, &event, sizeof(event), MSG_NOSIGNAL);
+    const auto count = ::send(state.worker_report_descriptor, &event,
+                              sizeof(event), MSG_NOSIGNAL);
     if (count == static_cast<ssize_t>(sizeof(event))) {
       return;
     }
@@ -474,6 +501,24 @@ void report_denied_auth_attempt(SessionState &state) noexcept {
     state.close_requested = true;
     return;
   }
+}
+
+int authenticate_none(ssh_session, const char *user, void *userdata) {
+  auto &state = *static_cast<SessionState *>(userdata);
+  const auto remote_user =
+      RemoteBytes::from_bounded_c_string(user, max_remote_username_size);
+  if (!remote_user || remote_user->text() != "guest") {
+    // OpenSSH probes "none" before offering a legitimate public key. Treat it
+    // as method discovery, not a failed credential attempt, so normal clients
+    // do not consume the per-IP authentication budget.
+    return SSH_AUTH_DENIED;
+  }
+  state.identity =
+      SessionIdentity{.kind = IdentityKind::guest, .handle = {}, .key = {}};
+  state.authenticated = true;
+  state.authenticated_at = Clock::now();
+  state.last_activity = state.authenticated_at;
+  return SSH_AUTH_SUCCESS;
 }
 
 void report_telemetry(int descriptor, std::uint64_t session_id,
@@ -491,15 +536,26 @@ void report_telemetry(int descriptor, std::uint64_t session_id,
 int authenticate_public_key(ssh_session, const char *user, ssh_key offered_key,
                             char signature_state, void *userdata) {
   auto &state = *static_cast<SessionState *>(userdata);
-  const bool authorized = key_is_authorized(state, user, offered_key);
+  static_cast<void>(user);
+  if (state.identity_store == nullptr) {
+    state.close_requested = true;
+    return SSH_AUTH_DENIED;
+  }
+  auto key = canonical_public_key(offered_key);
+  if (!key) {
+    report_denied_auth_attempt(state);
+    return SSH_AUTH_DENIED;
+  }
+  auto identity = resolve_public_key(*state.identity_store, *key);
   if (signature_state == SSH_PUBLICKEY_STATE_NONE) {
-    if (authorized) {
+    if (identity) {
       return SSH_AUTH_SUCCESS;
     }
     report_denied_auth_attempt(state);
     return SSH_AUTH_DENIED;
   }
-  if (signature_state == SSH_PUBLICKEY_STATE_VALID && authorized) {
+  if (signature_state == SSH_PUBLICKEY_STATE_VALID && identity) {
+    state.identity = std::move(*identity);
     state.authenticated = true;
     state.authenticated_at = Clock::now();
     state.last_activity = state.authenticated_at;
@@ -519,11 +575,13 @@ ssh_channel open_session_channel(ssh_session session, void *userdata) {
   return state.channel;
 }
 
-int request_pty(ssh_session, ssh_channel, const char *terminal_type, int columns, int rows,
-                int pixel_width, int pixel_height, void *userdata) {
+int request_pty(ssh_session, ssh_channel, const char *terminal_type,
+                int columns, int rows, int pixel_width, int pixel_height,
+                void *userdata) {
   auto &state = *static_cast<SessionState *>(userdata);
   if (state.pty_requested) {
-    const auto dimensions = normalize_resize_dimensions(columns, rows, pixel_width, pixel_height);
+    const auto dimensions =
+        normalize_resize_dimensions(columns, rows, pixel_width, pixel_height);
     if (dimensions) {
       state.columns = dimensions->columns;
       state.rows = dimensions->rows;
@@ -535,7 +593,8 @@ int request_pty(ssh_session, ssh_channel, const char *terminal_type, int columns
     }
     return SSH_OK;
   }
-  const auto dimensions = normalize_initial_dimensions(columns, rows, pixel_width, pixel_height);
+  const auto dimensions =
+      normalize_initial_dimensions(columns, rows, pixel_width, pixel_height);
   state.pty_requested = true;
   state.columns = dimensions.columns;
   state.rows = dimensions.rows;
@@ -552,10 +611,11 @@ int request_pty(ssh_session, ssh_channel, const char *terminal_type, int columns
   return SSH_OK;
 }
 
-int resize_pty(ssh_session, ssh_channel, int columns, int rows, int pixel_width, int pixel_height,
-               void *userdata) {
+int resize_pty(ssh_session, ssh_channel, int columns, int rows, int pixel_width,
+               int pixel_height, void *userdata) {
   auto &state = *static_cast<SessionState *>(userdata);
-  const auto dimensions = normalize_resize_dimensions(columns, rows, pixel_width, pixel_height);
+  const auto dimensions =
+      normalize_resize_dimensions(columns, rows, pixel_width, pixel_height);
   if (!dimensions) {
     return SSH_OK;
   }
@@ -600,20 +660,20 @@ int request_subsystem(ssh_session, ssh_channel, const char *, void *userdata) {
   return SSH_OK;
 }
 
-int receive_data(ssh_session, ssh_channel, void *data, std::uint32_t length, int is_stderr,
-                 void *userdata) {
+int receive_data(ssh_session, ssh_channel, void *data, std::uint32_t length,
+                 int is_stderr, void *userdata) {
   auto &state = *static_cast<SessionState *>(userdata);
   if (length > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
     state.close_requested = true;
     return SSH_ERROR;
   }
-  if (is_stderr != 0 || state.operation != RequestedOperation::shell || length == 0U) {
+  if (is_stderr != 0 || state.operation != RequestedOperation::shell ||
+      length == 0U) {
     return static_cast<int>(length);
   }
   const auto remote_input = RemoteBytes::from_raw(data, length);
-  if (!remote_input ||
-      !append_remote_bytes(state.pending_input, *remote_input,
-                           max_pending_input)) {
+  if (!remote_input || !append_remote_bytes(state.pending_input, *remote_input,
+                                            max_pending_input)) {
     state.close_requested = true;
     return remote_input ? static_cast<int>(length) : SSH_ERROR;
   }
@@ -633,15 +693,19 @@ void receive_close(ssh_session, ssh_channel, void *userdata) {
   static_cast<SessionState *>(userdata)->close_requested = true;
 }
 
-[[nodiscard]] bool write_channel(ssh_channel channel, const void *data, std::size_t length,
+[[nodiscard]] bool write_channel(ssh_channel channel, const void *data,
+                                 std::size_t length,
                                  bool standard_error = false) {
   const auto *bytes = static_cast<const std::byte *>(data);
   std::size_t offset = 0;
   while (offset < length) {
     const auto chunk = static_cast<std::uint32_t>(std::min<std::size_t>(
-        length - offset, static_cast<std::size_t>(std::numeric_limits<int>::max())));
-    const int count = standard_error ? ssh_channel_write_stderr(channel, bytes + offset, chunk)
-                                     : ssh_channel_write(channel, bytes + offset, chunk);
+        length - offset,
+        static_cast<std::size_t>(std::numeric_limits<int>::max())));
+    const int count =
+        standard_error
+            ? ssh_channel_write_stderr(channel, bytes + offset, chunk)
+            : ssh_channel_write(channel, bytes + offset, chunk);
     if (count <= 0) {
       return false;
     }
@@ -659,18 +723,22 @@ void close_channel(ssh_channel channel, int status) {
   static_cast<void>(ssh_channel_close(channel));
 }
 
-void await_peer_channel_close(ssh_event event, ssh_session session, SessionState &state) {
+void await_peer_channel_close(ssh_event event, ssh_session session,
+                              SessionState &state) {
   const auto deadline = Clock::now() + 500ms;
-  while (!state.close_requested && ssh_is_connected(session) != 0 && Clock::now() < deadline) {
+  while (!state.close_requested && ssh_is_connected(session) != 0 &&
+         Clock::now() < deadline) {
     if (ssh_event_dopoll(event, 10) == SSH_ERROR) {
       break;
     }
   }
 }
 
-[[nodiscard]] bool forward_session_input(int descriptor, std::vector<std::byte> &pending) {
+[[nodiscard]] bool forward_session_input(int descriptor,
+                                         std::vector<std::byte> &pending) {
   while (!pending.empty()) {
-    const auto count = ::send(descriptor, pending.data(), pending.size(), MSG_NOSIGNAL);
+    const auto count =
+        ::send(descriptor, pending.data(), pending.size(), MSG_NOSIGNAL);
     if (count > 0) {
       pending.erase(pending.begin(), pending.begin() + count);
       continue;
@@ -692,7 +760,8 @@ void await_peer_channel_close(ssh_event event, ssh_session session, SessionState
   for (;;) {
     const auto count = ::recv(descriptor, buffer.data(), buffer.size(), 0);
     if (count > 0) {
-      if (!discard && !write_channel(channel, buffer.data(), static_cast<std::size_t>(count))) {
+      if (!discard && !write_channel(channel, buffer.data(),
+                                     static_cast<std::size_t>(count))) {
         return false;
       }
       continue;
@@ -714,7 +783,8 @@ void await_peer_channel_close(ssh_event event, ssh_session session, SessionState
   bool requested = false;
   for (;;) {
     signalfd_siginfo signal_info{};
-    const auto count = ::read(signal_descriptor, &signal_info, sizeof(signal_info));
+    const auto count =
+        ::read(signal_descriptor, &signal_info, sizeof(signal_info));
     if (count < 0 && errno == EINTR) {
       continue;
     }
@@ -734,13 +804,15 @@ enum class SessionEnd { normal, idle_timeout, resource_limit, shutdown };
 
 class CpuProgressWatchdog {
  public:
-  explicit CpuProgressWatchdog(std::chrono::nanoseconds burst) : burst_(burst) {}
+  explicit CpuProgressWatchdog(std::chrono::nanoseconds burst)
+      : burst_(burst) {}
 
   [[nodiscard]] bool exceeded(SessionCpuProgress progress) noexcept {
     if (!progress.ready) {
       return false;
     }
-    if (!ready_ || progress.generation != generation_ || progress.consumed < baseline_) {
+    if (!ready_ || progress.generation != generation_ ||
+        progress.consumed < baseline_) {
       ready_ = true;
       generation_ = progress.generation;
       baseline_ = progress.consumed;
@@ -756,37 +828,39 @@ class CpuProgressWatchdog {
   bool ready_{};
 };
 
-[[nodiscard]] std::string_view failure_reason_name(SessionFailureReason reason) noexcept {
+[[nodiscard]] std::string_view
+failure_reason_name(SessionFailureReason reason) noexcept {
   switch (reason) {
-    case SessionFailureReason::none:
-      return "none";
-    case SessionFailureReason::app_returned_failure:
-      return "terminal application returned failure";
-    case SessionFailureReason::standard_exception:
-      return "standard exception escaped terminal session";
-    case SessionFailureReason::unknown_exception:
-      return "unknown exception escaped terminal session";
-    case SessionFailureReason::memory_limit:
-      return "session memory limit exceeded";
-    case SessionFailureReason::output_limit:
-      return "session output limit exceeded";
-    case SessionFailureReason::image_limit:
-      return "session terminal image quota exceeded";
+  case SessionFailureReason::none:
+    return "none";
+  case SessionFailureReason::app_returned_failure:
+    return "terminal application returned failure";
+  case SessionFailureReason::standard_exception:
+    return "standard exception escaped terminal session";
+  case SessionFailureReason::unknown_exception:
+    return "unknown exception escaped terminal session";
+  case SessionFailureReason::memory_limit:
+    return "session memory limit exceeded";
+  case SessionFailureReason::output_limit:
+    return "session output limit exceeded";
+  case SessionFailureReason::image_limit:
+    return "session terminal image quota exceeded";
   }
   return "unknown terminal session failure";
 }
 
-int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorized_keys,
-                const Config &config, int signal_descriptor, int worker_report_descriptor,
-                std::uint64_t session_id) {
+int run_session(ssh_session session, store::Store &identity_store,
+                const Config &config, int signal_descriptor,
+                int worker_report_descriptor, std::uint64_t session_id) {
   SessionState state;
-  state.authorized_keys = &authorized_keys;
+  state.identity_store = &identity_store;
   state.max_auth_attempts = config.max_auth_attempts_per_session;
   state.worker_report_descriptor = worker_report_descriptor;
   state.pending_input.reserve(4096);
 
   ssh_server_callbacks_struct server_callbacks{};
   server_callbacks.userdata = &state;
+  server_callbacks.auth_none_function = authenticate_none;
   server_callbacks.auth_pubkey_function = authenticate_public_key;
   server_callbacks.channel_open_request_session_function = open_session_channel;
   ssh_callbacks_init(&server_callbacks);
@@ -795,15 +869,19 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     std::cerr << "anvil: cannot install SSH server callbacks\n";
     return 1;
   }
-  static_cast<void>(ssh_set_auth_methods(session, SSH_AUTH_METHOD_PUBLICKEY));
+  static_cast<void>(ssh_set_auth_methods(
+      session, SSH_AUTH_METHOD_NONE | SSH_AUTH_METHOD_PUBLICKEY));
 
   timeval timeout{.tv_sec = authentication_timeout.count(), .tv_usec = 0};
   const auto socket = ssh_get_fd(session);
-  static_cast<void>(::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
-  static_cast<void>(::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
+  static_cast<void>(
+      ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
+  static_cast<void>(
+      ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
 
   if (ssh_handle_key_exchange(session) != SSH_OK) {
-    std::cerr << "anvil: key exchange failed: " << ssh_get_error(session) << '\n';
+    std::cerr << "anvil: key exchange failed: " << ssh_get_error(session)
+              << '\n';
     return 1;
   }
 
@@ -841,7 +919,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
   bool force_worker_exit = false;
 
   while (ssh_is_connected(session) != 0 && !state.close_requested) {
-    if (ssh_event_dopoll(event.get(), terminal_session ? 10 : 100) == SSH_ERROR) {
+    if (ssh_event_dopoll(event.get(), terminal_session ? 10 : 100) ==
+        SSH_ERROR) {
       break;
     }
     if (worker_shutdown_requested(signal_descriptor)) {
@@ -850,7 +929,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     }
     const auto now = Clock::now();
     if (!state.authenticated &&
-        (state.auth_attempts >= state.max_auth_attempts || now >= authentication_deadline)) {
+        (state.auth_attempts >= state.max_auth_attempts ||
+         now >= authentication_deadline)) {
       break;
     }
     if (state.authenticated) {
@@ -866,7 +946,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     }
 
     if (state.channel != nullptr && !state.channel_callbacks_installed) {
-      if (ssh_set_channel_callbacks(state.channel, &channel_callbacks) != SSH_OK) {
+      if (ssh_set_channel_callbacks(state.channel, &channel_callbacks) !=
+          SSH_OK) {
         break;
       }
       state.channel_callbacks_installed = true;
@@ -878,21 +959,24 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     if ((state.operation == RequestedOperation::exec ||
          state.operation == RequestedOperation::subsystem) &&
         !denial_sent) {
-      const std::string_view message = state.operation == RequestedOperation::exec
-                                           ? "Anvil does not execute commands.\r\n"
-                                           : "Anvil does not provide SSH subsystems.\r\n";
-      static_cast<void>(write_channel(state.channel, message.data(), message.size(), true));
+      const std::string_view message =
+          state.operation == RequestedOperation::exec
+              ? "Anvil does not execute commands.\r\n"
+              : "Anvil does not provide SSH subsystems.\r\n";
+      static_cast<void>(
+          write_channel(state.channel, message.data(), message.size(), true));
       close_channel(state.channel, 126);
       await_peer_channel_close(event.get(), session, state);
       denial_sent = true;
       break;
     }
 
-    if (state.operation == RequestedOperation::shell && !state.pty_requested && !denial_sent) {
-      constexpr std::string_view message =
-          "Anvil requires an interactive PTY; "
-          "omit -T or reconnect with -t.\r\n";
-      static_cast<void>(write_channel(state.channel, message.data(), message.size(), true));
+    if (state.operation == RequestedOperation::shell && !state.pty_requested &&
+        !denial_sent) {
+      constexpr std::string_view message = "Anvil requires an interactive PTY; "
+                                           "omit -T or reconnect with -t.\r\n";
+      static_cast<void>(
+          write_channel(state.channel, message.data(), message.size(), true));
       close_channel(state.channel, 126);
       await_peer_channel_close(event.get(), session, state);
       denial_sent = true;
@@ -903,22 +987,25 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
       std::array<int, 2> descriptors{};
       if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
                        descriptors.data()) != 0) {
-        std::cerr << "anvil: cannot create terminal session bridge: " << std::strerror(errno)
-                  << '\n';
+        std::cerr << "anvil: cannot create terminal session bridge: "
+                  << std::strerror(errno) << '\n';
         break;
       }
       application_descriptor = FileDescriptor(descriptors[0]);
       server_descriptor = FileDescriptor(descriptors[1]);
       try {
-        const TerminalDimensions dimensions{state.columns, state.rows, state.pixel_width,
-                                            state.pixel_height};
+        const TerminalDimensions dimensions{
+            state.columns, state.rows, state.pixel_width, state.pixel_height};
         terminal_session = std::make_unique<TerminalSession>(
-            application_descriptor.get(), state.terminal_type, dimensions, state.channel_opened_at,
-            config.session_resources, config.session_input_hook_for_testing);
+            application_descriptor.get(), state.terminal_type, dimensions,
+            state.channel_opened_at, config.session_resources, state.identity,
+            *state.identity_store, config.session_input_hook_for_testing);
         state.terminal_session = terminal_session.get();
-        auto armed = WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
+        auto armed =
+            WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
         if (!armed) {
-          std::cerr << "anvil: cannot arm session memory limit: " << armed.error() << '\n';
+          std::cerr << "anvil: cannot arm session memory limit: "
+                    << armed.error() << '\n';
           session_end = SessionEnd::resource_limit;
           resource_limit = ResourceLimitReason::memory;
           terminal_session.reset();
@@ -928,7 +1015,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
         memory_guard.emplace(std::move(*armed));
         terminal_session->start();
       } catch (const std::exception &error) {
-        std::cerr << "anvil: cannot start terminal session: " << error.what() << '\n';
+        std::cerr << "anvil: cannot start terminal session: " << error.what()
+                  << '\n';
         terminal_session.reset();
         state.terminal_session = nullptr;
         application_descriptor = FileDescriptor();
@@ -955,7 +1043,8 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
         force_worker_exit = true;
         break;
       }
-      if (!forward_session_input(server_descriptor.get(), state.pending_input)) {
+      if (!forward_session_input(server_descriptor.get(),
+                                 state.pending_input)) {
         application_failed = true;
         break;
       }
@@ -979,14 +1068,18 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
       }
     }
 
-    if (state.operation == RequestedOperation::shell && !state.idle_warning_sent &&
-        now - state.last_activity >= config.idle_timeout - config.idle_warning) {
+    if (state.operation == RequestedOperation::shell &&
+        !state.idle_warning_sent &&
+        now - state.last_activity >=
+            config.idle_timeout - config.idle_warning) {
       const auto seconds = config.idle_warning.count();
-      const auto warning = "Anvil: idle session will close in " + std::to_string(seconds) +
+      const auto warning = "Anvil: idle session will close in " +
+                           std::to_string(seconds) +
                            " seconds. Press any key to continue.";
       if (terminal_session) {
         terminal_session->post_notice(warning);
-      } else if (!write_channel(state.channel, warning.data(), warning.size())) {
+      } else if (!write_channel(state.channel, warning.data(),
+                                warning.size())) {
         break;
       }
       state.idle_warning_sent = true;
@@ -1006,13 +1099,15 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
   }
 
   if (force_worker_exit) {
-    const auto telemetry = terminal_session ? terminal_session->telemetry() : SessionTelemetry{};
+    const auto telemetry =
+        terminal_session ? terminal_session->telemetry() : SessionTelemetry{};
     report_telemetry(worker_report_descriptor, session_id, telemetry);
     std::cerr << "anvil: session " << ::getpid() << " exceeded its "
               << resource_limit_name(resource_limit) << " limit\n";
     if (state.channel != nullptr && ssh_channel_is_open(state.channel) != 0) {
       const auto message = resource_limit_message(resource_limit);
-      static_cast<void>(write_channel(state.channel, message.data(), message.size()));
+      static_cast<void>(
+          write_channel(state.channel, message.data(), message.size()));
       static_cast<void>(ssh_blocking_flush(session, 500));
       close_channel(state.channel, 124);
       await_peer_channel_close(event.get(), session, state);
@@ -1046,16 +1141,19 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     application_failed = application_failed || terminal_session->failed();
     const auto failure_reason = terminal_session->failure_reason();
     if (failure_reason != SessionFailureReason::none) {
-      std::cerr << "anvil: session " << ::getpid() << " failed: "
-                << failure_reason_name(failure_reason) << '\n';
+      std::cerr << "anvil: session " << ::getpid()
+                << " failed: " << failure_reason_name(failure_reason) << '\n';
     }
     const auto telemetry = terminal_session->telemetry();
     report_telemetry(worker_report_descriptor, session_id, telemetry);
-    std::cerr << "anvil: session " << ::getpid() << " frames=" << telemetry.frames
-              << " accepted=" << telemetry.accepted_frames << " cells=" << telemetry.cell_bytes
+    std::cerr << "anvil: session " << ::getpid()
+              << " frames=" << telemetry.frames
+              << " accepted=" << telemetry.accepted_frames
+              << " cells=" << telemetry.cell_bytes
               << " image-transmit=" << telemetry.image_transmit_bytes
               << " image-edit=" << telemetry.image_edit_bytes
-              << " first-frame-ms=" << telemetry.first_frame_latency.count() << '\n';
+              << " first-frame-ms=" << telemetry.first_frame_latency.count()
+              << '\n';
   }
 
   if (session_end == SessionEnd::resource_limit) {
@@ -1067,28 +1165,30 @@ int run_session(ssh_session session, const std::vector<AuthorizedKey> &authorize
     std::string_view message;
     int status = 0;
     switch (session_end) {
-      case SessionEnd::idle_timeout:
-        message = "Anvil: session closed after the idle timeout.\r\n";
-        status = 124;
-        break;
-      case SessionEnd::resource_limit:
-        message = resource_limit_message(resource_limit);
-        status = 124;
-        break;
-      case SessionEnd::shutdown:
-        message = "Anvil: server is shutting down; closing this session.\r\n";
-        break;
-      case SessionEnd::normal:
-        if (application_failed) {
-          message = "Anvil: this session failed; the board remains available.\r\n";
-          status = 1;
-        } else {
-          status = state.close_requested ? 1 : 0;
-        }
-        break;
+    case SessionEnd::idle_timeout:
+      message = "Anvil: session closed after the idle timeout.\r\n";
+      status = 124;
+      break;
+    case SessionEnd::resource_limit:
+      message = resource_limit_message(resource_limit);
+      status = 124;
+      break;
+    case SessionEnd::shutdown:
+      message = "Anvil: server is shutting down; closing this session.\r\n";
+      break;
+    case SessionEnd::normal:
+      if (application_failed) {
+        message =
+            "Anvil: this session failed; the board remains available.\r\n";
+        status = 1;
+      } else {
+        status = state.close_requested ? 1 : 0;
+      }
+      break;
     }
     if (!message.empty()) {
-      static_cast<void>(write_channel(state.channel, message.data(), message.size()));
+      static_cast<void>(
+          write_channel(state.channel, message.data(), message.size()));
     }
     close_channel(state.channel, status);
     await_peer_channel_close(event.get(), session, state);
@@ -1109,7 +1209,8 @@ struct ChildState {
 using ChildMap = std::unordered_map<pid_t, ChildState>;
 
 void drain_worker_reports(int descriptor, const ChildMap &children,
-                          AdmissionController &admission, HealthMonitor &health) {
+                          AdmissionController &admission,
+                          HealthMonitor &health) {
   for (;;) {
     WorkerReport event{};
     const auto count = ::recv(descriptor, &event, sizeof(event), 0);
@@ -1119,7 +1220,8 @@ void drain_worker_reports(int descriptor, const ChildMap &children,
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return;
     }
-    if (count != static_cast<ssize_t>(sizeof(event)) || event.magic != worker_report_magic ||
+    if (count != static_cast<ssize_t>(sizeof(event)) ||
+        event.magic != worker_report_magic ||
         event.version != worker_report_version) {
       return;
     }
@@ -1136,17 +1238,19 @@ void drain_worker_reports(int descriptor, const ChildMap &children,
   }
 }
 
-void reap_children(ChildMap &children, AdmissionController &admission, HealthMonitor &health) {
+void reap_children(ChildMap &children, AdmissionController &admission,
+                   HealthMonitor &health) {
   for (auto iterator = children.begin(); iterator != children.end();) {
     int status = 0;
     const auto child = ::waitpid(iterator->first, &status, WNOHANG);
     if (child == iterator->first) {
       if (WIFSIGNALED(status)) {
-        std::cerr << "anvil: session worker " << child << " terminated by signal "
-                  << WTERMSIG(status) << '\n';
+        std::cerr << "anvil: session worker " << child
+                  << " terminated by signal " << WTERMSIG(status) << '\n';
       }
       const auto now = Clock::now();
-      if (WIFEXITED(status) && WEXITSTATUS(status) == auth_report_failure_exit) {
+      if (WIFEXITED(status) &&
+          WEXITSTATUS(status) == auth_report_failure_exit) {
         admission.exhaust_auth_attempts(iterator->second.peer, now);
       }
       admission.release(iterator->second.peer, now);
@@ -1238,13 +1342,14 @@ void terminate_children(const ChildMap &children, int signal_number) {
   for (const auto &[child, state] : children) {
     static_cast<void>(state);
     if (::kill(child, signal_number) != 0 && errno != ESRCH) {
-      std::cerr << "anvil: cannot signal worker " << child << ": " << std::strerror(errno)
-                << '\n';
+      std::cerr << "anvil: cannot signal worker " << child << ": "
+                << std::strerror(errno) << '\n';
     }
   }
 }
 
-void await_children(ChildMap &children, int signal_descriptor, int worker_report_descriptor,
+void await_children(ChildMap &children, int signal_descriptor,
+                    int worker_report_descriptor,
                     AdmissionController &admission, HealthMonitor &health) {
   terminate_children(children, SIGTERM);
   const auto deadline = Clock::now() + shutdown_timeout;
@@ -1255,13 +1360,17 @@ void await_children(ChildMap &children, int signal_descriptor, int worker_report
     }};
     static_cast<void>(::poll(descriptors.data(), descriptors.size(), 100));
     if ((descriptors[1].revents & POLLIN) != 0) {
-      drain_worker_reports(worker_report_descriptor, children, admission, health);
+      drain_worker_reports(worker_report_descriptor, children, admission,
+                           health);
     }
     if ((descriptors[0].revents & POLLIN) != 0) {
       signalfd_siginfo signal_info{};
-      const auto count = ::read(signal_descriptor, &signal_info, sizeof(signal_info));
-      if (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-        std::cerr << "anvil: cannot read child signal: " << std::strerror(errno) << '\n';
+      const auto count =
+          ::read(signal_descriptor, &signal_info, sizeof(signal_info));
+      if (count < 0 && errno != EINTR && errno != EAGAIN &&
+          errno != EWOULDBLOCK) {
+        std::cerr << "anvil: cannot read child signal: " << std::strerror(errno)
+                  << '\n';
       }
     }
     reap_children(children, admission, health);
@@ -1302,7 +1411,8 @@ void await_children(ChildMap &children, int signal_descriptor, int worker_report
   return static_cast<std::uint16_t>(value);
 }
 
-[[nodiscard]] std::uint32_t parse_bounded_count(std::string_view text, std::string_view name,
+[[nodiscard]] std::uint32_t parse_bounded_count(std::string_view text,
+                                                std::string_view name,
                                                 std::uint32_t maximum) {
   if (text.empty()) {
     throw std::runtime_error(std::string(name) + " must not be empty");
@@ -1339,7 +1449,8 @@ void await_children(ChildMap &children, int signal_descriptor, int worker_report
   std::uint64_t value = 0U;
   for (const char character : text) {
     if (character < '0' || character > '9') {
-      throw std::runtime_error(std::string(name) + " must be a decimal byte count");
+      throw std::runtime_error(std::string(name) +
+                               " must be a decimal byte count");
     }
     const auto digit = static_cast<std::uint64_t>(character - '0');
     if (value > (maximum - digit) / 10U) {
@@ -1355,28 +1466,35 @@ void await_children(ChildMap &children, int signal_descriptor, int worker_report
   return value;
 }
 
-[[nodiscard]] std::chrono::seconds parse_duration(std::string_view text, std::string_view name);
+[[nodiscard]] std::chrono::seconds parse_duration(std::string_view text,
+                                                  std::string_view name);
 
-[[nodiscard]] RateLimit parse_rate_limit(std::string_view text, std::string_view name) {
+[[nodiscard]] RateLimit parse_rate_limit(std::string_view text,
+                                         std::string_view name) {
   const auto separator = text.find('/');
-  if (separator == std::string_view::npos || separator == 0U || separator + 1U >= text.size() ||
+  if (separator == std::string_view::npos || separator == 0U ||
+      separator + 1U >= text.size() ||
       text.find('/', separator + 1U) != std::string_view::npos) {
-    throw std::runtime_error(std::string(name) + " must have the form COUNT/PERIOD_SECONDS");
+    throw std::runtime_error(std::string(name) +
+                             " must have the form COUNT/PERIOD_SECONDS");
   }
-  const auto count =
-      parse_bounded_count(text.substr(0, separator), std::string(name) + " count", 1'000'000);
-  const auto period = parse_duration(text.substr(separator + 1U), std::string(name) + " period");
+  const auto count = parse_bounded_count(
+      text.substr(0, separator), std::string(name) + " count", 1'000'000);
+  const auto period = parse_duration(text.substr(separator + 1U),
+                                     std::string(name) + " period");
   return RateLimit{count, period};
 }
 
-[[nodiscard]] std::chrono::seconds parse_duration(std::string_view text, std::string_view name) {
+[[nodiscard]] std::chrono::seconds parse_duration(std::string_view text,
+                                                  std::string_view name) {
   if (text.empty()) {
     throw std::runtime_error(std::string(name) + " must not be empty");
   }
   std::uint64_t value = 0;
   for (const char character : text) {
     if (character < '0' || character > '9') {
-      throw std::runtime_error(std::string(name) + " must be a decimal number of seconds");
+      throw std::runtime_error(std::string(name) +
+                               " must be a decimal number of seconds");
     }
     value = value * 10U + static_cast<std::uint64_t>(character - '0');
     if (value > std::numeric_limits<std::uint32_t>::max()) {
@@ -1392,7 +1510,7 @@ void await_children(ChildMap &children, int signal_descriptor, int worker_report
 }  // namespace
 
 std::string_view usage() noexcept {
-  return "usage: anvil --host-key PATH --authorized-key USER=PATH [options]\n"
+  return "usage: anvil --host-key PATH [options]\n"
          "\n"
          "options:\n"
          "  --bind-address ADDRESS   address to listen on (default 127.0.0.1)\n"
@@ -1427,16 +1545,19 @@ std::string_view usage() noexcept {
          "  --session-cap-seconds S absolute session limit in seconds (default "
          "86400)\n"
          "  --session-memory-bytes B\n"
-         "                          allocation headroom per worker (default 67108864)\n"
+         "                          allocation headroom per worker (default "
+         "67108864)\n"
          "  --session-cpu-burst-ms M\n"
          "                          uninterrupted CPU burst (default 50)\n"
          "  --session-output-bytes-per-second B\n"
-         "                          output rate and one-second burst (default 1000000)\n"
+         "                          output rate and one-second burst (default "
+         "1000000)\n"
          "  --session-image-bytes B\n"
-         "                          resident image payload quota (default 33554432)\n"
+         "                          resident image payload quota (default "
+         "33554432)\n"
          "  --host-key PATH         unencrypted OpenSSH private host key\n"
-         "  --authorized-key U=P    authorize public key file P for user U; "
-         "repeatable\n"
+         "  --authorized-key U=P    bootstrap active user U from public key P; "
+         "optional, repeatable\n"
          "  --help                  show this help\n";
 }
 
@@ -1521,14 +1642,17 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     } else if (argument == "--max-sessions-per-ip") {
       result.config.max_sessions_per_ip = parse_session_limit(value);
     } else if (argument == "--connection-rate-limit") {
-      result.config.connection_rate = parse_rate_limit(value, "connection rate limit");
+      result.config.connection_rate =
+          parse_rate_limit(value, "connection rate limit");
     } else if (argument == "--auth-attempt-rate-limit") {
-      result.config.auth_attempt_rate = parse_rate_limit(value, "auth attempt rate limit");
+      result.config.auth_attempt_rate =
+          parse_rate_limit(value, "auth attempt rate limit");
     } else if (argument == "--max-auth-attempts-per-session") {
       result.config.max_auth_attempts_per_session =
           parse_bounded_count(value, "auth attempts per session", 4096);
     } else if (argument == "--max-tracked-ips") {
-      result.config.max_tracked_ips = parse_bounded_count(value, "tracked IP limit", 65'536);
+      result.config.max_tracked_ips =
+          parse_bounded_count(value, "tracked IP limit", 65'536);
     } else if (argument == "--idle-timeout-seconds") {
       result.config.idle_timeout = parse_duration(value, "idle timeout");
     } else if (argument == "--idle-warning-seconds") {
@@ -1541,7 +1665,8 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     } else if (argument == "--session-cpu-burst-ms") {
       const auto milliseconds =
           parse_bounded_count(value, "session CPU burst", 60'000U);
-      result.config.session_resources.cpu_burst = std::chrono::milliseconds(milliseconds);
+      result.config.session_resources.cpu_burst =
+          std::chrono::milliseconds(milliseconds);
     } else if (argument == "--session-output-bytes-per-second") {
       result.config.session_resources.output_bytes_per_second =
           parse_bounded_bytes(value, "session output rate", 1'000'000'000U);
@@ -1558,7 +1683,8 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
         throw std::runtime_error("authorized key must have the form USER=PATH");
       }
       result.config.authorized_keys.push_back(
-          {std::string(value.substr(0, separator)), std::string(value.substr(separator + 1U))});
+          {std::string(value.substr(0, separator)),
+           std::string(value.substr(separator + 1U))});
     }
   }
   if (!result.show_help) {
@@ -1584,22 +1710,23 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
           "scheduled backup options require --backup-directory");
     }
     if (result.config.max_sessions_per_ip > result.config.max_sessions) {
-      throw std::runtime_error("per-IP session limit must not exceed global session limit");
+      throw std::runtime_error(
+          "per-IP session limit must not exceed global session limit");
     }
     if (result.config.max_tracked_ips < result.config.max_sessions) {
-      throw std::runtime_error("tracked IP limit must be at least the global session limit");
+      throw std::runtime_error(
+          "tracked IP limit must be at least the global session limit");
     }
     if (result.config.idle_warning >= result.config.idle_timeout) {
-      throw std::runtime_error("idle warning must be shorter than idle timeout");
+      throw std::runtime_error(
+          "idle warning must be shorter than idle timeout");
     }
     if (result.config.health_port == result.config.port) {
-      throw std::runtime_error("health endpoint must use a separate port from SSH");
+      throw std::runtime_error(
+          "health endpoint must use a separate port from SSH");
     }
     if (result.config.host_key_path.empty()) {
       throw std::runtime_error("--host-key is required");
-    }
-    if (result.config.authorized_keys.empty()) {
-      throw std::runtime_error("at least one --authorized-key is required");
     }
   }
   return result;
@@ -1642,8 +1769,8 @@ int run(const Config &config) {
   auto database = store::SqliteStore::open(config.database_path);
   if (!database) {
     throw std::runtime_error("cannot initialize database '" +
-                             config.database_path + "': " +
-                             database.error().detail);
+                             config.database_path +
+                             "': " + database.error().detail);
   }
 
   if (ssh_init() != SSH_OK) {
@@ -1658,6 +1785,18 @@ int run(const Config &config) {
   for (const auto &specification : config.authorized_keys) {
     authorized_keys.push_back(load_authorized_key(specification));
   }
+  const auto identity_time = store::UtcEpochSeconds{
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count()};
+  for (const auto &authorized_key : authorized_keys) {
+    auto key = canonical_public_key(authorized_key.key.get());
+    if (!key || !bootstrap_active_identity(**database, authorized_key.user,
+                                           *key, identity_time)) {
+      throw std::runtime_error(
+          "cannot import --authorized-key into the identity store");
+    }
+  }
   auto host_key = load_or_create_host_key(config.host_key_path);
 
   UniqueBind bind(ssh_bind_new());
@@ -1666,27 +1805,33 @@ int run(const Config &config) {
   }
   const auto port = std::to_string(config.port);
   const bool configured =
-      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDADDR, config.bind_address.c_str()) ==
-          SSH_OK &&
-      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDPORT_STR, port.c_str()) == SSH_OK &&
-      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_IMPORT_KEY_STR, host_key.c_str()) == SSH_OK;
+      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDADDR,
+                           config.bind_address.c_str()) == SSH_OK &&
+      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDPORT_STR,
+                           port.c_str()) == SSH_OK &&
+      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_IMPORT_KEY_STR,
+                           host_key.c_str()) == SSH_OK;
   clear_secret(host_key.data(), host_key.size());
   if (!configured) {
     throw std::runtime_error("cannot configure SSH listener: " +
                              std::string(ssh_get_error(bind.get())));
   }
   if (ssh_bind_listen(bind.get()) != SSH_OK) {
-    throw std::runtime_error("cannot listen on " + config.bind_address + ':' + port + ": " +
+    throw std::runtime_error("cannot listen on " + config.bind_address + ':' +
+                             port + ": " +
                              std::string(ssh_get_error(bind.get())));
   }
 
   sigset_t signal_mask;
-  if (::sigemptyset(&signal_mask) != 0 || ::sigaddset(&signal_mask, SIGCHLD) != 0 ||
-      ::sigaddset(&signal_mask, SIGINT) != 0 || ::sigaddset(&signal_mask, SIGTERM) != 0 ||
+  if (::sigemptyset(&signal_mask) != 0 ||
+      ::sigaddset(&signal_mask, SIGCHLD) != 0 ||
+      ::sigaddset(&signal_mask, SIGINT) != 0 ||
+      ::sigaddset(&signal_mask, SIGTERM) != 0 ||
       ::sigprocmask(SIG_BLOCK, &signal_mask, nullptr) != 0) {
     throw_system_error("cannot block supervisor signals");
   }
-  FileDescriptor signal_descriptor(::signalfd(-1, &signal_mask, SFD_CLOEXEC | SFD_NONBLOCK));
+  FileDescriptor signal_descriptor(
+      ::signalfd(-1, &signal_mask, SFD_CLOEXEC | SFD_NONBLOCK));
   if (signal_descriptor.get() < 0) {
     throw_system_error("cannot create signal descriptor");
   }
@@ -1703,12 +1848,15 @@ int run(const Config &config) {
       config.health_bind_address,
       config.health_port,
       config.max_sessions,
-      {ssh_bind_get_fd(bind.get()), signal_descriptor.get(), worker_report_receiver.get(),
-       worker_report_sender.get()},
+      {ssh_bind_get_fd(bind.get()), signal_descriptor.get(),
+       worker_report_receiver.get(), worker_report_sender.get()},
   });
   health->set_component(
-      ComponentStatus{ComponentKind::storage, ComponentState::ready, "database",
-                      std::to_string((*database)->schema_version()), {}});
+      ComponentStatus{ComponentKind::storage,
+                      ComponentState::ready,
+                      "database",
+                      std::to_string((*database)->schema_version()),
+                      {}});
   if (!config.backup_directory.empty()) {
     health->set_component(ComponentStatus{ComponentKind::storage,
                                           ComponentState::not_configured,
@@ -1718,9 +1866,9 @@ int run(const Config &config) {
   }
   health->heartbeat(true);
 
-  AdmissionController admission(config.max_sessions, config.max_sessions_per_ip,
-                                config.connection_rate, config.auth_attempt_rate,
-                                config.max_tracked_ips);
+  AdmissionController admission(
+      config.max_sessions, config.max_sessions_per_ip, config.connection_rate,
+      config.auth_attempt_rate, config.max_tracked_ips);
   ChildMap children;
   children.reserve(config.max_sessions);
   std::uint64_t next_session_id = 1U;
@@ -1729,9 +1877,10 @@ int run(const Config &config) {
 
   bool stopping = false;
   bool health_failed = false;
-  std::cout << "anvil: listening on " << config.bind_address << ':' << config.port << '\n';
-  std::cout << "anvil: health listening on " << config.health_bind_address << ':'
-            << config.health_port << '\n';
+  std::cout << "anvil: listening on " << config.bind_address << ':'
+            << config.port << '\n';
+  std::cout << "anvil: health listening on " << config.health_bind_address
+            << ':' << config.health_port << '\n';
   if (!config.backup_directory.empty()) {
     std::cout << "anvil: backups enabled in " << config.backup_directory
               << " every " << config.backup_interval.count() << " seconds with "
@@ -1781,12 +1930,14 @@ int run(const Config &config) {
     }
 
     if ((descriptors[1].revents & POLLIN) != 0) {
-      drain_worker_reports(worker_report_receiver.get(), children, admission, *health);
+      drain_worker_reports(worker_report_receiver.get(), children, admission,
+                           *health);
     }
     if ((descriptors[2].revents & POLLIN) != 0) {
       for (;;) {
         signalfd_siginfo signal_info{};
-        const auto count = ::read(signal_descriptor.get(), &signal_info, sizeof(signal_info));
+        const auto count =
+            ::read(signal_descriptor.get(), &signal_info, sizeof(signal_info));
         if (count < 0 && errno == EINTR) {
           continue;
         }
@@ -1796,11 +1947,13 @@ int run(const Config &config) {
         if (count != static_cast<ssize_t>(sizeof(signal_info))) {
           throw std::runtime_error("short read from signal descriptor");
         }
-        if (signal_info.ssi_signo == SIGINT || signal_info.ssi_signo == SIGTERM) {
+        if (signal_info.ssi_signo == SIGINT ||
+            signal_info.ssi_signo == SIGTERM) {
           stopping = true;
         }
       }
-      drain_worker_reports(worker_report_receiver.get(), children, admission, *health);
+      drain_worker_reports(worker_report_receiver.get(), children, admission,
+                           *health);
       reap_children(children, admission, *health);
     }
     if (stopping || (descriptors[0].revents & POLLIN) == 0) {
@@ -1809,9 +1962,9 @@ int run(const Config &config) {
 
     sockaddr_storage raw_peer{};
     socklen_t raw_peer_size = sizeof(raw_peer);
-    FileDescriptor connection(
-        ::accept4(ssh_bind_get_fd(bind.get()), reinterpret_cast<sockaddr *>(&raw_peer),
-                  &raw_peer_size, SOCK_CLOEXEC));
+    FileDescriptor connection(::accept4(ssh_bind_get_fd(bind.get()),
+                                        reinterpret_cast<sockaddr *>(&raw_peer),
+                                        &raw_peer_size, SOCK_CLOEXEC));
     if (connection.get() < 0) {
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
         continue;
@@ -1820,11 +1973,13 @@ int run(const Config &config) {
       continue;
     }
     const auto raw_peer_bytes = std::as_bytes(std::span{&raw_peer, 1U});
-    const auto peer = raw_peer_size <= raw_peer_bytes.size()
-                          ? PeerAddress::from_remote_bytes(RemoteBytes::from_span(
-                                raw_peer_bytes.first(raw_peer_size)))
-                          : std::nullopt;
-    if (!peer || admission.admit(*peer, Clock::now()) != AdmissionDecision::allowed) {
+    const auto peer =
+        raw_peer_size <= raw_peer_bytes.size()
+            ? PeerAddress::from_remote_bytes(
+                  RemoteBytes::from_span(raw_peer_bytes.first(raw_peer_size)))
+            : std::nullopt;
+    if (!peer ||
+        admission.admit(*peer, Clock::now()) != AdmissionDecision::allowed) {
       continue;
     }
 
@@ -1835,8 +1990,10 @@ int run(const Config &config) {
       continue;
     }
     const auto accepted_descriptor = connection.release();
-    if (ssh_bind_accept_fd(bind.get(), session.get(), accepted_descriptor) != SSH_OK) {
-      std::cerr << "anvil: accept failed: " << ssh_get_error(bind.get()) << '\n';
+    if (ssh_bind_accept_fd(bind.get(), session.get(), accepted_descriptor) !=
+        SSH_OK) {
+      std::cerr << "anvil: accept failed: " << ssh_get_error(bind.get())
+                << '\n';
       if (ssh_get_fd(session.get()) != accepted_descriptor) {
         static_cast<void>(::close(accepted_descriptor));
       }
@@ -1858,7 +2015,8 @@ int run(const Config &config) {
       static_cast<void>(::close(worker_report_receiver.get()));
       bind.reset();
       sigset_t worker_mask;
-      if (::sigemptyset(&worker_mask) != 0 || ::sigaddset(&worker_mask, SIGINT) != 0 ||
+      if (::sigemptyset(&worker_mask) != 0 ||
+          ::sigaddset(&worker_mask, SIGINT) != 0 ||
           ::sigaddset(&worker_mask, SIGTERM) != 0 ||
           ::sigprocmask(SIG_SETMASK, &worker_mask, nullptr) != 0) {
         std::cerr << "anvil: cannot configure worker signals\n";
@@ -1870,9 +2028,9 @@ int run(const Config &config) {
         std::cerr << "anvil: cannot create worker signal descriptor\n";
         std::_Exit(1);
       }
-      const auto exit_status =
-          run_session(session.get(), authorized_keys, config, worker_signal_descriptor.get(),
-                      worker_report_sender.get(), session_id);
+      const auto exit_status = run_session(
+          session.get(), **database, config, worker_signal_descriptor.get(),
+          worker_report_sender.get(), session_id);
       ssh_disconnect(session.get());
       session.reset();
       std::_Exit(exit_status);
@@ -1889,8 +2047,8 @@ int run(const Config &config) {
   health->heartbeat(false);
   bind.reset();
   stop_scheduled_backup(backup_child);
-  await_children(children, signal_descriptor.get(), worker_report_receiver.get(), admission,
-                 *health);
+  await_children(children, signal_descriptor.get(),
+                 worker_report_receiver.get(), admission, *health);
   health->shutdown();
   return health_failed ? 1 : 0;
 }
