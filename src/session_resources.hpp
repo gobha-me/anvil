@@ -23,7 +23,7 @@ enum class ResourceLimitReason : std::uint8_t {
 
 struct SessionResourceLimits {
   std::uint64_t memory_bytes{64U << 20U};
-  std::chrono::nanoseconds cpu_burst{std::chrono::milliseconds(50)};
+  std::chrono::nanoseconds cpu_burst{std::chrono::milliseconds(250)};
   std::uint64_t output_bytes_per_second{1'000'000U};
   std::uint64_t image_bytes{32U << 20U};
 };

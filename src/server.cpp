@@ -1825,7 +1825,7 @@ std::string_view usage() noexcept {
          "                          allocation headroom per worker (default "
          "67108864)\n"
          "  --session-cpu-burst-ms M\n"
-         "                          uninterrupted CPU burst (default 50)\n"
+         "                          uninterrupted CPU burst (default 250)\n"
          "  --session-output-bytes-per-second B\n"
          "                          output rate and one-second burst (default "
          "1000000)\n"

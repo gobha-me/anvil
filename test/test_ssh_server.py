@@ -386,13 +386,14 @@ def main() -> int:
             assert b"Release planning" in created.stdout, created.stdout
             assert b"First board post" in created.stdout, created.stdout
 
-            replied = shell_session(
-                base, b"\n\nqStructured reply\n!Needs review\n\x1b\x1b"
-            )
+            replied = shell_session(base, b"\n\nqStructured reply\n\x1b\x1b")
             assert replied.returncode == 0, replied
             assert b"Reply to @tester" in replied.stdout, replied.stdout
             assert b"Structured reply" in replied.stdout, replied.stdout
-            assert b"Report submitted" in replied.stdout, replied.stdout
+
+            reported = shell_session(base, b"\n\n!Needs review\n\x1b\x1b")
+            assert reported.returncode == 0, reported
+            assert b"Report submitted" in reported.stdout, reported.stdout
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 alpha_future = executor.submit(shell_session, base, b"alpha-only\n")

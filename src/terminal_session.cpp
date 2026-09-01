@@ -767,6 +767,7 @@ private:
     composer_.clear();
     if (compose_action_ == ComposeAction::new_thread) {
       open_selected_board();
+      open_selected_thread();
       status_ = "Thread posted.";
     } else {
       open_selected_thread();

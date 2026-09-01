@@ -268,7 +268,7 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.session_cap.count() == 86'400);
   CHECK(parsed.config.session_resources.memory_bytes == (64U << 20U));
   CHECK(parsed.config.session_resources.cpu_burst ==
-        std::chrono::milliseconds(50));
+        std::chrono::milliseconds(250));
   CHECK(parsed.config.session_resources.output_bytes_per_second == 1'000'000U);
   CHECK(parsed.config.session_resources.image_bytes == (32U << 20U));
   CHECK(parsed.config.max_sessions == 64);

@@ -111,7 +111,7 @@ install -d -m 700 state
   --idle-warning-seconds 30 \
   --session-cap-seconds 86400 \
   --session-memory-bytes 67108864 \
-  --session-cpu-burst-ms 50 \
+  --session-cpu-burst-ms 250 \
   --session-output-bytes-per-second 1000000 \
   --session-image-bytes 33554432 \
   --database state/anvil.db \
@@ -217,7 +217,7 @@ count as activity. A separate 24-hour cap applies even to active sessions.
 Operators can set all three positive durations in whole seconds with
 `--idle-timeout-seconds`, `--idle-warning-seconds`, and
 `--session-cap-seconds`; the warning must remain shorter than the idle timeout.
-Each worker also receives 64 MiB of address-space headroom, a 50 ms maximum
+Each worker also receives 64 MiB of address-space headroom, a 250 ms maximum
 uninterrupted application CPU burst, a 1,000,000-byte-per-second output bucket
 with a one-second burst, and a 32 MiB resident terminal-image source-payload
 quota. Operators can set positive values with `--session-memory-bytes`,

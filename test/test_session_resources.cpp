@@ -14,7 +14,7 @@ using namespace std::chrono_literals;
 TEST_CASE("session resource defaults are the conservative operator baseline") {
   const anvil::server::SessionResourceLimits limits;
   CHECK(limits.memory_bytes == (64U << 20U));
-  CHECK(limits.cpu_burst == 50ms);
+  CHECK(limits.cpu_burst == 250ms);
   CHECK(limits.output_bytes_per_second == 1'000'000U);
   CHECK(limits.image_bytes == (32U << 20U));
 }
