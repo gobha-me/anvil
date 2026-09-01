@@ -231,6 +231,12 @@ catch_discover_tests(anvil_sdk_wrapper_tests)
 catch_discover_tests(anvil_store_tests)
 
 if(ANVIL_SERVER)
+  add_executable(anvil_ssh_protocol_client ssh_protocol_client.cpp)
+  target_compile_features(anvil_ssh_protocol_client PRIVATE cxx_std_23)
+  target_compile_options(anvil_ssh_protocol_client PRIVATE ${ANVIL_WARNING_FLAGS})
+  target_link_libraries(anvil_ssh_protocol_client PRIVATE ${ANVIL_LIBSSH_TARGET})
+  anvil_apply_input_safety(anvil_ssh_protocol_client)
+
   add_executable(anvil_failure_test_server failure_server_main.cpp)
   target_compile_features(anvil_failure_test_server PRIVATE cxx_std_23)
   target_compile_options(anvil_failure_test_server PRIVATE ${ANVIL_WARNING_FLAGS})
@@ -298,6 +304,16 @@ if(ANVIL_SERVER)
       $<TARGET_FILE:anvil>
   )
   set_tests_properties(ssh_session_lifecycle PROPERTIES TIMEOUT 45)
+
+  add_test(
+    NAME ssh_session_protocol
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_ssh_protocol.py
+      $<TARGET_FILE:anvil_ssh_protocol_client>
+      $<TARGET_FILE:anvil>
+  )
+  set_tests_properties(ssh_session_protocol PROPERTIES TIMEOUT 60)
 
   add_test(
     NAME ssh_session_failure_isolation

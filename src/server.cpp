@@ -1000,313 +1000,418 @@ failure_reason_name(SessionFailureReason reason) noexcept {
   return "unknown terminal session failure";
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- one SSH request state machine preserves hostile callback and cleanup ordering
-int run_session(ssh_session session, store::Store &identity_store,
-                const Config &config, const TosPolicy &tos_policy,
-                int signal_descriptor, int worker_report_descriptor,
-                int guest_report_permit_descriptor,
-                int oneliner_event_descriptor, std::uint64_t session_id) {
-  SessionState state;
-  state.identity_store = &identity_store;
-  state.tos_version = tos_policy.version;
-  state.max_auth_attempts = config.max_auth_attempts_per_session;
-  state.worker_report_descriptor = worker_report_descriptor;
-  state.pending_input.reserve(4096);
+struct SessionOutcome {
+  SessionEnd end{SessionEnd::normal};
+  ResourceLimitReason resource_limit{ResourceLimitReason::none};
+  bool application_failed{};
+  bool force_worker_exit{};
+};
 
-  ssh_server_callbacks_struct server_callbacks{};
-  server_callbacks.userdata = &state;
-  server_callbacks.auth_none_function = authenticate_none;
-  server_callbacks.auth_pubkey_function = authenticate_public_key;
-  server_callbacks.channel_open_request_session_function = open_session_channel;
-  ssh_callbacks_init(&server_callbacks);
+struct SessionDescriptors {
+  int signal;
+  int worker_report;
+  int guest_report_permit;
+  int oneliner_event;
+};
 
-  if (ssh_set_server_callbacks(session, &server_callbacks) != SSH_OK) {
-    std::cerr << "anvil: cannot install SSH server callbacks\n";
-    return 1;
-  }
-  static_cast<void>(ssh_set_auth_methods(
-      session, SSH_AUTH_METHOD_NONE | SSH_AUTH_METHOD_PUBLICKEY));
-
-  timeval timeout{.tv_sec = authentication_timeout.count(), .tv_usec = 0};
-  const auto socket = ssh_get_fd(session);
-  static_cast<void>(
-      ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
-  static_cast<void>(
-      ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
-
-  if (ssh_handle_key_exchange(session) != SSH_OK) {
-    std::cerr << "anvil: key exchange failed: " << ssh_get_error(session)
-              << '\n';
-    return 1;
+class SessionProtocol {
+public:
+  SessionProtocol(ssh_session session, store::Store &identity_store,
+                  const Config &config, const TosPolicy &tos_policy,
+                  SessionDescriptors descriptors, std::uint64_t session_id)
+      : session_(session), config_(config), tos_policy_(tos_policy),
+        descriptors_(descriptors), session_id_(session_id),
+        cpu_watchdog_(config.session_resources.cpu_burst),
+        session_output_buffer_(std::size_t{16U} * 1024U) {
+    state_.identity_store = &identity_store;
+    state_.tos_version = tos_policy.version;
+    state_.max_auth_attempts = config.max_auth_attempts_per_session;
+    state_.worker_report_descriptor = descriptors.worker_report;
+    state_.pending_input.reserve(4096);
   }
 
-  UniqueEvent event(ssh_event_new());
-  if (!event || ssh_event_add_session(event.get(), session) != SSH_OK) {
-    std::cerr << "anvil: cannot create session event loop\n";
-    return 1;
+  ~SessionProtocol() { release_libssh_resources(); }
+
+  SessionProtocol(const SessionProtocol &) = delete;
+  auto operator=(const SessionProtocol &) -> SessionProtocol & = delete;
+
+  [[nodiscard]] int run() {
+    if (!initialize()) {
+      return 1;
+    }
+    while (session_is_active() && poll_once()) {
+    }
+    if (outcome_.force_worker_exit) {
+      force_worker_exit();
+    }
+    finish_terminal_session();
+    report_resource_limit();
+    finish_channel();
+    release_libssh_resources();
+    return state_.auth_report_failed ? auth_report_failure_exit : 0;
   }
 
-  ssh_channel_callbacks_struct channel_callbacks{};
-  channel_callbacks.userdata = &state;
-  channel_callbacks.channel_data_function = receive_data;
-  channel_callbacks.channel_eof_function = receive_eof;
-  channel_callbacks.channel_close_function = receive_close;
-  channel_callbacks.channel_pty_request_function = request_pty;
-  channel_callbacks.channel_pty_window_change_function = resize_pty;
-  channel_callbacks.channel_shell_request_function = request_shell;
-  channel_callbacks.channel_exec_request_function = request_exec;
-  channel_callbacks.channel_subsystem_request_function = request_subsystem;
-  ssh_callbacks_init(&channel_callbacks);
+private:
+  [[nodiscard]] bool initialize() {
+    initialize_server_callbacks();
+    if (ssh_set_server_callbacks(session_, &server_callbacks_) != SSH_OK) {
+      std::cerr << "anvil: cannot install SSH server callbacks\n";
+      return false;
+    }
+    ssh_set_auth_methods(session_,
+                         SSH_AUTH_METHOD_NONE | SSH_AUTH_METHOD_PUBLICKEY);
+    configure_authentication_socket_timeout();
+    if (ssh_handle_key_exchange(session_) != SSH_OK) {
+      std::cerr << "anvil: key exchange failed: " << ssh_get_error(session_)
+                << '\n';
+      return false;
+    }
+    event_.reset(ssh_event_new());
+    if (!event_ || ssh_event_add_session(event_.get(), session_) != SSH_OK) {
+      std::cerr << "anvil: cannot create session event loop\n";
+      return false;
+    }
+    event_registered_ = true;
+    initialize_channel_callbacks();
+    authentication_deadline_ = Clock::now() + authentication_timeout;
+    return true;
+  }
 
-  const auto authentication_deadline = Clock::now() + authentication_timeout;
-  bool denial_sent = false;
-  bool application_failed = false;
-  std::optional<Clock::time_point> input_eof_at;
-  FileDescriptor application_descriptor;
-  FileDescriptor server_descriptor;
-  std::unique_ptr<TerminalSession> terminal_session;
-  std::optional<WorkerMemoryGuard> memory_guard;
-  CpuProgressWatchdog cpu_watchdog(config.session_resources.cpu_burst);
-  std::vector<std::byte> session_output_buffer(16U * 1024U);
-  SessionTelemetry reported_telemetry;
-  auto session_end = SessionEnd::normal;
-  auto resource_limit = ResourceLimitReason::none;
-  bool force_worker_exit = false;
+  void initialize_server_callbacks() {
+    server_callbacks_.userdata = &state_;
+    server_callbacks_.auth_none_function = authenticate_none;
+    server_callbacks_.auth_pubkey_function = authenticate_public_key;
+    server_callbacks_.channel_open_request_session_function =
+        open_session_channel;
+    server_callbacks_.size = sizeof(server_callbacks_);
+  }
 
-  while (ssh_is_connected(session) != 0 && !state.close_requested) {
-    if (ssh_event_dopoll(event.get(), terminal_session ? 10 : 100) ==
+  void initialize_channel_callbacks() {
+    channel_callbacks_.userdata = &state_;
+    channel_callbacks_.channel_data_function = receive_data;
+    channel_callbacks_.channel_eof_function = receive_eof;
+    channel_callbacks_.channel_close_function = receive_close;
+    channel_callbacks_.channel_pty_request_function = request_pty;
+    channel_callbacks_.channel_pty_window_change_function = resize_pty;
+    channel_callbacks_.channel_shell_request_function = request_shell;
+    channel_callbacks_.channel_exec_request_function = request_exec;
+    channel_callbacks_.channel_subsystem_request_function = request_subsystem;
+    channel_callbacks_.size = sizeof(channel_callbacks_);
+  }
+
+  void configure_authentication_socket_timeout() const {
+    timeval timeout{.tv_sec = authentication_timeout.count(), .tv_usec = 0};
+    const auto socket = ssh_get_fd(session_);
+    static_cast<void>(::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                                   sizeof(timeout)));
+    static_cast<void>(::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                                   sizeof(timeout)));
+  }
+
+  [[nodiscard]] bool session_is_active() const {
+    return ssh_is_connected(session_) != 0 && !state_.close_requested;
+  }
+
+  [[nodiscard]] bool poll_once() {
+    if (ssh_event_dopoll(event_.get(), terminal_session_ ? 10 : 100) ==
         SSH_ERROR) {
-      break;
+      return false;
     }
-    if (worker_shutdown_requested(signal_descriptor)) {
-      session_end = SessionEnd::shutdown;
-      break;
+    if (worker_shutdown_requested(descriptors_.signal)) {
+      outcome_.end = SessionEnd::shutdown;
+      return false;
     }
-    if (terminal_session &&
-        consume_oneliner_notifications(oneliner_event_descriptor)) {
-      terminal_session->post_oneliners_changed();
-    }
+    consume_application_notifications();
     const auto now = Clock::now();
-    if (!state.authenticated &&
-        (state.auth_attempts >= state.max_auth_attempts ||
-         now >= authentication_deadline)) {
-      break;
+    if (!within_lifecycle_limits(now) || !install_channel_callbacks()) {
+      return false;
     }
-    if (state.authenticated) {
-      if (now - state.authenticated_at >= config.session_cap) {
-        session_end = SessionEnd::resource_limit;
-        resource_limit = ResourceLimitReason::duration;
-        break;
-      }
-      if (now - state.last_activity >= config.idle_timeout) {
-        session_end = SessionEnd::idle_timeout;
-        break;
-      }
+    if (state_.channel == nullptr) {
+      return true;
     }
+    if (reject_unsupported_operation() || !start_terminal_if_requested() ||
+        !service_terminal_session() || !send_idle_warning(now) ||
+        input_eof_drained(now)) {
+      return false;
+    }
+    return ssh_channel_is_open(state_.channel) != 0;
+  }
 
-    if (state.channel != nullptr && !state.channel_callbacks_installed) {
-      if (ssh_set_channel_callbacks(state.channel, &channel_callbacks) !=
-          SSH_OK) {
-        break;
-      }
-      state.channel_callbacks_installed = true;
-    }
-    if (state.channel == nullptr) {
-      continue;
-    }
-
-    if ((state.operation == RequestedOperation::exec ||
-         state.operation == RequestedOperation::subsystem) &&
-        !denial_sent) {
-      const std::string_view message =
-          state.operation == RequestedOperation::exec
-              ? "Anvil does not execute commands.\r\n"
-              : "Anvil does not provide SSH subsystems.\r\n";
-      static_cast<void>(
-          write_channel(state.channel, message.data(), message.size(), true));
-      close_channel(state.channel, 126);
-      await_peer_channel_close(event.get(), session, state);
-      break;
-    }
-
-    if (state.operation == RequestedOperation::shell && !state.pty_requested &&
-        !denial_sent) {
-      constexpr std::string_view message = "Anvil requires an interactive PTY; "
-                                           "omit -T or reconnect with -t.\r\n";
-      static_cast<void>(
-          write_channel(state.channel, message.data(), message.size(), true));
-      close_channel(state.channel, 126);
-      await_peer_channel_close(event.get(), session, state);
-      break;
-    }
-
-    if (state.operation == RequestedOperation::shell && !terminal_session) {
-      std::array<int, 2> descriptors{};
-      if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
-                       descriptors.data()) != 0) {
-        std::cerr << "anvil: cannot create terminal session bridge: "
-                  << std::strerror(errno) << '\n';
-        break;
-      }
-      application_descriptor = FileDescriptor(descriptors[0]);
-      server_descriptor = FileDescriptor(descriptors[1]);
-      try {
-        const TerminalDimensions dimensions{
-            state.columns, state.rows, state.pixel_width, state.pixel_height};
-        terminal_session = std::make_unique<TerminalSession>(
-            application_descriptor.get(), state.terminal_type, dimensions,
-            state.channel_opened_at, config.session_resources,
-            config.registration_mode, config.invite_policy, tos_policy,
-            state.identity, *state.identity_store, config.oneliner_policy,
-            config.session_input_hook_for_testing,
-            guest_report_permit_descriptor, report_oneliner_published,
-            worker_report_descriptor, session_id);
-        state.terminal_session = terminal_session.get();
-        auto armed =
-            WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
-        if (!armed) {
-          std::cerr << "anvil: cannot arm session memory limit: "
-                    << armed.error() << '\n';
-          session_end = SessionEnd::resource_limit;
-          resource_limit = ResourceLimitReason::memory;
-          terminal_session.reset();
-          state.terminal_session = nullptr;
-          break;
-        }
-        memory_guard.emplace(std::move(*armed));
-        terminal_session->start();
-      } catch (const std::exception &error) {
-        std::cerr << "anvil: cannot start terminal session: " << error.what()
-                  << '\n';
-        terminal_session.reset();
-        state.terminal_session = nullptr;
-        application_descriptor = FileDescriptor();
-        server_descriptor = FileDescriptor();
-        application_failed = true;
-        break;
-      }
-    }
-
-    if (terminal_session) {
-      if (memory_guard && memory_guard->exceeded()) {
-        memory_guard->release_emergency_reserve();
-        session_end = SessionEnd::resource_limit;
-        resource_limit = ResourceLimitReason::memory;
-        force_worker_exit = true;
-        break;
-      }
-      if (cpu_watchdog.exceeded(terminal_session->cpu_progress())) {
-        if (memory_guard) {
-          memory_guard->release_emergency_reserve();
-        }
-        session_end = SessionEnd::resource_limit;
-        resource_limit = ResourceLimitReason::cpu;
-        force_worker_exit = true;
-        break;
-      }
-      if (!forward_session_input(server_descriptor.get(),
-                                 state.pending_input)) {
-        application_failed = true;
-        break;
-      }
-      if (!forward_session_output(server_descriptor.get(), state.channel,
-                                  session_output_buffer)) {
-        break;
-      }
-      if (terminal_session->finished()) {
-        application_failed = terminal_session->failed();
-        if (const auto limit = terminal_session->limit_reason();
-            limit != ResourceLimitReason::none) {
-          session_end = SessionEnd::resource_limit;
-          resource_limit = limit;
-        }
-        break;
-      }
-      const auto telemetry = terminal_session->telemetry();
-      if (telemetry != reported_telemetry) {
-        report_telemetry(worker_report_descriptor, session_id, telemetry);
-        reported_telemetry = telemetry;
-      }
-    }
-
-    if (state.operation == RequestedOperation::shell &&
-        !state.idle_warning_sent &&
-        now - state.last_activity >=
-            config.idle_timeout - config.idle_warning) {
-      const auto seconds = config.idle_warning.count();
-      const auto warning = "Anvil: idle session will close in " +
-                           std::to_string(seconds) +
-                           " seconds. Press any key to continue.";
-      if (terminal_session) {
-        terminal_session->post_notice(warning);
-      } else if (!write_channel(state.channel, warning.data(),
-                                warning.size())) {
-        break;
-      }
-      state.idle_warning_sent = true;
-    }
-    if (state.operation == RequestedOperation::shell &&
-        (state.input_eof || ssh_channel_is_eof(state.channel) != 0)) {
-      if (!input_eof_at) {
-        input_eof_at = now;
-      }
-      if (state.pending_input.empty() && now - *input_eof_at >= 100ms) {
-        break;
-      }
-    }
-    if (ssh_channel_is_open(state.channel) == 0) {
-      break;
+  void consume_application_notifications() const {
+    if (terminal_session_ &&
+        consume_oneliner_notifications(descriptors_.oneliner_event)) {
+      terminal_session_->post_oneliners_changed();
     }
   }
 
-  if (force_worker_exit) {
+  [[nodiscard]] bool within_lifecycle_limits(Clock::time_point now) {
+    if (!state_.authenticated) {
+      return state_.auth_attempts < state_.max_auth_attempts &&
+             now < authentication_deadline_;
+    }
+    if (now - state_.authenticated_at >= config_.session_cap) {
+      set_resource_limit(ResourceLimitReason::duration);
+      return false;
+    }
+    if (now - state_.last_activity >= config_.idle_timeout) {
+      outcome_.end = SessionEnd::idle_timeout;
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool install_channel_callbacks() {
+    if (state_.channel == nullptr || state_.channel_callbacks_installed) {
+      return true;
+    }
+    if (ssh_set_channel_callbacks(state_.channel, &channel_callbacks_) !=
+        SSH_OK) {
+      return false;
+    }
+    state_.channel_callbacks_installed = true;
+    return true;
+  }
+
+  [[nodiscard]] bool reject_unsupported_operation() {
+    switch (state_.operation) {
+    case RequestedOperation::exec:
+      refuse_channel("Anvil does not execute commands.\r\n");
+      return true;
+    case RequestedOperation::subsystem:
+      refuse_channel("Anvil does not provide SSH subsystems.\r\n");
+      return true;
+    case RequestedOperation::shell:
+      if (!state_.pty_requested) {
+        refuse_channel("Anvil requires an interactive PTY; omit -T or "
+                       "reconnect with -t.\r\n");
+        return true;
+      }
+      return false;
+    case RequestedOperation::none:
+      return false;
+    }
+    return false;
+  }
+
+  void refuse_channel(std::string_view message) {
+    static_cast<void>(
+        write_channel(state_.channel, message.data(), message.size(), true));
+    close_channel(state_.channel, 126);
+    await_peer_channel_close(event_.get(), session_, state_);
+  }
+
+  [[nodiscard]] bool start_terminal_if_requested() {
+    if (state_.operation != RequestedOperation::shell || terminal_session_) {
+      return true;
+    }
+    std::array<int, 2> descriptors{};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                     descriptors.data()) != 0) {
+      const std::error_code error(errno, std::generic_category());
+      std::cerr << "anvil: cannot create terminal session bridge: "
+                << error.message() << '\n';
+      return false;
+    }
+    application_descriptor_ = FileDescriptor(descriptors[0]);
+    server_descriptor_ = FileDescriptor(descriptors[1]);
+    return construct_terminal_session();
+  }
+
+  [[nodiscard]] bool construct_terminal_session() {
+    try {
+      const TerminalDimensions dimensions{
+          state_.columns, state_.rows, state_.pixel_width, state_.pixel_height};
+      terminal_session_ = std::make_unique<TerminalSession>(
+          application_descriptor_.get(), state_.terminal_type, dimensions,
+          state_.channel_opened_at, config_.session_resources,
+          config_.registration_mode, config_.invite_policy, tos_policy_,
+          state_.identity, *state_.identity_store, config_.oneliner_policy,
+          config_.session_input_hook_for_testing,
+          descriptors_.guest_report_permit, report_oneliner_published,
+          descriptors_.worker_report, session_id_);
+      state_.terminal_session = terminal_session_.get();
+      auto armed =
+          WorkerMemoryGuard::arm(config_.session_resources.memory_bytes);
+      if (!armed) {
+        std::cerr << "anvil: cannot arm session memory limit: " << armed.error()
+                  << '\n';
+        set_resource_limit(ResourceLimitReason::memory);
+        terminal_session_.reset();
+        state_.terminal_session = nullptr;
+        return false;
+      }
+      memory_guard_.emplace(std::move(*armed));
+      terminal_session_->start();
+      return true;
+    } catch (const std::exception &error) {
+      std::cerr << "anvil: cannot start terminal session: " << error.what()
+                << '\n';
+      terminal_session_.reset();
+      state_.terminal_session = nullptr;
+      application_descriptor_ = FileDescriptor();
+      server_descriptor_ = FileDescriptor();
+      outcome_.application_failed = true;
+      return false;
+    }
+  }
+
+  [[nodiscard]] bool service_terminal_session() {
+    if (!terminal_session_) {
+      return true;
+    }
+    if (memory_guard_ && memory_guard_->exceeded()) {
+      set_forced_resource_limit(ResourceLimitReason::memory);
+      return false;
+    }
+    if (cpu_watchdog_.exceeded(terminal_session_->cpu_progress())) {
+      set_forced_resource_limit(ResourceLimitReason::cpu);
+      return false;
+    }
+    if (!forward_session_input(server_descriptor_.get(),
+                               state_.pending_input)) {
+      outcome_.application_failed = true;
+      return false;
+    }
+    if (!forward_session_output(server_descriptor_.get(), state_.channel,
+                                session_output_buffer_)) {
+      return false;
+    }
+    if (terminal_session_->finished()) {
+      record_terminal_completion();
+      return false;
+    }
+    report_changed_telemetry();
+    return true;
+  }
+
+  void record_terminal_completion() {
+    outcome_.application_failed = terminal_session_->failed();
+    const auto limit = terminal_session_->limit_reason();
+    if (limit != ResourceLimitReason::none) {
+      set_resource_limit(limit);
+    }
+  }
+
+  void report_changed_telemetry() {
+    const auto telemetry = terminal_session_->telemetry();
+    if (telemetry == reported_telemetry_) {
+      return;
+    }
+    report_telemetry(descriptors_.worker_report, session_id_, telemetry);
+    reported_telemetry_ = telemetry;
+  }
+
+  void set_resource_limit(ResourceLimitReason limit) {
+    outcome_.end = SessionEnd::resource_limit;
+    outcome_.resource_limit = limit;
+  }
+
+  void set_forced_resource_limit(ResourceLimitReason limit) {
+    if (memory_guard_) {
+      memory_guard_->release_emergency_reserve();
+    }
+    set_resource_limit(limit);
+    outcome_.force_worker_exit = true;
+  }
+
+  [[nodiscard]] bool send_idle_warning(Clock::time_point now) {
+    if (state_.operation != RequestedOperation::shell ||
+        state_.idle_warning_sent ||
+        now - state_.last_activity <
+            config_.idle_timeout - config_.idle_warning) {
+      return true;
+    }
+    const auto warning = "Anvil: idle session will close in " +
+                         std::to_string(config_.idle_warning.count()) +
+                         " seconds. Press any key to continue.";
+    if (terminal_session_) {
+      terminal_session_->post_notice(warning);
+    } else if (!write_channel(state_.channel, warning.data(), warning.size())) {
+      return false;
+    }
+    state_.idle_warning_sent = true;
+    return true;
+  }
+
+  [[nodiscard]] bool input_eof_drained(Clock::time_point now) {
+    if (state_.operation != RequestedOperation::shell ||
+        (!state_.input_eof && ssh_channel_is_eof(state_.channel) == 0)) {
+      return false;
+    }
+    if (!input_eof_at_) {
+      input_eof_at_ = now;
+    }
+    return state_.pending_input.empty() && now - *input_eof_at_ >= 100ms;
+  }
+
+  [[noreturn]] void force_worker_exit() {
     const auto telemetry =
-        terminal_session ? terminal_session->telemetry() : SessionTelemetry{};
-    report_telemetry(worker_report_descriptor, session_id, telemetry);
+        terminal_session_ ? terminal_session_->telemetry() : SessionTelemetry{};
+    report_telemetry(descriptors_.worker_report, session_id_, telemetry);
     std::cerr << "anvil: session " << ::getpid() << " exceeded its "
-              << resource_limit_name(resource_limit) << " limit\n";
-    if (state.channel != nullptr && ssh_channel_is_open(state.channel) != 0) {
-      const auto message = resource_limit_message(resource_limit);
+              << resource_limit_name(outcome_.resource_limit) << " limit\n";
+    if (state_.channel != nullptr && ssh_channel_is_open(state_.channel) != 0) {
+      const auto message = resource_limit_message(outcome_.resource_limit);
       static_cast<void>(
-          write_channel(state.channel, message.data(), message.size()));
-      static_cast<void>(ssh_blocking_flush(session, 500));
-      close_channel(state.channel, 124);
-      await_peer_channel_close(event.get(), session, state);
+          write_channel(state_.channel, message.data(), message.size()));
+      static_cast<void>(ssh_blocking_flush(session_, 500));
+      close_channel(state_.channel, 124);
+      await_peer_channel_close(event_.get(), session_, state_);
     }
     std::_Exit(124);
   }
 
-  if (session_end == SessionEnd::resource_limit && memory_guard) {
-    memory_guard->release_emergency_reserve();
+  void finish_terminal_session() {
+    if (outcome_.end == SessionEnd::resource_limit && memory_guard_) {
+      memory_guard_->release_emergency_reserve();
+    }
+    if (!terminal_session_) {
+      return;
+    }
+    state_.terminal_session = nullptr;
+    terminal_session_->request_stop();
+    drain_terminal_output();
+    terminal_session_->join();
+    forward_final_terminal_output();
+    outcome_.application_failed =
+        outcome_.application_failed || terminal_session_->failed();
+    log_terminal_failure();
+    log_final_telemetry();
   }
 
-  if (terminal_session) {
-    state.terminal_session = nullptr;
-    terminal_session->request_stop();
+  void drain_terminal_output() {
     const auto drain_deadline = Clock::now() + 2s;
-    while (!terminal_session->finished() && Clock::now() < drain_deadline) {
-      static_cast<void>(ssh_event_dopoll(event.get(), 10));
+    while (!terminal_session_->finished() && Clock::now() < drain_deadline) {
+      static_cast<void>(ssh_event_dopoll(event_.get(), 10));
       static_cast<void>(forward_session_output(
-          server_descriptor.get(), state.channel, session_output_buffer,
-          ssh_channel_is_open(state.channel) == 0));
+          server_descriptor_.get(), state_.channel, session_output_buffer_,
+          ssh_channel_is_open(state_.channel) == 0));
     }
-    if (!terminal_session->finished()) {
-      server_descriptor = FileDescriptor();
+    if (!terminal_session_->finished()) {
+      server_descriptor_ = FileDescriptor();
     }
-    terminal_session->join();
-    if (server_descriptor.get() >= 0) {
-      static_cast<void>(forward_session_output(
-          server_descriptor.get(), state.channel, session_output_buffer,
-          ssh_channel_is_open(state.channel) == 0));
+  }
+
+  void forward_final_terminal_output() {
+    if (server_descriptor_.get() < 0) {
+      return;
     }
-    application_failed = application_failed || terminal_session->failed();
-    const auto failure_reason = terminal_session->failure_reason();
-    if (failure_reason != SessionFailureReason::none) {
+    static_cast<void>(forward_session_output(
+        server_descriptor_.get(), state_.channel, session_output_buffer_,
+        ssh_channel_is_open(state_.channel) == 0));
+  }
+
+  void log_terminal_failure() const {
+    const auto reason = terminal_session_->failure_reason();
+    if (reason != SessionFailureReason::none) {
       std::cerr << "anvil: session " << ::getpid()
-                << " failed: " << failure_reason_name(failure_reason) << '\n';
+                << " failed: " << failure_reason_name(reason) << '\n';
     }
-    const auto telemetry = terminal_session->telemetry();
-    report_telemetry(worker_report_descriptor, session_id, telemetry);
+  }
+
+  void log_final_telemetry() const {
+    const auto telemetry = terminal_session_->telemetry();
+    report_telemetry(descriptors_.worker_report, session_id_, telemetry);
     std::cerr << "anvil: session " << ::getpid()
               << " frames=" << telemetry.frames
               << " accepted=" << telemetry.accepted_frames
@@ -1317,49 +1422,91 @@ int run_session(ssh_session session, store::Store &identity_store,
               << '\n';
   }
 
-  if (session_end == SessionEnd::resource_limit) {
-    std::cerr << "anvil: session " << ::getpid() << " exceeded its "
-              << resource_limit_name(resource_limit) << " limit\n";
+  void report_resource_limit() const {
+    if (outcome_.end == SessionEnd::resource_limit) {
+      std::cerr << "anvil: session " << ::getpid() << " exceeded its "
+                << resource_limit_name(outcome_.resource_limit) << " limit\n";
+    }
   }
 
-  if (state.channel != nullptr && ssh_channel_is_open(state.channel) != 0) {
-    std::string_view message;
-    int status = 0;
-    switch (session_end) {
-    case SessionEnd::idle_timeout:
-      message = "Anvil: session closed after the idle timeout.\r\n";
-      status = 124;
-      break;
-    case SessionEnd::resource_limit:
-      message = resource_limit_message(resource_limit);
-      status = 124;
-      break;
-    case SessionEnd::shutdown:
-      message = "Anvil: server is shutting down; closing this session.\r\n";
-      break;
-    case SessionEnd::normal:
-      if (application_failed) {
-        message =
-            "Anvil: this session failed; the board remains available.\r\n";
-        status = 1;
-      } else {
-        status = state.close_requested ? 1 : 0;
-      }
-      break;
+  void finish_channel() {
+    if (state_.channel == nullptr || ssh_channel_is_open(state_.channel) == 0) {
+      return;
     }
+    const auto [message, status] = channel_close_result();
     if (!message.empty()) {
       static_cast<void>(
-          write_channel(state.channel, message.data(), message.size()));
+          write_channel(state_.channel, message.data(), message.size()));
     }
-    close_channel(state.channel, status);
-    await_peer_channel_close(event.get(), session, state);
+    close_channel(state_.channel, status);
+    await_peer_channel_close(event_.get(), session_, state_);
   }
-  static_cast<void>(ssh_event_remove_session(event.get(), session));
-  if (state.channel != nullptr) {
-    ssh_channel_free(state.channel);
-    state.channel = nullptr;
+
+  [[nodiscard]] auto channel_close_result() const
+      -> std::pair<std::string_view, int> {
+    switch (outcome_.end) {
+    case SessionEnd::idle_timeout:
+      return {"Anvil: session closed after the idle timeout.\r\n", 124};
+    case SessionEnd::resource_limit:
+      return {resource_limit_message(outcome_.resource_limit), 124};
+    case SessionEnd::shutdown:
+      return {"Anvil: server is shutting down; closing this session.\r\n", 0};
+    case SessionEnd::normal:
+      if (outcome_.application_failed) {
+        return {"Anvil: this session failed; the board remains available.\r\n",
+                1};
+      }
+      return {{}, state_.close_requested ? 1 : 0};
+    }
+    return {{}, 1};
   }
-  return state.auth_report_failed ? auth_report_failure_exit : 0;
+
+  void release_libssh_resources() {
+    if (event_registered_) {
+      ssh_event_remove_session(event_.get(), session_);
+      event_registered_ = false;
+    }
+    if (state_.channel != nullptr) {
+      ssh_channel_free(state_.channel);
+      state_.channel = nullptr;
+    }
+  }
+
+  ssh_session session_;
+  const Config &config_;
+  const TosPolicy &tos_policy_;
+  SessionDescriptors descriptors_;
+  std::uint64_t session_id_;
+  SessionState state_;
+  ssh_server_callbacks_struct server_callbacks_{};
+  ssh_channel_callbacks_struct channel_callbacks_{};
+  UniqueEvent event_;
+  bool event_registered_{};
+  Clock::time_point authentication_deadline_{};
+  std::optional<Clock::time_point> input_eof_at_;
+  FileDescriptor application_descriptor_;
+  FileDescriptor server_descriptor_;
+  std::unique_ptr<TerminalSession> terminal_session_;
+  std::optional<WorkerMemoryGuard> memory_guard_;
+  CpuProgressWatchdog cpu_watchdog_;
+  std::vector<std::byte> session_output_buffer_;
+  SessionTelemetry reported_telemetry_;
+  SessionOutcome outcome_;
+};
+
+[[gnu::noinline]] int
+run_session(ssh_session session, store::Store &identity_store,
+            const Config &config, const TosPolicy &tos_policy,
+            int signal_descriptor, int worker_report_descriptor,
+            int guest_report_permit_descriptor, int oneliner_event_descriptor,
+            std::uint64_t session_id) {
+  auto protocol = std::make_unique<SessionProtocol>(
+      session, identity_store, config, tos_policy,
+      SessionDescriptors{signal_descriptor, worker_report_descriptor,
+                         guest_report_permit_descriptor,
+                         oneliner_event_descriptor},
+      session_id);
+  return protocol->run();
 }
 
 struct ChildState {
@@ -1733,9 +1880,10 @@ void terminate_children(const ChildMap &children, int signal_number) {
   }
 }
 
-void await_children(ChildMap &children, int signal_descriptor,
-                    int worker_report_descriptor,
-                    AdmissionController &admission, HealthMonitor &health) {
+[[gnu::noinline]] void
+await_children(ChildMap &children, int signal_descriptor,
+               int worker_report_descriptor, AdmissionController &admission,
+               HealthMonitor &health) {
   terminate_children(children, SIGTERM);
   const auto deadline = Clock::now() + shutdown_timeout;
   while (!children.empty() && Clock::now() < deadline) {
@@ -1774,6 +1922,40 @@ void await_children(ChildMap &children, int signal_descriptor,
       }
     }
   }
+}
+
+[[gnu::noinline]] auto configure_supervisor_signals() -> FileDescriptor {
+  sigset_t signal_mask;
+  if (::sigemptyset(&signal_mask) != 0 ||
+      ::sigaddset(&signal_mask, SIGCHLD) != 0 ||
+      ::sigaddset(&signal_mask, SIGINT) != 0 ||
+      ::sigaddset(&signal_mask, SIGTERM) != 0 ||
+      ::sigprocmask(SIG_BLOCK, &signal_mask, nullptr) != 0) {
+    throw_system_error("cannot block supervisor signals");
+  }
+  FileDescriptor descriptor(
+      ::signalfd(-1, &signal_mask, SFD_CLOEXEC | SFD_NONBLOCK));
+  if (descriptor.get() < 0) {
+    throw_system_error("cannot create signal descriptor");
+  }
+  return descriptor;
+}
+
+[[gnu::noinline]] auto configure_worker_signals() noexcept -> FileDescriptor {
+  sigset_t worker_mask;
+  if (::sigemptyset(&worker_mask) != 0 ||
+      ::sigaddset(&worker_mask, SIGINT) != 0 ||
+      ::sigaddset(&worker_mask, SIGTERM) != 0 ||
+      ::sigprocmask(SIG_SETMASK, &worker_mask, nullptr) != 0) {
+    std::cerr << "anvil: cannot configure worker signals\n";
+    return FileDescriptor(-1);
+  }
+  FileDescriptor descriptor(
+      ::signalfd(-1, &worker_mask, SFD_CLOEXEC | SFD_NONBLOCK));
+  if (descriptor.get() < 0) {
+    std::cerr << "anvil: cannot create worker signal descriptor\n";
+  }
+  return descriptor;
 }
 
 [[nodiscard]] std::uint16_t parse_port(std::string_view text) {
@@ -2442,19 +2624,7 @@ int run(const Config &config) {
                              std::string(ssh_get_error(bind.get())));
   }
 
-  sigset_t signal_mask;
-  if (::sigemptyset(&signal_mask) != 0 ||
-      ::sigaddset(&signal_mask, SIGCHLD) != 0 ||
-      ::sigaddset(&signal_mask, SIGINT) != 0 ||
-      ::sigaddset(&signal_mask, SIGTERM) != 0 ||
-      ::sigprocmask(SIG_BLOCK, &signal_mask, nullptr) != 0) {
-    throw_system_error("cannot block supervisor signals");
-  }
-  FileDescriptor signal_descriptor(
-      ::signalfd(-1, &signal_mask, SFD_CLOEXEC | SFD_NONBLOCK));
-  if (signal_descriptor.get() < 0) {
-    throw_system_error("cannot create signal descriptor");
-  }
+  auto signal_descriptor = configure_supervisor_signals();
 
   std::array<int, 2> worker_report_descriptors{};
   if (::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
@@ -2659,18 +2829,8 @@ int run(const Config &config) {
       static_cast<void>(::close(signal_descriptor.get()));
       static_cast<void>(::close(worker_report_receiver.get()));
       bind.reset();
-      sigset_t worker_mask;
-      if (::sigemptyset(&worker_mask) != 0 ||
-          ::sigaddset(&worker_mask, SIGINT) != 0 ||
-          ::sigaddset(&worker_mask, SIGTERM) != 0 ||
-          ::sigprocmask(SIG_SETMASK, &worker_mask, nullptr) != 0) {
-        std::cerr << "anvil: cannot configure worker signals\n";
-        std::_Exit(1);
-      }
-      FileDescriptor worker_signal_descriptor(
-          ::signalfd(-1, &worker_mask, SFD_CLOEXEC | SFD_NONBLOCK));
+      auto worker_signal_descriptor = configure_worker_signals();
       if (worker_signal_descriptor.get() < 0) {
-        std::cerr << "anvil: cannot create worker signal descriptor\n";
         std::_Exit(1);
       }
       const auto exit_status = run_session(
