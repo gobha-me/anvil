@@ -293,6 +293,7 @@ read_key_file(FileDescriptor file, const std::string &path, bool private_key) {
   return read_key_file(FileDescriptor(descriptor), path, private_key);
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- bounded no-follow file admission keeps each rejection next to its read
 [[nodiscard]] TosPolicy load_tos_policy(const Config &config) {
   if (!valid_tos_version(config.tos_version)) {
     throw std::runtime_error(
@@ -999,6 +1000,7 @@ failure_reason_name(SessionFailureReason reason) noexcept {
   return "unknown terminal session failure";
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- one SSH request state machine preserves hostile callback and cleanup ordering
 int run_session(ssh_session session, store::Store &identity_store,
                 const Config &config, const TosPolicy &tos_policy,
                 int signal_descriptor, int worker_report_descriptor,
@@ -1124,7 +1126,6 @@ int run_session(ssh_session session, store::Store &identity_store,
           write_channel(state.channel, message.data(), message.size(), true));
       close_channel(state.channel, 126);
       await_peer_channel_close(event.get(), session, state);
-      denial_sent = true;
       break;
     }
 
@@ -1136,7 +1137,6 @@ int run_session(ssh_session session, store::Store &identity_store,
           write_channel(state.channel, message.data(), message.size(), true));
       close_channel(state.channel, 126);
       await_peer_channel_close(event.get(), session, state);
-      denial_sent = true;
       break;
     }
 
@@ -1381,6 +1381,7 @@ struct SupervisorState {
   bool health_failed{};
 };
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- the bounded nonblocking protocol deliberately drains each worker explicitly
 void service_guest_report_permits(ChildMap &children,
                                   AdmissionController &admission) noexcept {
   for (auto &[worker, child] : children) {
@@ -1949,6 +1950,7 @@ void await_children(ChildMap &children, int signal_descriptor,
                           .registered_only = registered_only};
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- duplicate detection and provisioning keep startup fail-closed
 void reconcile_boards(store::Store &database, const Config &config,
                       store::UtcEpochSeconds now) {
   std::vector<BoardDeclaration> declarations = config.boards;
@@ -2081,6 +2083,7 @@ std::string_view usage() noexcept {
          "  --help                  show this help\n";
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- one parser centralizes cross-option validation and authority defaults
 ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   ParseResult result;
   bool database_explicit = false;
@@ -2356,6 +2359,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   return result;
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- the supervisor lifecycle centralizes fork, signal, health, and cleanup ordering
 int run(const Config &config) {
   if (config.operation == Operation::restore) {
     auto restored = backup::restore_snapshot(

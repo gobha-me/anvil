@@ -14,6 +14,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  clang-tidy:
+    name: Clang Tidy 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Clang Tidy 20 and project dependencies
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "$CLANG_VERSION"
+          sudo apt-get install --yes --no-install-recommends \
+            clang-tidy-20 clang-tools-20 libsqlite3-dev libssl-dev
+      - name: Check shipped code and suppression policy
+        run: tools/lint.sh
+
   sdk-abi-history:
     name: sdk ABI history
     runs-on: ubuntu-24.04
