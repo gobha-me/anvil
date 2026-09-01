@@ -44,6 +44,7 @@
 #include "health.hpp"
 #include "sqlite_store.hpp"
 #include "terminal_session.hpp"
+#include "text_sanitization.hpp"
 
 namespace anvil::server {
 namespace {
@@ -52,6 +53,7 @@ using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
 constexpr std::size_t max_key_file_size = 64U * 1024U;
+constexpr std::size_t max_tos_file_size = 256U * 1024U;
 constexpr std::size_t max_pending_input = 64U * 1024U;
 constexpr std::size_t max_remote_username_size = 256U;
 constexpr auto authentication_timeout = 15s;
@@ -172,6 +174,7 @@ enum class RequestedOperation { none, shell, exec, subsystem };
 
 struct SessionState {
   store::Store *identity_store{};
+  std::string_view tos_version;
   SessionIdentity identity;
   ssh_channel channel{};
   unsigned int auth_attempts{};
@@ -196,6 +199,23 @@ struct SessionState {
   Clock::time_point channel_opened_at{};
   bool idle_warning_sent{};
 };
+
+[[nodiscard]] auto valid_tos_version(std::string_view version) -> bool {
+  if (version.empty() || version.size() > 128U ||
+      !is_well_formed_utf8(version)) {
+    return false;
+  }
+  for (std::size_t offset = 0; offset < version.size(); ++offset) {
+    const auto byte = static_cast<unsigned char>(version[offset]);
+    if (byte < 0x20U || byte == 0x7fU ||
+        (byte == 0xc2U && offset + 1U < version.size() &&
+         static_cast<unsigned char>(version[offset + 1U]) >= 0x80U &&
+         static_cast<unsigned char>(version[offset + 1U]) <= 0x9fU)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 enum class WorkerReportKind : std::uint16_t { denied_auth, telemetry };
 
@@ -264,6 +284,80 @@ read_key_file(FileDescriptor file, const std::string &path, bool private_key) {
     throw_system_error("cannot open key file '" + path + "'");
   }
   return read_key_file(FileDescriptor(descriptor), path, private_key);
+}
+
+[[nodiscard]] TosPolicy load_tos_policy(const Config &config) {
+  if (!valid_tos_version(config.tos_version)) {
+    throw std::runtime_error(
+        "TOS version must contain 1 to 128 bytes of valid UTF-8 and no "
+        "controls");
+  }
+  const auto descriptor = ::open(
+      config.tos_file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (descriptor < 0) {
+    throw_system_error("cannot open TOS file '" + config.tos_file + "'");
+  }
+  FileDescriptor file(descriptor);
+  struct stat metadata{};
+  if (::fstat(file.get(), &metadata) != 0) {
+    throw_system_error("cannot inspect TOS file '" + config.tos_file + "'");
+  }
+  if (!S_ISREG(metadata.st_mode)) {
+    throw std::runtime_error("TOS file is not a regular file: " +
+                             config.tos_file);
+  }
+  if (metadata.st_size <= 0 ||
+      static_cast<std::uintmax_t>(metadata.st_size) > max_tos_file_size) {
+    throw std::runtime_error("TOS file must contain 1 to 262144 bytes: " +
+                             config.tos_file);
+  }
+  std::string contents(static_cast<std::size_t>(metadata.st_size), '\0');
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto count =
+        ::read(file.get(), contents.data() + offset, contents.size() - offset);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      throw_system_error("cannot read TOS file '" + config.tos_file + "'");
+    }
+    if (count == 0) {
+      throw std::runtime_error("TOS file changed while being read: " +
+                               config.tos_file);
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  char trailing{};
+  ssize_t trailing_count = 0;
+  do {
+    trailing_count = ::read(file.get(), &trailing, 1);
+  } while (trailing_count < 0 && errno == EINTR);
+  if (trailing_count < 0) {
+    throw_system_error("cannot finish reading TOS file '" + config.tos_file +
+                       "'");
+  }
+  if (trailing_count != 0) {
+    throw std::runtime_error("TOS file changed while being read: " +
+                             config.tos_file);
+  }
+  if (contents.find('\0') != std::string::npos) {
+    throw std::runtime_error("TOS file contains a NUL byte: " +
+                             config.tos_file);
+  }
+  if (!is_well_formed_utf8(contents)) {
+    throw std::runtime_error("TOS file is not valid UTF-8: " + config.tos_file);
+  }
+  const auto display = sanitize_prose_for_render(contents);
+  const auto visible = std::ranges::any_of(display, [](const char value) {
+    const auto byte = static_cast<unsigned char>(value);
+    return byte > 0x20U && byte != 0x7fU;
+  });
+  if (!visible) {
+    throw std::runtime_error("TOS file has no visible text: " +
+                             config.tos_file);
+  }
+  return TosPolicy{.version = config.tos_version, .text = std::move(contents)};
 }
 
 [[nodiscard]] std::string read_host_key_at(int directory,
@@ -546,7 +640,8 @@ int authenticate_public_key(ssh_session, const char *user, ssh_key offered_key,
     report_denied_auth_attempt(state);
     return SSH_AUTH_DENIED;
   }
-  auto identity = resolve_public_key(*state.identity_store, *key);
+  auto identity =
+      resolve_public_key(*state.identity_store, *key, state.tos_version);
   if (signature_state == SSH_PUBLICKEY_STATE_NONE) {
     if (identity) {
       return SSH_AUTH_SUCCESS;
@@ -850,10 +945,12 @@ failure_reason_name(SessionFailureReason reason) noexcept {
 }
 
 int run_session(ssh_session session, store::Store &identity_store,
-                const Config &config, int signal_descriptor,
-                int worker_report_descriptor, std::uint64_t session_id) {
+                const Config &config, const TosPolicy &tos_policy,
+                int signal_descriptor, int worker_report_descriptor,
+                std::uint64_t session_id) {
   SessionState state;
   state.identity_store = &identity_store;
+  state.tos_version = tos_policy.version;
   state.max_auth_attempts = config.max_auth_attempts_per_session;
   state.worker_report_descriptor = worker_report_descriptor;
   state.pending_input.reserve(4096);
@@ -999,8 +1096,9 @@ int run_session(ssh_session session, store::Store &identity_store,
         terminal_session = std::make_unique<TerminalSession>(
             application_descriptor.get(), state.terminal_type, dimensions,
             state.channel_opened_at, config.session_resources,
-            config.registration_mode, config.invite_policy, state.identity,
-            *state.identity_store, config.session_input_hook_for_testing);
+            config.registration_mode, config.invite_policy, tos_policy,
+            state.identity, *state.identity_store,
+            config.session_input_hook_for_testing);
         state.terminal_session = terminal_session.get();
         auto armed =
             WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
@@ -1546,6 +1644,8 @@ std::string_view usage() noexcept {
          "  --invite-expiration-seconds S\n"
          "                          bearer-code lifetime (default 604800)\n"
          "  --notify-inviters-on-moderation on|off (default off)\n"
+         "  --tos-version VERSION  opaque current TOS version (required)\n"
+         "  --tos-file PATH        UTF-8 TOS text file (required)\n"
          "  --backup-directory P  enable snapshots in directory P\n"
          "  --backup-interval-seconds S\n"
          "                          snapshot period (default 86400)\n"
@@ -1598,6 +1698,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   bool backup_directory_explicit = false;
   bool registration_mode_explicit = false;
   bool invite_policy_explicit = false;
+  bool tos_explicit = false;
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const auto argument = arguments[index];
     if (argument == "--help") {
@@ -1611,6 +1712,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
         argument != "--invite-regeneration-seconds" &&
         argument != "--invite-expiration-seconds" &&
         argument != "--notify-inviters-on-moderation" &&
+        argument != "--tos-version" && argument != "--tos-file" &&
         argument != "--backup-directory" &&
         argument != "--backup-interval-seconds" &&
         argument != "--backup-retention-seconds" &&
@@ -1681,6 +1783,16 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
             "notify inviters on moderation must be on or off");
       }
       invite_policy_explicit = true;
+    } else if (argument == "--tos-version") {
+      if (!valid_tos_version(value)) {
+        throw std::runtime_error("TOS version must contain 1 to 128 bytes of "
+                                 "valid UTF-8 and no controls");
+      }
+      result.config.tos_version = value;
+      tos_explicit = true;
+    } else if (argument == "--tos-file") {
+      result.config.tos_file = value;
+      tos_explicit = true;
     } else if (argument == "--backup-directory") {
       result.config.backup_directory = value;
       backup_directory_explicit = true;
@@ -1773,6 +1885,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
         throw std::runtime_error(
             "invite policy options are not valid in backup or restore mode");
       }
+      if (tos_explicit) {
+        throw std::runtime_error(
+            "TOS options are not valid in backup or restore mode");
+      }
       if (backup_directory_explicit || backup_interval_explicit ||
           backup_retention_explicit) {
         throw std::runtime_error(
@@ -1803,6 +1919,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     }
     if (result.config.host_key_path.empty()) {
       throw std::runtime_error("--host-key is required");
+    }
+    if (result.config.tos_version.empty() || result.config.tos_file.empty()) {
+      throw std::runtime_error(
+          "--tos-version and --tos-file are required in serve mode");
     }
   }
   return result;
@@ -1841,6 +1961,8 @@ int run(const Config &config) {
     std::cout << "anvil: created backup " << snapshot->path.string() << '\n';
     return 0;
   }
+
+  const auto tos_policy = load_tos_policy(config);
 
   auto database = store::SqliteStore::open(config.database_path);
   if (!database) {
@@ -2104,9 +2226,10 @@ int run(const Config &config) {
         std::cerr << "anvil: cannot create worker signal descriptor\n";
         std::_Exit(1);
       }
-      const auto exit_status = run_session(
-          session.get(), **database, config, worker_signal_descriptor.get(),
-          worker_report_sender.get(), session_id);
+      const auto exit_status =
+          run_session(session.get(), **database, config, tos_policy,
+                      worker_signal_descriptor.get(),
+                      worker_report_sender.get(), session_id);
       ssh_disconnect(session.get());
       session.reset();
       std::_Exit(exit_status);

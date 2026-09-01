@@ -34,6 +34,14 @@ struct InvitePolicy {
       -> bool = default;
 };
 
+struct TosPolicy {
+  std::string version;
+  std::string text;
+
+  [[nodiscard]] auto operator==(const TosPolicy &) const noexcept
+      -> bool = default;
+};
+
 struct Config {
   Operation operation{Operation::serve};
   std::string bind_address{"127.0.0.1"};
@@ -43,6 +51,8 @@ struct Config {
   std::string database_path{"anvil.db"};
   RegistrationMode registration_mode{RegistrationMode::open};
   InvitePolicy invite_policy;
+  std::string tos_version;
+  std::string tos_file;
   std::string backup_directory;
   std::chrono::seconds backup_interval{86'400};
   std::chrono::seconds backup_retention{604'800};

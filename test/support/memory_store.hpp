@@ -130,6 +130,29 @@ public:
     return invite->claimed_by_handle;
   }
 
+  [[nodiscard]] auto user_status(std::string_view handle) const
+      -> std::optional<store::UserStatus> {
+    const auto user =
+        std::ranges::find(state_->users, handle, &UserEntry::handle);
+    if (user == state_->users.end()) {
+      return std::nullopt;
+    }
+    return user->status;
+  }
+
+  [[nodiscard]] auto tos_acceptance_time(std::string_view handle,
+                                         std::string_view version) const
+      -> std::optional<store::UtcEpochSeconds> {
+    const auto acceptance = std::ranges::find_if(
+        state_->tos_acceptances, [&](const TosEntry &entry) {
+          return entry.user_handle == handle && entry.tos_version == version;
+        });
+    if (acceptance == state_->tos_acceptances.end()) {
+      return std::nullopt;
+    }
+    return acceptance->accepted_at;
+  }
+
   [[nodiscard]] auto content_status(const store::ContentRef &content) const
       -> std::optional<store::ContentStatus> {
     return status_of(state_->contents, content);
@@ -172,6 +195,12 @@ private:
     bool active{true};
   };
 
+  struct TosEntry {
+    std::string user_handle;
+    std::string tos_version;
+    store::UtcEpochSeconds accepted_at;
+  };
+
   struct State {
     std::vector<TransactionObservation> observations;
     std::optional<store::Error> next_commit_error;
@@ -180,6 +209,7 @@ private:
     std::vector<UserEntry> users;
     std::vector<store::CredentialRecord> credentials;
     std::vector<InviteEntry> invites;
+    std::vector<TosEntry> tos_acceptances;
   };
 
   static void upsert_content(std::vector<ContentEntry> &contents,
@@ -219,7 +249,8 @@ private:
         : state_(std::move(state)), index_(index), mode_(mode),
           contents_(state_->contents), messages_(state_->messages),
           users_(state_->users), credentials_(state_->credentials),
-          invites_(state_->invites) {}
+          invites_(state_->invites), tos_acceptances_(state_->tos_acceptances) {
+    }
 
     [[nodiscard]] auto commit() -> std::expected<void, store::Error> override {
       ++state_->observations.at(index_).commit_attempts;
@@ -234,6 +265,7 @@ private:
         state_->users = users_;
         state_->credentials = credentials_;
         state_->invites = invites_;
+        state_->tos_acceptances = tos_acceptances_;
       }
       return {};
     }
@@ -269,6 +301,10 @@ private:
       return invites_;
     }
 
+    [[nodiscard]] auto tos_acceptances() noexcept -> std::vector<TosEntry> & {
+      return tos_acceptances_;
+    }
+
   private:
     std::shared_ptr<State> state_;
     std::size_t index_;
@@ -278,6 +314,7 @@ private:
     std::vector<UserEntry> users_;
     std::vector<store::CredentialRecord> credentials_;
     std::vector<InviteEntry> invites_;
+    std::vector<TosEntry> tos_acceptances_;
   };
 
   [[nodiscard]] auto backend(store::Transaction &transaction) const noexcept
@@ -436,6 +473,64 @@ private:
     credentials.push_back({provision.handle, provision.fingerprint,
                            provision.public_key, status});
     return {};
+  }
+
+  [[nodiscard]] auto has_tos_acceptance_impl(store::Transaction &transaction,
+                                             std::string_view user_handle,
+                                             std::string_view tos_version)
+      -> std::expected<bool, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    return std::ranges::any_of(active->tos_acceptances(),
+                               [&](const TosEntry &entry) {
+                                 return entry.user_handle == user_handle &&
+                                        entry.tos_version == tos_version;
+                               });
+  }
+
+  [[nodiscard]] auto accept_tos_impl(store::Transaction &transaction,
+                                     const store::TosAcceptance &acceptance)
+      -> std::expected<store::UserStatus, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    auto &users = active->users();
+    const auto user =
+        std::ranges::find(users, acceptance.user_handle, &UserEntry::handle);
+    if (user == users.end()) {
+      return std::unexpected(
+          store::Error{store::ErrorCode::not_found, "TOS user does not exist"});
+    }
+    if (user->status != store::UserStatus::pending &&
+        user->status != store::UserStatus::active) {
+      return std::unexpected(
+          store::Error{store::ErrorCode::conflict,
+                       "only pending or active accounts may accept the TOS"});
+    }
+    auto &acceptances = active->tos_acceptances();
+    const auto existing =
+        std::ranges::find_if(acceptances, [&](const TosEntry &entry) {
+          return entry.user_handle == acceptance.user_handle &&
+                 entry.tos_version == acceptance.tos_version;
+        });
+    if (existing == acceptances.end()) {
+      acceptances.push_back({.user_handle = acceptance.user_handle,
+                             .tos_version = acceptance.tos_version,
+                             .accepted_at = acceptance.accepted_at});
+    }
+    user->status = store::UserStatus::active;
+    for (auto &credential : active->credentials()) {
+      if (credential.handle == acceptance.user_handle &&
+          credential.status == store::CredentialStatus::pending) {
+        credential.status = store::CredentialStatus::active;
+      }
+    }
+    return store::UserStatus::active;
   }
 
   [[nodiscard]] auto claim_invite_impl(store::Transaction &transaction,

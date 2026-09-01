@@ -73,6 +73,20 @@ private:
                             "consumer fixture has no identity backend"});
   }
 
+  [[nodiscard]] auto has_tos_acceptance_impl(anvil::store::Transaction &,
+                                             std::string_view, std::string_view)
+      -> std::expected<bool, anvil::store::Error> override {
+    return false;
+  }
+
+  [[nodiscard]] auto accept_tos_impl(anvil::store::Transaction &,
+                                     const anvil::store::TosAcceptance &)
+      -> std::expected<anvil::store::UserStatus, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no TOS backend"});
+  }
+
   [[nodiscard]] auto claim_invite_impl(anvil::store::Transaction &,
                                        const anvil::store::InviteClaim &)
       -> std::expected<void, anvil::store::Error> override {

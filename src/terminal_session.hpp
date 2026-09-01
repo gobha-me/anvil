@@ -18,6 +18,7 @@ namespace anvil::server {
 
 struct SessionIdentity;
 struct InvitePolicy;
+struct TosPolicy;
 enum class RegistrationMode : std::uint8_t;
 
 struct TerminalDimensions {
@@ -80,7 +81,8 @@ public:
                   std::chrono::steady_clock::time_point channel_opened,
                   SessionResourceLimits resource_limits,
                   RegistrationMode registration_mode,
-                  const InvitePolicy &invite_policy, SessionIdentity identity,
+                  const InvitePolicy &invite_policy,
+                  const TosPolicy &tos_policy, SessionIdentity identity,
                   store::Store &identity_store,
                   SessionInputHook input_hook_for_testing = nullptr);
   ~TerminalSession();

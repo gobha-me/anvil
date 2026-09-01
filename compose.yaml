@@ -20,6 +20,7 @@ services:
       - anvil-state:/var/lib/anvil
     secrets:
       - authorized_key
+      - tos_text
     ports:
       - "${ANVIL_PORT:-2222}:2222"
     pids_limit: ${ANVIL_PID_LIMIT:-256}
@@ -47,6 +48,10 @@ services:
       - "${ANVIL_INVITE_EXPIRATION_SECONDS:-604800}"
       - --notify-inviters-on-moderation
       - "${ANVIL_NOTIFY_INVITERS_ON_MODERATION:-off}"
+      - --tos-version
+      - "${ANVIL_TOS_VERSION:?set ANVIL_TOS_VERSION to the current opaque version}"
+      - --tos-file
+      - /run/secrets/tos_text
       - --backup-directory
       - /var/lib/anvil/backups
       - --backup-interval-seconds
@@ -61,6 +66,8 @@ services:
 secrets:
   authorized_key:
     file: ${ANVIL_AUTHORIZED_KEY:?set ANVIL_AUTHORIZED_KEY to an OpenSSH public-key file}
+  tos_text:
+    file: ${ANVIL_TOS_FILE:?set ANVIL_TOS_FILE to a UTF-8 terms-of-service file}
 
 volumes:
   anvil-state:

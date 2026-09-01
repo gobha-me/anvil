@@ -15,7 +15,9 @@ import sys
 import tempfile
 import time
 
-from test_ssh_server import reserve_port, run_checked, ssh_command, wait_until_listening
+from test_ssh_server import (
+    reserve_port, run_checked, shell_session, ssh_command, wait_until_listening,
+)
 
 
 def request(port: int, path: str, method: str = "GET",
@@ -126,6 +128,8 @@ def test_live_server(executable: pathlib.Path) -> None:
         directory = pathlib.Path(directory_name)
         host_key = directory / "host_key"
         client_key = directory / "client_key"
+        tos_file = directory / "tos.txt"
+        tos_file.write_text("Test terms\n", encoding="utf-8")
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)])
         ssh_port = reserve_port()
         health_port = reserve_port()
@@ -134,6 +138,7 @@ def test_live_server(executable: pathlib.Path) -> None:
                 str(executable), "--bind-address", "127.0.0.1", "--port", str(ssh_port),
                 "--health-bind-address", "127.0.0.1", "--health-port", str(health_port),
                 "--database", str(directory / "anvil.db"),
+                "--tos-version", "v1", "--tos-file", str(tos_file),
                 "--host-key", str(host_key), "--authorized-key", f"tester={client_key}.pub",
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -141,6 +146,8 @@ def test_live_server(executable: pathlib.Path) -> None:
         session: subprocess.Popen[bytes] | None = None
         try:
             wait_until_listening(server)
+            accepted = shell_session(ssh_command(ssh_port, client_key), b"ACCEPT\n\x1b")
+            assert b"Current terms accepted" in accepted.stdout, accepted.stdout
             status, _, body = request(health_port, "/livez")
             assert status == 200 and json.loads(body)["status"] == "live", body
             status, _, body = request(health_port, "/readyz")
@@ -263,13 +270,17 @@ def test_live_server(executable: pathlib.Path) -> None:
 
 def test_newer_database_refuses_startup(executable: pathlib.Path) -> None:
     with tempfile.TemporaryDirectory(prefix="anvil-newer-database-") as directory_name:
-        database = pathlib.Path(directory_name) / "anvil.db"
+        directory = pathlib.Path(directory_name)
+        database = directory / "anvil.db"
+        tos_file = directory / "tos.txt"
+        tos_file.write_text("Test terms\n", encoding="utf-8")
         with sqlite3.connect(database) as connection:
             connection.execute("PRAGMA application_id=1095652940")
             connection.execute("PRAGMA user_version=4")
         result = subprocess.run(
             [
                 str(executable), "--database", str(database),
+                "--tos-version", "v1", "--tos-file", str(tos_file),
                 "--host-key", "unused", "--authorized-key", "tester=unused",
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False,

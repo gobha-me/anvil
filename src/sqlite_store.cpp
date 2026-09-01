@@ -1172,6 +1172,149 @@ auto SqliteStore::provision_local_credential_impl(
   return {};
 }
 
+auto SqliteStore::has_tos_acceptance_impl(Transaction &transaction,
+                                          std::string_view user_handle,
+                                          std::string_view tos_version)
+    -> std::expected<bool, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql =
+      "SELECT 1 FROM tos_acceptances WHERE user_handle=?1 AND "
+      "user_origin IS NULL AND tos_version=?2";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare TOS acceptance lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 1,
+                             user_handle, "cannot bind TOS user");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 2,
+                             tos_version, "cannot bind TOS version");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto result = sqlite3_step(statement->get());
+  if (result == SQLITE_ROW) {
+    return true;
+  }
+  if (result == SQLITE_DONE) {
+    return false;
+  }
+  return std::unexpected(sqlite_error(backend->database(), result,
+                                      "cannot look up TOS acceptance"));
+}
+
+auto SqliteStore::accept_tos_impl(Transaction &transaction,
+                                  const TosAcceptance &acceptance)
+    -> std::expected<UserStatus, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+
+  constexpr std::string_view find_user_sql =
+      "SELECT status,origin FROM users WHERE handle=?1 AND origin_key=''";
+  auto find_user = prepare(backend->database(), find_user_sql,
+                           "cannot prepare TOS user lookup");
+  if (!find_user) {
+    return std::unexpected(find_user.error());
+  }
+  if (auto bound =
+          bind_text(backend->database(), find_user->get(), 1,
+                    acceptance.user_handle, "cannot bind TOS user lookup");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto found = sqlite3_step(find_user->get());
+  if (found == SQLITE_DONE) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "TOS user does not exist"});
+  }
+  if (found != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(backend->database(), found, "cannot look up TOS user"));
+  }
+  auto status = column_text(find_user->get(), 0, "TOS user status");
+  if (!status) {
+    return std::unexpected(status.error());
+  }
+  if (sqlite3_column_type(find_user->get(), 1) != SQLITE_NULL) {
+    return std::unexpected(invalid_data("TOS user has a non-null origin"));
+  }
+  if (*status != "pending" && *status != "active") {
+    return std::unexpected(
+        Error{ErrorCode::conflict,
+              "only pending or active accounts may accept the TOS"});
+  }
+
+  constexpr std::string_view insert_sql =
+      "INSERT INTO tos_acceptances(user_handle,tos_version,accepted_at) "
+      "VALUES(?1,?2,?3) ON CONFLICT(user_handle,user_origin_key,tos_version) "
+      "DO NOTHING";
+  auto insert = prepare(backend->database(), insert_sql,
+                        "cannot prepare TOS acceptance insert");
+  if (!insert) {
+    return std::unexpected(insert.error());
+  }
+  if (auto bound = bind_text(backend->database(), insert->get(), 1,
+                             acceptance.user_handle, "cannot bind TOS user");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), insert->get(), 2,
+                             acceptance.tos_version, "cannot bind TOS version");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), insert->get(), 3,
+                                acceptance.accepted_at.value,
+                                "cannot bind TOS acceptance time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(insert->get());
+  if (inserted != SQLITE_DONE) {
+    return std::unexpected(sqlite_error(backend->database(), inserted,
+                                        "cannot record TOS acceptance"));
+  }
+
+  if (*status == "pending") {
+    constexpr std::string_view activate_sql =
+        "UPDATE users SET status='active' WHERE handle=?1 AND origin IS NULL "
+        "AND status='pending'";
+    auto activate = prepare(backend->database(), activate_sql,
+                            "cannot prepare TOS account activation");
+    if (!activate) {
+      return std::unexpected(activate.error());
+    }
+    if (auto bound = bind_text(backend->database(), activate->get(), 1,
+                               acceptance.user_handle,
+                               "cannot bind TOS account activation");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    const auto activated = sqlite3_step(activate->get());
+    if (activated != SQLITE_DONE) {
+      return std::unexpected(sqlite_error(backend->database(), activated,
+                                          "cannot activate TOS user"));
+    }
+    if (sqlite3_changes(backend->database()) != 1) {
+      return std::unexpected(
+          Error{ErrorCode::conflict, "TOS user status changed concurrently"});
+    }
+  }
+  return UserStatus::active;
+}
+
 auto SqliteStore::claim_invite_impl(Transaction &transaction,
                                     const InviteClaim &claim)
     -> std::expected<void, Error> {

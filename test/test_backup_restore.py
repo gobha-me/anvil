@@ -65,7 +65,9 @@ def start(executable: pathlib.Path, database: pathlib.Path, host_key: pathlib.Pa
     arguments = [
         str(executable), "--bind-address", "127.0.0.1", "--port", str(port),
         "--health-bind-address", "127.0.0.1", "--health-port", str(health_port),
-        "--database", str(database), "--host-key", str(host_key),
+        "--database", str(database),
+        "--tos-version", "v1", "--tos-file", str(authorized_key.with_name("tos.txt")),
+        "--host-key", str(host_key),
         "--authorized-key", f"tester={authorized_key}",
     ]
     if backup_directory is not None:
@@ -82,6 +84,7 @@ def main(executable: pathlib.Path) -> None:
         directory = pathlib.Path(raw_directory)
         directory.chmod(0o700)
         client_key = directory / "client_key"
+        (directory / "tos.txt").write_text("Test terms\n", encoding="utf-8")
         subprocess.run(
             ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)],
             check=True,

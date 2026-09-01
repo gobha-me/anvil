@@ -22,6 +22,7 @@ using anvil::store::MessageRecord;
 using anvil::store::Store;
 using anvil::store::TransactionMode;
 using anvil::store::UserStatus;
+using anvil::store::UtcEpochSeconds;
 
 constexpr std::string_view board_id = "00000000-0000-0000-0000-000000000001";
 
@@ -474,6 +475,101 @@ TEST_CASE(
   malformed.code_hash = "not-a-sha256-hash";
   CHECK(first.claim_invite(*invalid, malformed).error().code ==
         ErrorCode::invalid_data);
+}
+
+TEST_CASE(
+    "TOS acceptance is append-only and atomically activates pending users") {
+  anvil::testing::MemoryStore store;
+  store.seed_credential(anvil::store::CredentialRecord{
+      .handle = "alice",
+      .fingerprint = "SHA256:alice",
+      .public_key = "ssh-ed25519 ALICE",
+      .status = anvil::store::CredentialStatus::pending,
+  });
+
+  auto read = store.begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  CHECK_FALSE(store.has_tos_acceptance(*read, "alice", "2026-09").value());
+  CHECK_FALSE(store
+                  .accept_tos(*read, {.user_handle = "alice",
+                                      .tos_version = "2026-09",
+                                      .accepted_at = {10}})
+                  .has_value());
+  read->rollback();
+
+  auto write = store.begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  CHECK(store.accept_tos(*write, {.user_handle = "alice",
+                                  .tos_version = "2026-09",
+                                  .accepted_at = {10}}) == UserStatus::active);
+  CHECK(store.user_status("alice") == UserStatus::pending);
+  REQUIRE(write->commit().has_value());
+  CHECK(store.user_status("alice") == UserStatus::active);
+  CHECK(store.tos_acceptance_time("alice", "2026-09") == UtcEpochSeconds{10});
+
+  auto repeat = store.begin(TransactionMode::read_write);
+  REQUIRE(repeat.has_value());
+  REQUIRE(store
+              .accept_tos(*repeat, {.user_handle = "alice",
+                                    .tos_version = "2026-09",
+                                    .accepted_at = {99}})
+              .has_value());
+  REQUIRE(store
+              .accept_tos(*repeat, {.user_handle = "alice",
+                                    .tos_version = "2026-10",
+                                    .accepted_at = {20}})
+              .has_value());
+  REQUIRE(repeat->commit().has_value());
+  CHECK(store.tos_acceptance_time("alice", "2026-09") == UtcEpochSeconds{10});
+  CHECK(store.tos_acceptance_time("alice", "2026-10") == UtcEpochSeconds{20});
+}
+
+TEST_CASE("TOS acceptance rejects invalid identities and rolls back failures") {
+  anvil::testing::MemoryStore store;
+  store.seed_credential(anvil::store::CredentialRecord{
+      .handle = "alice",
+      .fingerprint = "SHA256:alice",
+      .public_key = "ssh-ed25519 ALICE",
+      .status = anvil::store::CredentialStatus::pending,
+  });
+  auto invalid = store.begin(TransactionMode::read_write);
+  REQUIRE(invalid.has_value());
+  CHECK_FALSE(store
+                  .accept_tos(*invalid, {.user_handle = "alice",
+                                         .tos_version = "bad\nversion",
+                                         .accepted_at = {1}})
+                  .has_value());
+  CHECK_FALSE(
+      store
+          .accept_tos(*invalid, {.user_handle = "alice",
+                                 .tos_version = std::string{"bad\xff", 4},
+                                 .accepted_at = {1}})
+          .has_value());
+  CHECK_FALSE(
+      store
+          .accept_tos(*invalid, {.user_handle = "alice",
+                                 .tos_version = std::string{"v\xc2\x85", 3},
+                                 .accepted_at = {1}})
+          .has_value());
+  CHECK_FALSE(store
+                  .accept_tos(*invalid, {.user_handle = "missing",
+                                         .tos_version = "v1",
+                                         .accepted_at = {1}})
+                  .has_value());
+  invalid->rollback();
+
+  store.fail_next_commit({ErrorCode::unavailable, "failed"});
+  auto failed = store.begin(TransactionMode::read_write);
+  REQUIRE(failed.has_value());
+  REQUIRE(store
+              .accept_tos(*failed, {.user_handle = "alice",
+                                    .tos_version = "v1",
+                                    .accepted_at = {2}})
+              .has_value());
+  CHECK_FALSE(failed->commit().has_value());
+  failed->rollback();
+  CHECK(store.user_status("alice") == UserStatus::pending);
+  CHECK_FALSE(store.tos_acceptance_time("alice", "v1").has_value());
 }
 
 TEST_CASE("invite economics consume, cap, and regenerate atomic credits") {
