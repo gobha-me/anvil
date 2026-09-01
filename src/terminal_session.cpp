@@ -2,11 +2,13 @@
 
 #include <poll.h>
 #include <pthread.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -22,6 +24,8 @@
 #include <string_view>
 #include <termforge/core/app.hpp>
 #include <termforge/core/byte_sink.hpp>
+#include <termforge/widgets/composer.hpp>
+#include <termforge/widgets/list_widget.hpp>
 #include <termforge/widgets/text_box.hpp>
 #include <termforge/widgets/text_input.hpp>
 #include <thread>
@@ -41,6 +45,36 @@ constexpr int max_cell_dimension = 1000;
 constexpr int max_pixel_dimension = 65'535;
 constexpr std::size_t max_echo_size = 4096;
 constexpr auto sink_stall_timeout = 5s;
+
+[[nodiscard]] store::UtcEpochSeconds utc_now() {
+  return {std::chrono::duration_cast<std::chrono::seconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count()};
+}
+
+[[nodiscard]] std::string random_content_id(std::string_view prefix) {
+  std::array<unsigned char, 16> bytes{};
+  std::size_t offset = 0;
+  while (offset < bytes.size()) {
+    const auto count =
+        ::getrandom(bytes.data() + offset, bytes.size() - offset, 0);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count <= 0) {
+      throw std::runtime_error("cannot obtain message identifier randomness");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  constexpr std::string_view digits = "0123456789abcdef";
+  std::string result(prefix);
+  result.reserve(prefix.size() + bytes.size() * 2U);
+  for (const auto byte : bytes) {
+    result.push_back(digits[byte >> 4U]);
+    result.push_back(digits[byte & 0x0fU]);
+  }
+  return result;
+}
 
 [[nodiscard]] bool valid_cells(int columns, int rows) noexcept {
   return columns > 0 && rows > 0 && columns <= max_cell_dimension &&
@@ -160,16 +194,18 @@ public:
           SharedState &shared, SessionIdentity identity,
           store::Store &identity_store, RegistrationMode registration_mode,
           InvitePolicy invite_policy, TosPolicy tos_policy,
-          SessionInputHook input_hook_for_testing)
+          SessionInputHook input_hook_for_testing,
+          int guest_report_permit_descriptor)
       : sink_(descriptor, shared.resources, shared.stop_requested),
         channel_opened_(channel_opened), shared_(shared),
         identity_(std::move(identity)), identity_store_(identity_store),
         registration_mode_(registration_mode), invite_policy_(invite_policy),
         tos_policy_(std::move(tos_policy)),
+        guest_report_permit_descriptor_(guest_report_permit_descriptor),
         screen_mode_((identity_.kind == IdentityKind::pending ||
                       identity_.kind == IdentityKind::tos_required)
                          ? ScreenMode::tos
-                         : ScreenMode::shell) {
+                         : ScreenMode::boards) {
     const auto io =
         terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
     if (!io) {
@@ -196,6 +232,10 @@ public:
     }
 
     input_.set_focused(true);
+    board_list_.set_focused(true);
+    thread_list_.set_focused(true);
+    message_box_.set_focused(true);
+    composer_.set_focused(true);
     input_.set_placeholder("Type here");
     append_tos_text();
     input_.on_change([this, input_hook_for_testing](const std::string &text) {
@@ -213,6 +253,11 @@ public:
         input_hook_for_testing(text, shared_.resources);
       }
     });
+    composer_.set_enter_mode(termforge::ComposerEnterMode::Submit);
+    composer_.set_max_height(8);
+    if (screen_mode_ == ScreenMode::boards) {
+      load_boards();
+    }
     set_render_mode(termforge::RenderMode::Demand);
     set_frame_observer([this](const termforge::FrameObservation &observation) {
       std::lock_guard lock(shared_.mutex);
@@ -259,8 +304,33 @@ public:
 
     if (const auto *key = std::get_if<termforge::KeyEvent>(&event)) {
       if (key->action == termforge::KeyAction::Press &&
-          (key->key == termforge::Key::Escape ||
-           (key->ctrl && (key->ch == U'c' || key->ch == U'C')))) {
+          key->key == termforge::Key::Escape) {
+        if (screen_mode_ == ScreenMode::thread ||
+            screen_mode_ == ScreenMode::subject ||
+            screen_mode_ == ScreenMode::compose ||
+            screen_mode_ == ScreenMode::report) {
+          composer_.clear();
+          input_.set_text({});
+          if (screen_mode_ == ScreenMode::report) {
+            report_target_.reset();
+          }
+          if (screen_mode_ == ScreenMode::thread) {
+            open_selected_board();
+          } else {
+            screen_mode_ = ScreenMode::threads;
+          }
+          return;
+        }
+        if (screen_mode_ == ScreenMode::threads) {
+          load_boards();
+          screen_mode_ = ScreenMode::boards;
+          return;
+        }
+        quit();
+        return;
+      }
+      if (key->action == termforge::KeyAction::Press && key->ctrl &&
+          (key->ch == U'c' || key->ch == U'C')) {
         quit();
         return;
       }
@@ -269,8 +339,21 @@ public:
       if (key->action == termforge::KeyAction::Press &&
           (key->key == termforge::Key::Enter ||
            (key->ctrl && (key->ch == U'j' || key->ch == U'J' ||
-                          key->ch == U'm' || key->ch == U'M')))) {
-        if (identity_.kind == IdentityKind::registration) {
+                          key->ch == U'm' || key->ch == U'M'))) &&
+          !(screen_mode_ == ScreenMode::compose && (key->shift || key->alt))) {
+        if (screen_mode_ == ScreenMode::subject) {
+          begin_new_thread_body();
+        } else if (screen_mode_ == ScreenMode::compose) {
+          submit_composition();
+        } else if (screen_mode_ == ScreenMode::report) {
+          submit_report();
+        } else if (screen_mode_ == ScreenMode::boards &&
+                   input_.text().empty()) {
+          open_selected_board();
+        } else if (screen_mode_ == ScreenMode::threads &&
+                   input_.text().empty()) {
+          open_selected_thread();
+        } else if (identity_.kind == IdentityKind::registration) {
           submit_registration();
         } else if (screen_mode_ == ScreenMode::tos &&
                    (identity_.kind == IdentityKind::pending ||
@@ -282,6 +365,51 @@ public:
           submit_active_command();
         }
         return;
+      }
+      if (key->action == termforge::KeyAction::Press &&
+          screen_mode_ == ScreenMode::threads && !key->ctrl && !key->alt) {
+        if ((key->ch == U'n' || key->ch == U'N') && may_post()) {
+          input_.set_text({});
+          screen_mode_ = ScreenMode::subject;
+          status_.clear();
+          return;
+        }
+        if ((key->ch == U'c' || key->ch == U'C') &&
+            identity_.kind != IdentityKind::guest) {
+          catch_up_selected_board();
+          return;
+        }
+      }
+      if (key->action == termforge::KeyAction::Press &&
+          screen_mode_ == ScreenMode::thread && !key->ctrl && !key->alt) {
+        if ((key->ch == U'r' || key->ch == U'R') && may_post()) {
+          begin_reply(false);
+          return;
+        }
+        if ((key->ch == U'q' || key->ch == U'Q') && may_post()) {
+          begin_reply(true);
+          return;
+        }
+        if (key->ch == U'!') {
+          if (messages_.empty()) {
+            status_ = "There is no post to report.";
+            return;
+          }
+          report_target_ = store::ContentRef{store::ContentKind::message,
+                                             messages_.back().message_id};
+          composer_.clear();
+          screen_mode_ = ScreenMode::report;
+          status_.clear();
+          return;
+        }
+        if (key->ch == U'T' && selected_thread_ < threads_.size()) {
+          report_target_ = store::ContentRef{
+              store::ContentKind::thread, threads_[selected_thread_].thread_id};
+          composer_.clear();
+          screen_mode_ = ScreenMode::report;
+          status_.clear();
+          return;
+        }
       }
     }
 
@@ -320,11 +448,27 @@ public:
       return;
     }
 
+    if (screen_mode_ == ScreenMode::boards && board_list_.on_event(event)) {
+      return;
+    }
+    if (screen_mode_ == ScreenMode::threads && thread_list_.on_event(event)) {
+      return;
+    }
+    if (screen_mode_ == ScreenMode::thread && message_box_.on_event(event)) {
+      return;
+    }
+    if ((screen_mode_ == ScreenMode::compose ||
+         screen_mode_ == ScreenMode::report) &&
+        composer_.on_event(event)) {
+      return;
+    }
+
     if (((identity_.kind == IdentityKind::registration &&
           registration_mode_ != RegistrationMode::closed) ||
          identity_.kind == IdentityKind::pending ||
          identity_.kind == IdentityKind::tos_required ||
-         identity_.kind == IdentityKind::active) &&
+         identity_.kind == IdentityKind::active ||
+         screen_mode_ == ScreenMode::subject) &&
         input_.on_event(event)) {
       return;
     }
@@ -343,46 +487,14 @@ public:
         std::to_string(screen.cols()) + "x" + std::to_string(screen.rows());
     static_cast<void>(screen.write_text(0, 1, "Terminal: " + dimensions,
                                         foreground, background));
-    if (identity_.kind == IdentityKind::guest) {
-      static_cast<void>(screen.write_text(
-          0, 2, "Guest access: boards and doors are read-only.", foreground,
-          background));
-      if (screen.rows() > 3) {
-        static_cast<void>(
-            screen.write_text(0, 3, "Boards  (none yet)", accent, background));
-      }
-      if (screen.rows() > 4) {
-        static_cast<void>(
-            screen.write_text(0, 4, "Doors   (none yet)", accent, background));
-      }
-    } else if (identity_.kind == IdentityKind::registration) {
+    if (identity_.kind == IdentityKind::registration) {
       render_registration(screen, foreground, accent, background);
     } else if ((identity_.kind == IdentityKind::pending ||
                 identity_.kind == IdentityKind::tos_required) &&
                screen_mode_ == ScreenMode::tos) {
       render_tos(screen, foreground, accent, background);
-    } else if (identity_.kind == IdentityKind::tos_required) {
-      static_cast<void>(screen.write_text(
-          0, 2, "TOS changed: read-only until the current version is accepted.",
-          accent, background));
-      if (screen.rows() > 3) {
-        static_cast<void>(
-            screen.write_text(0, 3, "Boards  (none yet)", accent, background));
-      }
-      if (screen.rows() > 4) {
-        input_.set_geometry(termforge::Rect{0, 4, screen.cols(), 1});
-        input_.draw(screen);
-      }
     } else {
-      static_cast<void>(
-          screen.write_text(0, 2,
-                            "Signed in as " + identity_.handle +
-                                ". Type /invite to issue an invite code.",
-                            foreground, background));
-      if (screen.rows() > 3) {
-        input_.set_geometry(termforge::Rect{0, 3, screen.cols(), 1});
-        input_.draw(screen);
-      }
+      render_board_screen(screen, foreground, accent, background);
     }
     auto issued_message =
         issued_invite_code_.empty()
@@ -404,7 +516,16 @@ public:
 
 private:
   enum class RegistrationStep { invite_code, handle };
-  enum class ScreenMode { shell, tos };
+  enum class ScreenMode {
+    boards,
+    threads,
+    thread,
+    subject,
+    compose,
+    report,
+    tos,
+  };
+  enum class ComposeAction { new_thread, reply };
 
   void append_tos_text() {
     std::size_t start = 0;
@@ -420,6 +541,368 @@ private:
         break;
       }
       start = end + 1U;
+    }
+  }
+
+  [[nodiscard]] auto board_reader() const -> store::BoardReader {
+    if (identity_.kind == IdentityKind::active ||
+        identity_.kind == IdentityKind::tos_required) {
+      return {.handle = identity_.handle, .may_read_registered = true};
+    }
+    return {};
+  }
+
+  [[nodiscard]] bool may_post() const noexcept {
+    return identity_.kind == IdentityKind::active;
+  }
+
+  void load_boards() {
+    auto read = identity_store_.begin(store::TransactionMode::read_only);
+    if (!read) {
+      status_ = "Boards are temporarily unavailable.";
+      return;
+    }
+    auto boards = identity_store_.list_boards(*read, board_reader());
+    if (!boards || !read->commit()) {
+      status_ = "Boards are temporarily unavailable.";
+      return;
+    }
+    boards_ = std::move(*boards);
+    std::vector<std::string> items;
+    items.reserve(boards_.size());
+    for (const auto &board : boards_) {
+      auto item = board.title;
+      if (board.unread_messages > 0U) {
+        item += " (" + std::to_string(board.unread_messages) + " new)";
+      }
+      items.push_back(std::move(item));
+    }
+    board_list_.set_items(std::move(items));
+    if (!boards_.empty()) {
+      board_list_.set_selected(
+          static_cast<int>(std::min(selected_board_, boards_.size() - 1U)));
+    }
+  }
+
+  void open_selected_board() {
+    const auto selected = board_list_.selected();
+    if (selected < 0 || static_cast<std::size_t>(selected) >= boards_.size()) {
+      status_ = "No board is selected.";
+      return;
+    }
+    selected_board_ = static_cast<std::size_t>(selected);
+    auto read = identity_store_.begin(store::TransactionMode::read_only);
+    if (!read) {
+      status_ = "Threads are temporarily unavailable.";
+      return;
+    }
+    auto threads = identity_store_.list_threads(
+        *read, boards_[selected_board_].board_id, board_reader());
+    if (!threads || !read->commit()) {
+      status_ = "Threads are temporarily unavailable.";
+      return;
+    }
+    threads_ = std::move(*threads);
+    std::vector<std::string> items;
+    items.reserve(threads_.size());
+    for (const auto &thread : threads_) {
+      auto item =
+          thread.subject + " [" + std::to_string(thread.message_count) + "]";
+      if (thread.unread_messages > 0U) {
+        item += " (" + std::to_string(thread.unread_messages) + " new)";
+      }
+      if (thread.locked) {
+        item += " [locked]";
+      }
+      items.push_back(std::move(item));
+    }
+    thread_list_.set_items(std::move(items));
+    selected_thread_ = 0U;
+    screen_mode_ = ScreenMode::threads;
+    status_.clear();
+  }
+
+  void open_selected_thread() {
+    const auto selected = thread_list_.selected();
+    if (selected < 0 || static_cast<std::size_t>(selected) >= threads_.size()) {
+      status_ = "No thread is selected.";
+      return;
+    }
+    selected_thread_ = static_cast<std::size_t>(selected);
+    const auto mode = identity_.kind == IdentityKind::guest
+                          ? store::TransactionMode::read_only
+                          : store::TransactionMode::read_write;
+    auto transaction = identity_store_.begin(mode);
+    if (!transaction) {
+      status_ = "Messages are temporarily unavailable.";
+      return;
+    }
+    const auto &thread = threads_[selected_thread_];
+    auto messages = identity_store_.list_messages_for_thread(
+        *transaction, thread.board_id, thread.thread_id, board_reader());
+    if (!messages) {
+      status_ = "Messages are temporarily unavailable.";
+      return;
+    }
+    if (identity_.kind != IdentityKind::guest) {
+      auto marked = identity_store_.mark_thread_read(
+          *transaction, identity_.handle, thread.board_id, thread.thread_id);
+      if (!marked) {
+        status_ = "Could not save the read position.";
+        return;
+      }
+    }
+    if (!transaction->commit()) {
+      status_ = "Messages are temporarily unavailable.";
+      return;
+    }
+    messages_ = std::move(*messages);
+    message_box_.clear();
+    for (const auto &message : messages_) {
+      if (message.parent_message_id) {
+        const auto parent = std::ranges::find_if(
+            messages_, [&](const store::MessageRecord &candidate) {
+              return candidate.message_id == *message.parent_message_id;
+            });
+        const auto quoted_author = parent == messages_.end()
+                                       ? std::string{"unknown"}
+                                       : parent->author_handle;
+        message_box_.append("Reply to @" + quoted_author + " [" +
+                            *message.parent_message_id + "]");
+      }
+      message_box_.append("@" + message.author_handle + ": " + message.body);
+      message_box_.append(std::string{});
+    }
+    screen_mode_ = ScreenMode::thread;
+    status_.clear();
+  }
+
+  void catch_up_selected_board() {
+    if (selected_board_ >= boards_.size()) {
+      return;
+    }
+    auto write = identity_store_.begin(store::TransactionMode::read_write);
+    if (!write ||
+        !identity_store_.catch_up_board(*write, identity_.handle,
+                                        boards_[selected_board_].board_id) ||
+        !write->commit()) {
+      status_ = "Could not catch up this board.";
+      return;
+    }
+    load_boards();
+    open_selected_board();
+    status_ = "Board marked read through the latest message.";
+  }
+
+  void begin_new_thread_body() {
+    auto subject = prepare_user_text_for_ingest(
+        UserTextField::subject, RemoteBytes::from_text(input_.text()));
+    if (!subject || subject->empty()) {
+      status_ = "Subject must contain 1 to 120 graphemes.";
+      return;
+    }
+    pending_subject_ = std::move(*subject);
+    input_.set_text({});
+    composer_.clear();
+    compose_action_ = ComposeAction::new_thread;
+    quote_parent_.reset();
+    screen_mode_ = ScreenMode::compose;
+    status_.clear();
+  }
+
+  void begin_reply(bool quote) {
+    quote_parent_.reset();
+    if (quote && !messages_.empty()) {
+      quote_parent_ = messages_.back().message_id;
+    }
+    composer_.clear();
+    compose_action_ = ComposeAction::reply;
+    screen_mode_ = ScreenMode::compose;
+    status_.clear();
+  }
+
+  void submit_composition() {
+    auto body = prepare_user_text_for_ingest(
+        UserTextField::post_body, RemoteBytes::from_text(composer_.text()));
+    if (!body || body->empty()) {
+      status_ = "Post body must contain 1 to 16384 graphemes.";
+      return;
+    }
+    if (selected_board_ >= boards_.size()) {
+      status_ = "The selected board is no longer available.";
+      return;
+    }
+    auto write = identity_store_.begin(store::TransactionMode::read_write);
+    if (!write) {
+      status_ = "Posting is temporarily unavailable.";
+      return;
+    }
+    const auto now = utc_now();
+    std::expected<store::MessageRecord, store::Error> created =
+        std::unexpected(store::Error{});
+    if (compose_action_ == ComposeAction::new_thread) {
+      created = identity_store_.create_thread(
+          *write, {.board_id = boards_[selected_board_].board_id,
+                   .thread_id = random_content_id("thread-"),
+                   .message_id = random_content_id("message-"),
+                   .author_handle = identity_.handle,
+                   .subject = pending_subject_,
+                   .body = *body,
+                   .created_at = now});
+    } else if (selected_thread_ < threads_.size()) {
+      created = identity_store_.create_reply(
+          *write, {.board_id = boards_[selected_board_].board_id,
+                   .thread_id = threads_[selected_thread_].thread_id,
+                   .message_id = random_content_id("message-"),
+                   .parent_message_id = quote_parent_,
+                   .author_handle = identity_.handle,
+                   .body = *body,
+                   .created_at = now});
+    }
+    if (!created || !write->commit()) {
+      status_ = "Posting failed; no partial post was saved.";
+      return;
+    }
+    composer_.push_history(*body);
+    composer_.clear();
+    if (compose_action_ == ComposeAction::new_thread) {
+      open_selected_board();
+      open_selected_thread();
+      status_ = "Thread posted.";
+    } else {
+      open_selected_thread();
+      status_ = "Reply posted.";
+    }
+  }
+
+  [[nodiscard]] bool request_guest_report_permit() const noexcept {
+    if (guest_report_permit_descriptor_ < 0) {
+      return false;
+    }
+    constexpr std::uint8_t request = 1U;
+    ssize_t sent{};
+    do {
+      sent = ::send(guest_report_permit_descriptor_, &request, sizeof(request),
+                    MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent != static_cast<ssize_t>(sizeof(request))) {
+      return false;
+    }
+    pollfd descriptor{
+        .fd = guest_report_permit_descriptor_, .events = POLLIN, .revents = 0};
+    int ready{};
+    do {
+      ready = ::poll(&descriptor, 1, 1500);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0 || (descriptor.revents & POLLIN) == 0) {
+      return false;
+    }
+    std::uint8_t allowed{};
+    const auto received =
+        ::recv(guest_report_permit_descriptor_, &allowed, sizeof(allowed), 0);
+    return received == static_cast<ssize_t>(sizeof(allowed)) && allowed == 1U;
+  }
+
+  void submit_report() {
+    auto reason =
+        prepare_user_text_for_ingest(UserTextField::file_description,
+                                     RemoteBytes::from_text(composer_.text()));
+    if (!reason || reason->empty() || !report_target_) {
+      status_ = "Report reason must contain 1 to 1024 graphemes.";
+      return;
+    }
+    if (identity_.kind == IdentityKind::guest &&
+        !request_guest_report_permit()) {
+      status_ = "Anonymous report limit reached; try again later.";
+      return;
+    }
+    auto write = identity_store_.begin(store::TransactionMode::read_write);
+    const auto reporter = identity_.kind == IdentityKind::guest
+                              ? std::nullopt
+                              : std::optional<std::string>{identity_.handle};
+    if (!write ||
+        !identity_store_.submit_report(
+            *write, {.report_id = random_content_id("report-"),
+                     .reporter_handle = reporter,
+                     .target = *report_target_,
+                     .reason = *reason,
+                     .created_at = utc_now()}) ||
+        !write->commit()) {
+      status_ = "Report failed; no partial report was saved.";
+      return;
+    }
+    composer_.clear();
+    report_target_.reset();
+    screen_mode_ = ScreenMode::thread;
+    status_ = "Report submitted.";
+  }
+
+  void render_board_screen(termforge::Screen &screen, termforge::Rgb foreground,
+                           termforge::Rgb accent, termforge::Rgb background) {
+    const auto identity_line =
+        identity_.kind == IdentityKind::guest
+            ? std::string{"Guest access: boards and doors are read-only."}
+        : identity_.kind == IdentityKind::tos_required
+            ? std::string{"TOS changed: read-only until accepted (/tos)."}
+            : "Signed in as " + identity_.handle +
+                  ". Type /invite to issue an invite code.";
+    static_cast<void>(
+        screen.write_text(0, 2, identity_line, foreground, background));
+    const auto body_height = std::max(1, screen.rows() - 7);
+    if (screen_mode_ == ScreenMode::boards) {
+      static_cast<void>(screen.write_text(
+          0, 3, "Boards - arrows move, Enter opens, Esc exits", accent,
+          background));
+      board_list_.set_geometry(
+          termforge::Rect{0, 4, screen.cols(), body_height});
+      board_list_.draw(screen);
+      if (identity_.kind != IdentityKind::guest && screen.rows() > 2) {
+        input_.set_geometry(
+            termforge::Rect{0, screen.rows() - 2, screen.cols(), 1});
+        input_.draw(screen);
+      }
+    } else if (screen_mode_ == ScreenMode::threads) {
+      const auto board_title = selected_board_ < boards_.size()
+                                   ? boards_[selected_board_].title
+                                   : std::string{"Board"};
+      const auto help = may_post()
+                            ? " - Enter opens, n new, c catch up, Esc back"
+                        : identity_.kind == IdentityKind::guest
+                            ? " - Enter opens, Esc back"
+                            : " - Enter opens, c catch up, Esc back";
+      static_cast<void>(
+          screen.write_text(0, 3, board_title + help, accent, background));
+      thread_list_.set_geometry(
+          termforge::Rect{0, 4, screen.cols(), body_height + 1});
+      thread_list_.draw(screen);
+    } else if (screen_mode_ == ScreenMode::thread) {
+      const auto subject = selected_thread_ < threads_.size()
+                               ? threads_[selected_thread_].subject
+                               : std::string{"Thread"};
+      const auto help =
+          may_post()
+              ? " - r reply, q quote, ! post report, T thread report, Esc back"
+              : " - ! post report, T thread report, Esc back";
+      static_cast<void>(
+          screen.write_text(0, 3, subject + help, accent, background));
+      message_box_.set_geometry(
+          termforge::Rect{0, 4, screen.cols(), body_height + 1});
+      message_box_.draw(screen);
+    } else if (screen_mode_ == ScreenMode::subject) {
+      static_cast<void>(screen.write_text(
+          0, 3, "New thread subject (Enter continues, Esc cancels)", accent,
+          background));
+      input_.set_geometry(termforge::Rect{0, 5, screen.cols(), 1});
+      input_.draw(screen);
+    } else {
+      const auto prompt =
+          screen_mode_ == ScreenMode::report
+              ? "Report reason (Enter submits, Esc cancels)"
+              : "Post body (Enter submits, Shift+Enter newline)";
+      static_cast<void>(screen.write_text(0, 3, prompt, accent, background));
+      composer_.set_geometry(
+          termforge::Rect{0, 4, screen.cols(), body_height + 1});
+      composer_.draw(screen);
     }
   }
 
@@ -542,7 +1025,8 @@ private:
     if (input_.text() == "/browse" &&
         identity_.kind == IdentityKind::tos_required) {
       input_.set_text({});
-      screen_mode_ = ScreenMode::shell;
+      screen_mode_ = ScreenMode::boards;
+      load_boards();
       status_ = "Read-only access. Type /tos to review the current terms.";
       return;
     }
@@ -564,7 +1048,8 @@ private:
       return;
     }
     identity_ = std::move(*accepted);
-    screen_mode_ = ScreenMode::shell;
+    screen_mode_ = ScreenMode::boards;
+    load_boards();
     status_ = "Current terms accepted.";
   }
 
@@ -620,8 +1105,22 @@ private:
   RegistrationMode registration_mode_{RegistrationMode::open};
   InvitePolicy invite_policy_;
   TosPolicy tos_policy_;
-  ScreenMode screen_mode_{ScreenMode::shell};
+  int guest_report_permit_descriptor_{-1};
+  ScreenMode screen_mode_{ScreenMode::boards};
   termforge::TextBox tos_box_;
+  termforge::ListWidget board_list_;
+  termforge::ListWidget thread_list_;
+  termforge::TextBox message_box_;
+  termforge::Composer composer_;
+  std::vector<store::BoardRecord> boards_;
+  std::vector<store::ThreadRecord> threads_;
+  std::vector<store::MessageRecord> messages_;
+  std::size_t selected_board_{};
+  std::size_t selected_thread_{};
+  ComposeAction compose_action_{ComposeAction::reply};
+  std::optional<std::string> quote_parent_;
+  std::optional<store::ContentRef> report_target_;
+  std::string pending_subject_;
   bool tos_positioned_{};
   RegistrationStep registration_step_{RegistrationStep::invite_code};
   termforge::TextInput input_;
@@ -681,12 +1180,13 @@ public:
        SessionResourceLimits resource_limits,
        RegistrationMode registration_mode, InvitePolicy invite_policy,
        TosPolicy tos_policy, SessionIdentity identity,
-       store::Store &identity_store, SessionInputHook input_hook_for_testing)
+       store::Store &identity_store, SessionInputHook input_hook_for_testing,
+       int guest_report_permit_descriptor)
       : shared_(dimensions, resource_limits),
         app_(io_descriptor, std::move(terminal_type), dimensions,
              channel_opened, shared_, std::move(identity), identity_store,
              registration_mode, invite_policy, std::move(tos_policy),
-             input_hook_for_testing) {}
+             input_hook_for_testing, guest_report_permit_descriptor) {}
 
   ~Impl() {
     request_stop();
@@ -841,11 +1341,12 @@ TerminalSession::TerminalSession(
     SessionResourceLimits resource_limits, RegistrationMode registration_mode,
     const InvitePolicy &invite_policy, const TosPolicy &tos_policy,
     SessionIdentity identity, store::Store &identity_store,
-    SessionInputHook input_hook_for_testing)
+    SessionInputHook input_hook_for_testing, int guest_report_permit_descriptor)
     : impl_(std::make_unique<Impl>(
           io_descriptor, std::move(terminal_type), dimensions, channel_opened,
           resource_limits, registration_mode, invite_policy, tos_policy,
-          std::move(identity), identity_store, input_hook_for_testing)) {}
+          std::move(identity), identity_store, input_hook_for_testing,
+          guest_report_permit_descriptor)) {}
 
 TerminalSession::~TerminalSession() = default;
 

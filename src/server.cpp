@@ -402,12 +402,10 @@ void write_all(int descriptor, std::string_view contents,
       continue;
     }
     if (count < 0) {
-      throw_system_error(
-          "cannot obtain randomness for temporary host key name");
+      throw_system_error("cannot obtain randomness for opaque identifier");
     }
     if (count == 0) {
-      throw std::runtime_error(
-          "no randomness returned for temporary host key name");
+      throw std::runtime_error("no randomness returned for opaque identifier");
     }
     offset += static_cast<std::size_t>(count);
   }
@@ -420,6 +418,24 @@ void write_all(int descriptor, std::string_view contents,
     suffix.push_back(digits[byte & 0x0fU]);
   }
   return suffix;
+}
+
+[[nodiscard]] std::string random_uuid() {
+  auto compact = random_suffix();
+  compact[12] = '4';
+  compact[16] = '8';
+  std::string uuid;
+  uuid.reserve(36);
+  uuid.append(compact, 0, 8);
+  uuid.push_back('-');
+  uuid.append(compact, 8, 4);
+  uuid.push_back('-');
+  uuid.append(compact, 12, 4);
+  uuid.push_back('-');
+  uuid.append(compact, 16, 4);
+  uuid.push_back('-');
+  uuid.append(compact, 20, 12);
+  return uuid;
 }
 
 [[nodiscard]] std::string generate_ed25519_host_key() {
@@ -947,7 +963,7 @@ failure_reason_name(SessionFailureReason reason) noexcept {
 int run_session(ssh_session session, store::Store &identity_store,
                 const Config &config, const TosPolicy &tos_policy,
                 int signal_descriptor, int worker_report_descriptor,
-                std::uint64_t session_id) {
+                int guest_report_permit_descriptor, std::uint64_t session_id) {
   SessionState state;
   state.identity_store = &identity_store;
   state.tos_version = tos_policy.version;
@@ -1098,7 +1114,8 @@ int run_session(ssh_session session, store::Store &identity_store,
             state.channel_opened_at, config.session_resources,
             config.registration_mode, config.invite_policy, tos_policy,
             state.identity, *state.identity_store,
-            config.session_input_hook_for_testing);
+            config.session_input_hook_for_testing,
+            guest_report_permit_descriptor);
         state.terminal_session = terminal_session.get();
         auto armed =
             WorkerMemoryGuard::arm(config.session_resources.memory_bytes);
@@ -1303,9 +1320,41 @@ int run_session(ssh_session session, store::Store &identity_store,
 struct ChildState {
   PeerAddress peer;
   std::uint64_t session_id{};
+  FileDescriptor guest_report_permit;
 };
 
 using ChildMap = std::unordered_map<pid_t, ChildState>;
+
+void service_guest_report_permits(ChildMap &children,
+                                  AdmissionController &admission) noexcept {
+  for (auto &[worker, child] : children) {
+    static_cast<void>(worker);
+    for (;;) {
+      std::uint8_t request{};
+      const auto received =
+          ::recv(child.guest_report_permit.get(), &request, sizeof(request), 0);
+      if (received < 0 && errno == EINTR) {
+        continue;
+      }
+      if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        break;
+      }
+      if (received != static_cast<ssize_t>(sizeof(request)) || request != 1U) {
+        break;
+      }
+      const std::uint8_t allowed =
+          admission.consume_guest_report(child.peer, Clock::now()) ? 1U : 0U;
+      ssize_t sent{};
+      do {
+        sent = ::send(child.guest_report_permit.get(), &allowed,
+                      sizeof(allowed), MSG_NOSIGNAL);
+      } while (sent < 0 && errno == EINTR);
+      if (sent != static_cast<ssize_t>(sizeof(allowed))) {
+        break;
+      }
+    }
+  }
+}
 
 void drain_worker_reports(int descriptor, const ChildMap &children,
                           AdmissionController &admission,
@@ -1626,6 +1675,102 @@ void await_children(ChildMap &children, int signal_descriptor,
   return std::chrono::seconds(value);
 }
 
+[[nodiscard]] BoardDeclaration parse_board_declaration(std::string_view text,
+                                                       bool registered_only) {
+  const auto separator = text.find('=');
+  if (separator == std::string_view::npos || separator == 0U ||
+      separator + 1U >= text.size()) {
+    throw std::runtime_error("board declaration must have the form NAME=TITLE");
+  }
+  const auto name = text.substr(0, separator);
+  if (name.size() > 64U) {
+    throw std::runtime_error(
+        "board name must be a 1 to 64 byte lowercase ASCII slug");
+  }
+  for (const auto character : name) {
+    if (!((character >= 'a' && character <= 'z') ||
+          (character >= '0' && character <= '9') || character == '-')) {
+      throw std::runtime_error(
+          "board name must be a 1 to 64 byte lowercase ASCII slug");
+    }
+  }
+  const auto raw_title = text.substr(separator + 1U);
+  if (raw_title.find('\n') != std::string_view::npos ||
+      raw_title.find('\r') != std::string_view::npos) {
+    throw std::runtime_error("board title must be one line");
+  }
+  auto title = prepare_user_text_for_ingest(UserTextField::subject,
+                                            RemoteBytes::from_text(raw_title));
+  if (!title || title->empty()) {
+    throw std::runtime_error(
+        "board title must contain 1 to 120 graphemes of valid UTF-8");
+  }
+  return BoardDeclaration{.name = std::string(name),
+                          .title = std::move(*title),
+                          .registered_only = registered_only};
+}
+
+void reconcile_boards(store::Store &database, const Config &config,
+                      store::UtcEpochSeconds now) {
+  std::vector<BoardDeclaration> declarations = config.boards;
+  for (std::size_t index = 0; index < declarations.size(); ++index) {
+    for (std::size_t other = index + 1U; other < declarations.size(); ++other) {
+      if (declarations[index].name == declarations[other].name) {
+        throw std::runtime_error("duplicate board declaration: " +
+                                 declarations[index].name);
+      }
+    }
+  }
+  if (declarations.empty()) {
+    auto read = database.begin(store::TransactionMode::read_only);
+    if (!read) {
+      throw std::runtime_error("cannot inspect configured boards: " +
+                               read.error().detail);
+    }
+    auto existing = database.list_boards(
+        *read, store::BoardReader{.handle = std::nullopt,
+                                  .may_read_registered = true});
+    if (!existing) {
+      throw std::runtime_error("cannot inspect configured boards: " +
+                               existing.error().detail);
+    }
+    if (auto committed = read->commit(); !committed) {
+      throw std::runtime_error("cannot finish board inspection: " +
+                               committed.error().detail);
+    }
+    if (!existing->empty()) {
+      return;
+    }
+    declarations.push_back(
+        BoardDeclaration{.name = "general", .title = "General"});
+  }
+
+  auto write = database.begin(store::TransactionMode::read_write);
+  if (!write) {
+    throw std::runtime_error("cannot begin board reconciliation: " +
+                             write.error().detail);
+  }
+  for (const auto &declaration : declarations) {
+    auto reconciled = database.reconcile_board(
+        *write, store::BoardProvision{
+                    .board_id = random_uuid(),
+                    .name = declaration.name,
+                    .title = declaration.title,
+                    .visibility = declaration.registered_only
+                                      ? store::BoardVisibility::registered_only
+                                      : store::BoardVisibility::public_read,
+                    .created_at = now});
+    if (!reconciled) {
+      throw std::runtime_error("cannot reconcile board '" + declaration.name +
+                               "': " + reconciled.error().detail);
+    }
+  }
+  if (auto committed = write->commit(); !committed) {
+    throw std::runtime_error("cannot commit board reconciliation: " +
+                             committed.error().detail);
+  }
+}
+
 } // namespace
 
 std::string_view usage() noexcept {
@@ -1646,6 +1791,8 @@ std::string_view usage() noexcept {
          "  --notify-inviters-on-moderation on|off (default off)\n"
          "  --tos-version VERSION  opaque current TOS version (required)\n"
          "  --tos-file PATH        UTF-8 TOS text file (required)\n"
+         "  --board NAME=TITLE    public board declaration; repeatable\n"
+         "  --member-board N=T    registered-only board; repeatable\n"
          "  --backup-directory P  enable snapshots in directory P\n"
          "  --backup-interval-seconds S\n"
          "                          snapshot period (default 86400)\n"
@@ -1662,6 +1809,8 @@ std::string_view usage() noexcept {
          "  --auth-attempt-rate-limit C/S\n"
          "                          denied-auth burst C per S seconds (default "
          "6/60)\n"
+         "  --guest-report-rate-limit C/S\n"
+         "                          anonymous report burst (default 5/3600)\n"
          "  --max-auth-attempts-per-session N\n"
          "                          denied-auth limit per connection (default "
          "6)\n"
@@ -1676,7 +1825,7 @@ std::string_view usage() noexcept {
          "                          allocation headroom per worker (default "
          "67108864)\n"
          "  --session-cpu-burst-ms M\n"
-         "                          uninterrupted CPU burst (default 50)\n"
+         "                          uninterrupted CPU burst (default 250)\n"
          "  --session-output-bytes-per-second B\n"
          "                          output rate and one-second burst (default "
          "1000000)\n"
@@ -1699,6 +1848,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   bool registration_mode_explicit = false;
   bool invite_policy_explicit = false;
   bool tos_explicit = false;
+  bool board_policy_explicit = false;
   for (std::size_t index = 0; index < arguments.size(); ++index) {
     const auto argument = arguments[index];
     if (argument == "--help") {
@@ -1713,6 +1863,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
         argument != "--invite-expiration-seconds" &&
         argument != "--notify-inviters-on-moderation" &&
         argument != "--tos-version" && argument != "--tos-file" &&
+        argument != "--board" && argument != "--member-board" &&
         argument != "--backup-directory" &&
         argument != "--backup-interval-seconds" &&
         argument != "--backup-retention-seconds" &&
@@ -1720,6 +1871,7 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
         argument != "--max-sessions" && argument != "--max-sessions-per-ip" &&
         argument != "--connection-rate-limit" &&
         argument != "--auth-attempt-rate-limit" &&
+        argument != "--guest-report-rate-limit" &&
         argument != "--max-auth-attempts-per-session" &&
         argument != "--max-tracked-ips" &&
         argument != "--idle-timeout-seconds" &&
@@ -1793,6 +1945,18 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     } else if (argument == "--tos-file") {
       result.config.tos_file = value;
       tos_explicit = true;
+    } else if (argument == "--board" || argument == "--member-board") {
+      auto declaration =
+          parse_board_declaration(value, argument == "--member-board");
+      if (std::ranges::any_of(result.config.boards,
+                              [&](const BoardDeclaration &existing) {
+                                return existing.name == declaration.name;
+                              })) {
+        throw std::runtime_error("duplicate board declaration: " +
+                                 declaration.name);
+      }
+      result.config.boards.push_back(std::move(declaration));
+      board_policy_explicit = true;
     } else if (argument == "--backup-directory") {
       result.config.backup_directory = value;
       backup_directory_explicit = true;
@@ -1827,6 +1991,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
     } else if (argument == "--auth-attempt-rate-limit") {
       result.config.auth_attempt_rate =
           parse_rate_limit(value, "auth attempt rate limit");
+    } else if (argument == "--guest-report-rate-limit") {
+      result.config.guest_report_rate =
+          parse_rate_limit(value, "guest report rate limit");
+      board_policy_explicit = true;
     } else if (argument == "--max-auth-attempts-per-session") {
       result.config.max_auth_attempts_per_session =
           parse_bounded_count(value, "auth attempts per session", 4096);
@@ -1888,6 +2056,10 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
       if (tos_explicit) {
         throw std::runtime_error(
             "TOS options are not valid in backup or restore mode");
+      }
+      if (board_policy_explicit) {
+        throw std::runtime_error(
+            "board options are not valid in backup or restore mode");
       }
       if (backup_directory_explicit || backup_interval_explicit ||
           backup_retention_explicit) {
@@ -1995,6 +2167,7 @@ int run(const Config &config) {
           "cannot import --authorized-key into the identity store");
     }
   }
+  reconcile_boards(**database, config, identity_time);
   auto host_key = load_or_create_host_key(config.host_key_path);
 
   UniqueBind bind(ssh_bind_new());
@@ -2066,7 +2239,8 @@ int run(const Config &config) {
 
   AdmissionController admission(
       config.max_sessions, config.max_sessions_per_ip, config.connection_rate,
-      config.auth_attempt_rate, config.max_tracked_ips);
+      config.auth_attempt_rate, config.max_tracked_ips,
+      config.guest_report_rate);
   ChildMap children;
   children.reserve(config.max_sessions);
   std::uint64_t next_session_id = 1U;
@@ -2120,6 +2294,7 @@ int run(const Config &config) {
       throw_system_error("listener poll failed");
     }
 
+    service_guest_report_permits(children, admission);
     health->heartbeat(!stopping);
     if (!health->alive()) {
       std::cerr << "anvil: health process exited unexpectedly\n";
@@ -2200,6 +2375,17 @@ int run(const Config &config) {
     }
 
     const auto session_id = next_session_id;
+    std::array<int, 2> guest_report_descriptors{};
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                     guest_report_descriptors.data()) != 0) {
+      std::cerr << "anvil: cannot create guest-report permit channel: "
+                << std::strerror(errno) << '\n';
+      ssh_disconnect(session.get());
+      admission.release(*peer, Clock::now());
+      continue;
+    }
+    FileDescriptor guest_report_supervisor(guest_report_descriptors[0]);
+    FileDescriptor guest_report_worker(guest_report_descriptors[1]);
     const auto child = ::fork();
     if (child < 0) {
       std::cerr << "anvil: fork failed: " << std::strerror(errno) << '\n';
@@ -2209,6 +2395,11 @@ int run(const Config &config) {
     }
     if (child == 0) {
       health->detach_in_worker();
+      guest_report_supervisor = FileDescriptor();
+      for (auto &[existing_worker, existing] : children) {
+        static_cast<void>(existing_worker);
+        existing.guest_report_permit = FileDescriptor();
+      }
       static_cast<void>(::close(signal_descriptor.get()));
       static_cast<void>(::close(worker_report_receiver.get()));
       bind.reset();
@@ -2226,15 +2417,17 @@ int run(const Config &config) {
         std::cerr << "anvil: cannot create worker signal descriptor\n";
         std::_Exit(1);
       }
-      const auto exit_status =
-          run_session(session.get(), **database, config, tos_policy,
-                      worker_signal_descriptor.get(),
-                      worker_report_sender.get(), session_id);
+      const auto exit_status = run_session(
+          session.get(), **database, config, tos_policy,
+          worker_signal_descriptor.get(), worker_report_sender.get(),
+          guest_report_worker.get(), session_id);
       ssh_disconnect(session.get());
       session.reset();
       std::_Exit(exit_status);
     }
-    children.emplace(child, ChildState{*peer, session_id});
+    guest_report_worker = FileDescriptor();
+    children.emplace(child, ChildState{*peer, session_id,
+                                       std::move(guest_report_supervisor)});
     health->session_started(session_id, child);
     ++next_session_id;
     if (next_session_id == 0U) {

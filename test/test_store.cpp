@@ -717,3 +717,77 @@ TEST_CASE("invite graph reads retain tombstoned descendants by depth") {
   CHECK(store.list_invite_subtree(*read, "missing").error().code ==
         ErrorCode::not_found);
 }
+
+TEST_CASE("database-free Store implements board posting and unread contracts") {
+  anvil::testing::MemoryStore store;
+  store.seed_credential({.handle = "alice",
+                         .fingerprint = "SHA256:alice",
+                         .public_key = "ssh-ed25519 ALICE",
+                         .status = CredentialStatus::active});
+  store.seed_credential({.handle = "bob",
+                         .fingerprint = "SHA256:bob",
+                         .public_key = "ssh-ed25519 BOB",
+                         .status = CredentialStatus::active});
+  auto write = store.begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE(
+      store
+          .reconcile_board(
+              *write, {.board_id = std::string(board_id),
+                       .name = "general",
+                       .title = "General",
+                       .visibility = anvil::store::BoardVisibility::public_read,
+                       .created_at = {1}})
+          .has_value());
+  REQUIRE(store
+              .create_thread(*write, {.board_id = std::string(board_id),
+                                      .thread_id = "thread-1",
+                                      .message_id = "message-1",
+                                      .author_handle = "alice",
+                                      .subject = "Welcome",
+                                      .body = "first",
+                                      .created_at = {2}})
+              .has_value());
+  REQUIRE(write->commit().has_value());
+
+  auto read = store.begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  const anvil::store::BoardReader bob{.handle = "bob",
+                                      .may_read_registered = true};
+  auto boards = store.list_boards(*read, bob);
+  REQUIRE(boards.has_value());
+  REQUIRE(boards->size() == 1);
+  CHECK(boards->front().unread_messages == 1);
+  auto threads = store.list_threads(*read, board_id, bob);
+  REQUIRE(threads.has_value());
+  REQUIRE(threads->size() == 1);
+  CHECK(threads->front().unread_messages == 1);
+  REQUIRE(read->commit().has_value());
+
+  auto mark = store.begin(TransactionMode::read_write);
+  REQUIRE(mark.has_value());
+  REQUIRE(
+      store.mark_thread_read(*mark, "bob", board_id, "thread-1").has_value());
+  REQUIRE(store
+              .create_reply(*mark, {.board_id = std::string(board_id),
+                                    .thread_id = "thread-1",
+                                    .message_id = "message-2",
+                                    .parent_message_id = "message-1",
+                                    .author_handle = "alice",
+                                    .body = "reply",
+                                    .created_at = {2}})
+              .has_value());
+  REQUIRE(mark->commit().has_value());
+
+  auto exact = store.begin(TransactionMode::read_only);
+  REQUIRE(exact.has_value());
+  threads = store.list_threads(*exact, board_id, bob);
+  REQUIRE(threads.has_value());
+  REQUIRE(threads->size() == 1);
+  CHECK(threads->front().unread_messages == 1);
+  auto messages =
+      store.list_messages_for_thread(*exact, board_id, "thread-1", bob);
+  REQUIRE(messages.has_value());
+  REQUIRE(messages->size() == 2);
+  CHECK(messages->back().parent_message_id == "message-1");
+}

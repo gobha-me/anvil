@@ -161,6 +161,90 @@ struct InviteDescendant {
       -> bool = default;
 };
 
+enum class BoardVisibility {
+  public_read,
+  registered_only,
+};
+
+// Board visibility is always evaluated by Store. A handle makes unread-state
+// reads available; it does not itself grant member access.
+struct BoardReader {
+  std::optional<std::string> handle;
+  bool may_read_registered{};
+
+  [[nodiscard]] auto operator==(const BoardReader &) const -> bool = default;
+};
+
+struct BoardRecord {
+  std::string board_id;
+  std::string name;
+  std::string title;
+  std::string description;
+  BoardVisibility visibility{BoardVisibility::public_read};
+  std::uint64_t unread_messages{};
+
+  [[nodiscard]] auto operator==(const BoardRecord &) const -> bool = default;
+};
+
+struct ThreadRecord {
+  std::string thread_id;
+  std::string board_id;
+  std::string author_handle;
+  std::string subject;
+  UtcEpochSeconds created_at;
+  UtcEpochSeconds updated_at;
+  bool locked{};
+  std::uint64_t message_count{};
+  std::uint64_t unread_messages{};
+
+  [[nodiscard]] auto operator==(const ThreadRecord &) const -> bool = default;
+};
+
+struct BoardProvision {
+  std::string board_id;
+  std::string name;
+  std::string title;
+  BoardVisibility visibility{BoardVisibility::public_read};
+  UtcEpochSeconds created_at;
+
+  [[nodiscard]] auto operator==(const BoardProvision &) const -> bool = default;
+};
+
+struct ThreadCreate {
+  std::string board_id;
+  std::string thread_id;
+  std::string message_id;
+  std::string author_handle;
+  std::string subject;
+  std::string body;
+  UtcEpochSeconds created_at;
+
+  [[nodiscard]] auto operator==(const ThreadCreate &) const -> bool = default;
+};
+
+struct ReplyCreate {
+  std::string board_id;
+  std::string thread_id;
+  std::string message_id;
+  std::optional<std::string> parent_message_id;
+  std::string author_handle;
+  std::string body;
+  UtcEpochSeconds created_at;
+
+  [[nodiscard]] auto operator==(const ReplyCreate &) const -> bool = default;
+};
+
+struct ReportSubmission {
+  std::string report_id;
+  std::optional<std::string> reporter_handle;
+  ContentRef target;
+  std::string reason;
+  UtcEpochSeconds created_at;
+
+  [[nodiscard]] auto operator==(const ReportSubmission &) const
+      -> bool = default;
+};
+
 struct MessageRecord {
   std::string message_id;
   std::string board_id;
@@ -171,6 +255,7 @@ struct MessageRecord {
   std::string body;
   UtcEpochSeconds posted_at;
   UtcEpochSeconds received_at;
+  std::int64_t local_sequence{};
   ContentStatus status{ContentStatus::active};
 
   [[nodiscard]] auto operator==(const MessageRecord &) const -> bool = default;
@@ -298,6 +383,42 @@ public:
                                          std::string_view root_handle)
       -> std::expected<std::vector<InviteDescendant>, Error>;
 
+  // Board declarations are idempotent for active local boards. A declaration
+  // updates title and visibility, but never resurrects a tombstone or adopts a
+  // federated board with the same name.
+  [[nodiscard]] auto reconcile_board(Transaction &transaction,
+                                     const BoardProvision &board)
+      -> std::expected<BoardRecord, Error>;
+  [[nodiscard]] auto list_boards(Transaction &transaction,
+                                 const BoardReader &reader)
+      -> std::expected<std::vector<BoardRecord>, Error>;
+  [[nodiscard]] auto list_threads(Transaction &transaction,
+                                  std::string_view board_id,
+                                  const BoardReader &reader)
+      -> std::expected<std::vector<ThreadRecord>, Error>;
+  [[nodiscard]] auto list_messages_for_thread(Transaction &transaction,
+                                              std::string_view board_id,
+                                              std::string_view thread_id,
+                                              const BoardReader &reader)
+      -> std::expected<std::vector<MessageRecord>, Error>;
+  [[nodiscard]] auto create_thread(Transaction &transaction,
+                                   const ThreadCreate &thread)
+      -> std::expected<MessageRecord, Error>;
+  [[nodiscard]] auto create_reply(Transaction &transaction,
+                                  const ReplyCreate &reply)
+      -> std::expected<MessageRecord, Error>;
+  [[nodiscard]] auto
+  mark_thread_read(Transaction &transaction, std::string_view user_handle,
+                   std::string_view board_id, std::string_view thread_id)
+      -> std::expected<void, Error>;
+  [[nodiscard]] auto catch_up_board(Transaction &transaction,
+                                    std::string_view user_handle,
+                                    std::string_view board_id)
+      -> std::expected<void, Error>;
+  [[nodiscard]] auto submit_report(Transaction &transaction,
+                                   const ReportSubmission &report)
+      -> std::expected<void, Error>;
+
 protected:
   // Store implementations use this factory so null backends fail as data,
   // rather than producing an apparently active transaction that later crashes.
@@ -357,6 +478,37 @@ protected:
   list_invite_subtree_impl(Transaction &transaction,
                            std::string_view root_handle)
       -> std::expected<std::vector<InviteDescendant>, Error> = 0;
+  [[nodiscard]] virtual auto reconcile_board_impl(Transaction &transaction,
+                                                  const BoardProvision &board)
+      -> std::expected<BoardRecord, Error> = 0;
+  [[nodiscard]] virtual auto list_boards_impl(Transaction &transaction,
+                                              const BoardReader &reader)
+      -> std::expected<std::vector<BoardRecord>, Error> = 0;
+  [[nodiscard]] virtual auto list_threads_impl(Transaction &transaction,
+                                               std::string_view board_id,
+                                               const BoardReader &reader)
+      -> std::expected<std::vector<ThreadRecord>, Error> = 0;
+  [[nodiscard]] virtual auto list_messages_for_thread_impl(
+      Transaction &transaction, std::string_view board_id,
+      std::string_view thread_id, const BoardReader &reader)
+      -> std::expected<std::vector<MessageRecord>, Error> = 0;
+  [[nodiscard]] virtual auto create_thread_impl(Transaction &transaction,
+                                                const ThreadCreate &thread)
+      -> std::expected<MessageRecord, Error> = 0;
+  [[nodiscard]] virtual auto create_reply_impl(Transaction &transaction,
+                                               const ReplyCreate &reply)
+      -> std::expected<MessageRecord, Error> = 0;
+  [[nodiscard]] virtual auto
+  mark_thread_read_impl(Transaction &transaction, std::string_view user_handle,
+                        std::string_view board_id, std::string_view thread_id)
+      -> std::expected<void, Error> = 0;
+  [[nodiscard]] virtual auto catch_up_board_impl(Transaction &transaction,
+                                                 std::string_view user_handle,
+                                                 std::string_view board_id)
+      -> std::expected<void, Error> = 0;
+  [[nodiscard]] virtual auto submit_report_impl(Transaction &transaction,
+                                                const ReportSubmission &report)
+      -> std::expected<void, Error> = 0;
 };
 
 } // namespace anvil::store

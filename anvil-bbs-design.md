@@ -948,6 +948,7 @@ Recorded so they are not relitigated in a later session.
 | Multi-instance pattern | Stateless instances, Postgres, `LISTEN`/`NOTIFY`. Not built in MVP. |
 | Federation | Not built. Data model keeps the option open (§9.4). If it ever happens: allowlist peering, board-level attestation, SSH transport, mutable state — never p2p append-only logs. |
 | Web UI | cpp-httplib if it ever happens. Well past MVP. |
+| Board visibility | Public by default. Operators may declare registered-only boards; guests cannot observe their existence or content. Startup declarations reconcile by stable local name. |
 | **Who writes plugins** | **Anyone. A mod community is the goal; first-party plugins are a small demonstration set, not a catalogue (§7.10).** |
 | Plugin loading | `dlopen` behind an RAII wrapper. No Boost.DLL. |
 | **Loader library** | **Extracted as a standalone, heavily tested project and built before Anvil consumes it (§7.2).** |
@@ -971,15 +972,14 @@ Recorded so they are not relitigated in a later session.
 ## 15b. Still open
 
 1. Does shadow-ban belong in the moderation set, or does it create more confusion than it prevents at small scale?
-2. Board-level read permissions — are all boards visible to guests, or can an operator mark some registered-only?
-3. Retention defaults for `sessions_log` and `moderation_log`. Long enough to investigate, short enough not to be a liability.
-4. Whether presence should show *what screen* a user is on, or only that they are online. The former is more alive, the latter is less surveillant.
-5. Are board services (`PluginKind::BoardService`) actually needed in MVP, or does only `Door` ship in M3? The SDK should define the kind either way; the question is whether any host-side wiring exists for it at first release.
-6. **Signed plugin releases** (§7.9) — `ssh-keygen -Y sign` with an allowed-signers file is cheap and fits the project's existing key model. Post-MVP or M3? It is the difference between an operator trusting a *download* and trusting an *author*, and retrofitting it means every existing manifest entry lacks a signature.
-7. Which plugins make up the first-party demonstration set (§7.10)? The constraint is coverage of the interface — one tier-1 door, one tier-3 door, one verifier, possibly one board service — not entertainment value.
-8. Does the second-party repository build with a *different* compiler than the server's in CI, or the same one? Different is a much stronger test of §7.3 and costs one more CI job.
-9. Should a plugin be able to declare a dependency on another plugin? Almost certainly not in v1 — load-ordering and version-resolution are how plugin systems become package managers — but mod ecosystems generate the request early and it is worth having the answer ready.
-10. Is there a story for a plugin that wants to add a *board*, as opposed to a door? It is the most obvious `BoardService` and it collides with §9.2's no-plugin-tables rule.
+2. Retention defaults for `sessions_log` and `moderation_log`. Long enough to investigate, short enough not to be a liability.
+3. Whether presence should show *what screen* a user is on, or only that they are online. The former is more alive, the latter is less surveillant.
+4. Are board services (`PluginKind::BoardService`) actually needed in MVP, or does only `Door` ship in M3? The SDK should define the kind either way; the question is whether any host-side wiring exists for it at first release.
+5. **Signed plugin releases** (§7.9) — `ssh-keygen -Y sign` with an allowed-signers file is cheap and fits the project's existing key model. Post-MVP or M3? It is the difference between an operator trusting a *download* and trusting an *author*, and retrofitting it means every existing manifest entry lacks a signature.
+6. Which plugins make up the first-party demonstration set (§7.10)? The constraint is coverage of the interface — one tier-1 door, one tier-3 door, one verifier, possibly one board service — not entertainment value.
+7. Does the second-party repository build with a *different* compiler than the server's in CI, or the same one? Different is a much stronger test of §7.3 and costs one more CI job.
+8. Should a plugin be able to declare a dependency on another plugin? Almost certainly not in v1 — load-ordering and version-resolution are how plugin systems become package managers — but mod ecosystems generate the request early and it is worth having the answer ready.
+9. Is there a story for a plugin that wants to add a *board*, as opposed to a door? It is the most obvious `BoardService` and it collides with §9.2's no-plugin-tables rule.
 
 ---
 

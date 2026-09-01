@@ -102,6 +102,38 @@ private:
   [[nodiscard]] auto list_invite_subtree_impl(Transaction &transaction,
                                               std::string_view root_handle)
       -> std::expected<std::vector<InviteDescendant>, Error> final;
+  [[nodiscard]] auto reconcile_board_impl(Transaction &transaction,
+                                          const BoardProvision &board)
+      -> std::expected<BoardRecord, Error> final;
+  [[nodiscard]] auto list_boards_impl(Transaction &transaction,
+                                      const BoardReader &reader)
+      -> std::expected<std::vector<BoardRecord>, Error> final;
+  [[nodiscard]] auto list_threads_impl(Transaction &transaction,
+                                       std::string_view board_id,
+                                       const BoardReader &reader)
+      -> std::expected<std::vector<ThreadRecord>, Error> final;
+  [[nodiscard]] auto list_messages_for_thread_impl(Transaction &transaction,
+                                                   std::string_view board_id,
+                                                   std::string_view thread_id,
+                                                   const BoardReader &reader)
+      -> std::expected<std::vector<MessageRecord>, Error> final;
+  [[nodiscard]] auto create_thread_impl(Transaction &transaction,
+                                        const ThreadCreate &thread)
+      -> std::expected<MessageRecord, Error> final;
+  [[nodiscard]] auto create_reply_impl(Transaction &transaction,
+                                       const ReplyCreate &reply)
+      -> std::expected<MessageRecord, Error> final;
+  [[nodiscard]] auto
+  mark_thread_read_impl(Transaction &transaction, std::string_view user_handle,
+                        std::string_view board_id, std::string_view thread_id)
+      -> std::expected<void, Error> final;
+  [[nodiscard]] auto catch_up_board_impl(Transaction &transaction,
+                                         std::string_view user_handle,
+                                         std::string_view board_id)
+      -> std::expected<void, Error> final;
+  [[nodiscard]] auto submit_report_impl(Transaction &transaction,
+                                        const ReportSubmission &report)
+      -> std::expected<void, Error> final;
 
   std::filesystem::path path_;
   SqliteOptions options_;

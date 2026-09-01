@@ -103,16 +103,22 @@ AdmissionController::AdmissionController(std::uint32_t max_sessions,
                                          std::uint32_t max_sessions_per_ip,
                                          RateLimit connection_rate,
                                          RateLimit auth_attempt_rate,
-                                         std::uint32_t max_tracked_ips)
+                                         std::uint32_t max_tracked_ips,
+                                         RateLimit guest_report_rate)
     : max_sessions_(max_sessions), max_sessions_per_ip_(max_sessions_per_ip),
       connection_rate_(connection_rate), auth_attempt_rate_(auth_attempt_rate),
-      max_tracked_ips_(max_tracked_ips),
-      idle_retention_(std::max(connection_rate.period, auth_attempt_rate.period)) {
+      guest_report_rate_(guest_report_rate), max_tracked_ips_(max_tracked_ips),
+      idle_retention_(
+          std::max(connection_rate.period, auth_attempt_rate.period)),
+      guest_report_retention_(guest_report_rate.period) {
   if (max_sessions_ == 0U || max_sessions_per_ip_ == 0U ||
-      max_sessions_per_ip_ > max_sessions_ || max_tracked_ips_ < max_sessions_ ||
-      connection_rate_.count == 0U || connection_rate_.period <= std::chrono::seconds::zero() ||
+      max_sessions_per_ip_ > max_sessions_ ||
+      max_tracked_ips_ < max_sessions_ || connection_rate_.count == 0U ||
+      connection_rate_.period <= std::chrono::seconds::zero() ||
       auth_attempt_rate_.count == 0U ||
-      auth_attempt_rate_.period <= std::chrono::seconds::zero()) {
+      auth_attempt_rate_.period <= std::chrono::seconds::zero() ||
+      guest_report_rate_.count == 0U ||
+      guest_report_rate_.period <= std::chrono::seconds::zero()) {
     throw std::invalid_argument("invalid SSH admission limit configuration");
   }
   peers_.reserve(max_tracked_ips_);
@@ -130,7 +136,10 @@ AdmissionDecision AdmissionController::admit(const PeerAddress &peer, Clock::tim
     if (peers_.size() >= max_tracked_ips_) {
       return AdmissionDecision::tracking_capacity;
     }
-    found = peers_.emplace(peer, PeerState(connection_rate_, auth_attempt_rate_, now)).first;
+    found = peers_
+                .emplace(peer, PeerState(connection_rate_, auth_attempt_rate_,
+                                         guest_report_rate_, now))
+                .first;
   }
 
   auto &state = found->second;
@@ -184,10 +193,25 @@ void AdmissionController::exhaust_auth_attempts(const PeerAddress &peer,
   found->second.last_seen = now;
 }
 
+bool AdmissionController::consume_guest_report(const PeerAddress &peer,
+                                               Clock::time_point now) noexcept {
+  const auto found = peers_.find(peer);
+  if (found == peers_.end()) {
+    return false;
+  }
+  found->second.last_seen = now;
+  found->second.guest_report_used = true;
+  return found->second.guest_reports.consume(now);
+}
+
 void AdmissionController::prune(Clock::time_point now) {
   for (auto entry = peers_.begin(); entry != peers_.end();) {
+    const auto retention =
+        entry->second.guest_report_used
+            ? std::max(idle_retention_, guest_report_retention_)
+            : idle_retention_;
     const auto idle = entry->second.active_sessions == 0U &&
-                      now - entry->second.last_seen >= idle_retention_;
+                      now - entry->second.last_seen >= retention;
     if (idle) {
       entry = peers_.erase(entry);
     } else {

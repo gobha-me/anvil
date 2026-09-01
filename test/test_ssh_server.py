@@ -379,6 +379,22 @@ def main() -> int:
             assert_shell(spoofed, b"same-key\n")
             assert b"Signed in as tester" in spoofed.stdout, spoofed.stdout
 
+            created = shell_session(
+                base, b"\nnRelease planning\nFirst board post\n\n\x1b\x1b"
+            )
+            assert created.returncode == 0, created
+            assert b"Release planning" in created.stdout, created.stdout
+            assert b"First board post" in created.stdout, created.stdout
+
+            replied = shell_session(base, b"\n\nqStructured reply\n\x1b\x1b")
+            assert replied.returncode == 0, replied
+            assert b"Reply to @tester" in replied.stdout, replied.stdout
+            assert b"Structured reply" in replied.stdout, replied.stdout
+
+            reported = shell_session(base, b"\n\n!Needs review\n\x1b\x1b")
+            assert reported.returncode == 0, reported
+            assert b"Report submitted" in reported.stdout, reported.stdout
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 alpha_future = executor.submit(shell_session, base, b"alpha-only\n")
                 beta_future = executor.submit(shell_session, base, b"beta-only\n")
@@ -402,6 +418,49 @@ def main() -> int:
             assert guest.returncode == 0, guest
             assert b"Guest access: boards and doors are read-only" in guest.stdout, guest.stdout
             assert b"cannot-post" not in guest.stdout, guest.stdout
+
+            guest_report = shell_session(
+                guest_command(port),
+                b"\n\n!Guest concern\n\x1b\x1b",
+            )
+            assert guest_report.returncode == 0, guest_report
+            assert b"First board post" in guest_report.stdout, guest_report.stdout
+            assert b"Report submitted" in guest_report.stdout, guest_report.stdout
+            for number in range(2, 6):
+                additional = shell_session(
+                    guest_command(port),
+                    f"\n\n!Guest {number}\n\x1b\x1b".encode(),
+                )
+                assert b"Report submitted" in additional.stdout, additional.stdout
+            limited = shell_session(
+                guest_command(port), b"\n\n!Guest 6\n\x1b\x1b"
+            )
+            assert b"Anonymous report limit reached" in limited.stdout, limited.stdout
+
+            with sqlite3.connect(database) as connection:
+                assert connection.execute(
+                    "SELECT count(*) FROM threads WHERE subject='Release planning'"
+                ).fetchone() == (1,)
+                assert connection.execute(
+                    "SELECT count(*) FROM messages WHERE body='Structured reply' "
+                    "AND parent_message_id IS NOT NULL"
+                ).fetchone() == (1,)
+                assert connection.execute(
+                    "SELECT reporter_kind,reporter_handle,evidence FROM reports "
+                    "WHERE reporter_kind='registered'"
+                ).fetchall() == [("registered", "tester", "Needs review")]
+                assert connection.execute(
+                    "SELECT count(*),count(reporter_handle) FROM reports "
+                    "WHERE reporter_kind='guest'"
+                ).fetchone() == (5, 0)
+                assert connection.execute(
+                    "SELECT count(*) FROM reports WHERE evidence='Guest 6'"
+                ).fetchone() == (0,)
+                assert "address" not in {
+                    column[1] for column in connection.execute(
+                        "PRAGMA table_info('reports')"
+                    )
+                }
 
             non_guest_none = shell_session(guest_command(port, "visitor"), b"")
             assert non_guest_none.returncode != 0, non_guest_none

@@ -279,6 +279,94 @@ namespace {
   return {};
 }
 
+[[nodiscard]] auto valid_board_name(std::string_view name) -> bool {
+  if (name.empty() || name.size() > 64U ||
+      !((name.front() >= 'a' && name.front() <= 'z') ||
+        (name.front() >= '0' && name.front() <= '9'))) {
+    return false;
+  }
+  for (const auto value : name) {
+    if (!((value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') ||
+          value == '_' || value == '-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] auto valid_text(std::string_view value, std::size_t maximum,
+                              bool allow_empty = false) -> bool {
+  return (allow_empty || !value.empty()) && value.size() <= maximum &&
+         value.find('\0') == std::string_view::npos;
+}
+
+[[nodiscard]] auto validate_reader(const BoardReader &reader)
+    -> std::expected<void, Error> {
+  if (reader.handle && !valid_handle(*reader.handle)) {
+    return std::unexpected(
+        invalid_identifier("board reader handle is invalid"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto validate_board_provision(const BoardProvision &board)
+    -> std::expected<void, Error> {
+  if (!valid_board_identifier(board.board_id)) {
+    return std::unexpected(
+        invalid_identifier("board identifier is not a canonical UUID"));
+  }
+  if (!valid_board_name(board.name)) {
+    return std::unexpected(invalid_identifier(
+        "board name must be a 1 to 64 byte lowercase ASCII slug"));
+  }
+  if (!valid_text(board.title, 3'840U)) {
+    return std::unexpected(
+        invalid_identifier("board title is empty or exceeds its byte limit"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto validate_thread_create(const ThreadCreate &thread)
+    -> std::expected<void, Error> {
+  if (!valid_board_identifier(thread.board_id) ||
+      !valid_opaque_identifier(thread.thread_id, 128U) ||
+      !valid_opaque_identifier(thread.message_id, 128U) ||
+      !valid_handle(thread.author_handle) ||
+      !valid_text(thread.subject, 3'840U) ||
+      !valid_text(thread.body, 524'288U)) {
+    return std::unexpected(
+        invalid_identifier("thread creation contains invalid bounded data"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto validate_reply_create(const ReplyCreate &reply)
+    -> std::expected<void, Error> {
+  if (!valid_board_identifier(reply.board_id) ||
+      !valid_opaque_identifier(reply.thread_id, 128U) ||
+      !valid_opaque_identifier(reply.message_id, 128U) ||
+      (reply.parent_message_id &&
+       !valid_opaque_identifier(*reply.parent_message_id, 128U)) ||
+      !valid_handle(reply.author_handle) || !valid_text(reply.body, 524'288U)) {
+    return std::unexpected(
+        invalid_identifier("reply creation contains invalid bounded data"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto validate_report(const ReportSubmission &report)
+    -> std::expected<void, Error> {
+  if (!valid_opaque_identifier(report.report_id, 128U) ||
+      (report.reporter_handle && !valid_handle(*report.reporter_handle)) ||
+      (report.target.kind != ContentKind::thread &&
+       report.target.kind != ContentKind::message) ||
+      !valid_text(report.reason, 32'768U)) {
+    return std::unexpected(
+        invalid_identifier("report contains invalid bounded data"));
+  }
+  return validate_content_ref(report.target);
+}
+
 } // namespace
 
 Transaction::Transaction(const Store *owner, TransactionMode mode,
@@ -542,6 +630,157 @@ auto Store::list_invite_subtree(Transaction &transaction,
         "invite subtree root violates the M1 handle grammar or is reserved"));
   }
   return list_invite_subtree_impl(transaction, root_handle);
+}
+
+auto Store::reconcile_board(Transaction &transaction,
+                            const BoardProvision &board)
+    -> std::expected<BoardRecord, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "board reconciliation requires a write transaction"});
+  }
+  if (auto valid = validate_board_provision(board); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return reconcile_board_impl(transaction, board);
+}
+
+auto Store::list_boards(Transaction &transaction, const BoardReader &reader)
+    -> std::expected<std::vector<BoardRecord>, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (auto valid = validate_reader(reader); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return list_boards_impl(transaction, reader);
+}
+
+auto Store::list_threads(Transaction &transaction, std::string_view board_id,
+                         const BoardReader &reader)
+    -> std::expected<std::vector<ThreadRecord>, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (!valid_board_identifier(board_id)) {
+    return std::unexpected(invalid_identifier("board identifier is invalid"));
+  }
+  if (auto valid = validate_reader(reader); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return list_threads_impl(transaction, board_id, reader);
+}
+
+auto Store::list_messages_for_thread(Transaction &transaction,
+                                     std::string_view board_id,
+                                     std::string_view thread_id,
+                                     const BoardReader &reader)
+    -> std::expected<std::vector<MessageRecord>, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (!valid_board_identifier(board_id) ||
+      !valid_opaque_identifier(thread_id, 128U)) {
+    return std::unexpected(
+        invalid_identifier("board or thread identifier is invalid"));
+  }
+  if (auto valid = validate_reader(reader); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return list_messages_for_thread_impl(transaction, board_id, thread_id,
+                                       reader);
+}
+
+auto Store::create_thread(Transaction &transaction, const ThreadCreate &thread)
+    -> std::expected<MessageRecord, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "thread creation requires a write transaction"});
+  }
+  if (auto valid = validate_thread_create(thread); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return create_thread_impl(transaction, thread);
+}
+
+auto Store::create_reply(Transaction &transaction, const ReplyCreate &reply)
+    -> std::expected<MessageRecord, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "reply creation requires a write transaction"});
+  }
+  if (auto valid = validate_reply_create(reply); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return create_reply_impl(transaction, reply);
+}
+
+auto Store::mark_thread_read(Transaction &transaction,
+                             std::string_view user_handle,
+                             std::string_view board_id,
+                             std::string_view thread_id)
+    -> std::expected<void, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(Error{ErrorCode::invalid_state,
+                                 "read markers require a write transaction"});
+  }
+  if (!valid_handle(user_handle) || !valid_board_identifier(board_id) ||
+      !valid_opaque_identifier(thread_id, 128U)) {
+    return std::unexpected(
+        invalid_identifier("read marker identity is invalid"));
+  }
+  return mark_thread_read_impl(transaction, user_handle, board_id, thread_id);
+}
+
+auto Store::catch_up_board(Transaction &transaction,
+                           std::string_view user_handle,
+                           std::string_view board_id)
+    -> std::expected<void, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "board catch-up requires a write transaction"});
+  }
+  if (!valid_handle(user_handle) || !valid_board_identifier(board_id)) {
+    return std::unexpected(
+        invalid_identifier("board catch-up identity is invalid"));
+  }
+  return catch_up_board_impl(transaction, user_handle, board_id);
+}
+
+auto Store::submit_report(Transaction &transaction,
+                          const ReportSubmission &report)
+    -> std::expected<void, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "report submission requires a write transaction"});
+  }
+  if (auto valid = validate_report(report); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return submit_report_impl(transaction, report);
 }
 
 } // namespace anvil::store
