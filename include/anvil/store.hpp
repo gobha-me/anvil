@@ -261,6 +261,36 @@ struct MessageRecord {
   [[nodiscard]] auto operator==(const MessageRecord &) const -> bool = default;
 };
 
+struct OnelinerRecord {
+  std::string oneliner_id;
+  std::string author_handle;
+  std::optional<std::string> author_origin;
+  std::string body;
+  UtcEpochSeconds posted_at;
+  UtcEpochSeconds received_at;
+  ContentStatus status{ContentStatus::active};
+
+  [[nodiscard]] auto operator==(const OnelinerRecord &) const -> bool = default;
+};
+
+struct OnelinerCreate {
+  std::string oneliner_id;
+  std::string author_handle;
+  std::string body;
+  UtcEpochSeconds posted_at;
+  UtcEpochSeconds received_at;
+
+  [[nodiscard]] auto operator==(const OnelinerCreate &) const -> bool = default;
+};
+
+struct OnelinerPolicy {
+  std::uint32_t max_posts{};
+  std::uint32_t window_seconds{};
+  std::uint32_t retention_seconds{};
+
+  [[nodiscard]] auto operator==(const OnelinerPolicy &) const -> bool = default;
+};
+
 class Store;
 class TransactionBackend;
 
@@ -419,6 +449,23 @@ public:
                                    const ReportSubmission &report)
       -> std::expected<void, Error>;
 
+  // One-liner admission and its rolling per-user limit are one write
+  // transaction, so reconnects and concurrent workers cannot bypass it.
+  // Reads are newest-first and bounded; received_at is the authoritative local
+  // clock for both limiting and retention.
+  [[nodiscard]] auto create_oneliner(Transaction &transaction,
+                                     const OnelinerCreate &oneliner,
+                                     const OnelinerPolicy &policy)
+      -> std::expected<OnelinerRecord, Error>;
+  [[nodiscard]] auto
+  list_oneliners(Transaction &transaction, UtcEpochSeconds now,
+                 const OnelinerPolicy &policy, std::uint32_t limit)
+      -> std::expected<std::vector<OnelinerRecord>, Error>;
+  [[nodiscard]] auto purge_expired_oneliners(Transaction &transaction,
+                                             UtcEpochSeconds now,
+                                             const OnelinerPolicy &policy)
+      -> std::expected<std::uint64_t, Error>;
+
 protected:
   // Store implementations use this factory so null backends fail as data,
   // rather than producing an apparently active transaction that later crashes.
@@ -509,6 +556,18 @@ protected:
   [[nodiscard]] virtual auto submit_report_impl(Transaction &transaction,
                                                 const ReportSubmission &report)
       -> std::expected<void, Error> = 0;
+  [[nodiscard]] virtual auto
+  create_oneliner_impl(Transaction &transaction, const OnelinerCreate &oneliner,
+                       const OnelinerPolicy &policy)
+      -> std::expected<OnelinerRecord, Error> = 0;
+  [[nodiscard]] virtual auto
+  list_oneliners_impl(Transaction &transaction, UtcEpochSeconds now,
+                      const OnelinerPolicy &policy, std::uint32_t limit)
+      -> std::expected<std::vector<OnelinerRecord>, Error> = 0;
+  [[nodiscard]] virtual auto
+  purge_expired_oneliners_impl(Transaction &transaction, UtcEpochSeconds now,
+                               const OnelinerPolicy &policy)
+      -> std::expected<std::uint64_t, Error> = 0;
 };
 
 } // namespace anvil::store

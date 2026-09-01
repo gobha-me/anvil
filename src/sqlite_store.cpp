@@ -9,6 +9,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,6 +30,7 @@ constexpr std::array production_migrations{
     detail::SqliteMigration{2, detail::domain_schema_v2},
     detail::SqliteMigration{3, detail::invite_economics_v3},
     detail::SqliteMigration{4, detail::message_boards_v4},
+    detail::SqliteMigration{5, detail::oneliner_indexes_v5},
 };
 
 struct DatabaseDeleter {
@@ -98,6 +100,16 @@ using Backup = std::unique_ptr<sqlite3_backup, BackupDeleter>;
 
 [[nodiscard]] auto invalid_data(std::string detail) -> Error {
   return {ErrorCode::invalid_data, std::move(detail)};
+}
+
+[[nodiscard]] constexpr auto saturating_subtract(UtcEpochSeconds value,
+                                                 std::uint32_t seconds) noexcept
+    -> std::int64_t {
+  const auto amount = static_cast<std::int64_t>(seconds);
+  if (value.value < std::numeric_limits<std::int64_t>::min() + amount) {
+    return std::numeric_limits<std::int64_t>::min();
+  }
+  return value.value - amount;
 }
 
 [[nodiscard]] auto validate_options(const SqliteOptions &options)
@@ -2407,26 +2419,33 @@ auto SqliteStore::submit_report_impl(Transaction &transaction,
         Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
   }
   const auto &target_id = std::get<std::string>(report.target.id);
-  const auto target_kind = report.target.kind == ContentKind::thread
-                               ? std::string_view{"thread"}
-                               : std::string_view{"message"};
-  const auto target_sql =
-      report.target.kind == ContentKind::thread
-          ? std::string_view{"SELECT 1 FROM threads t JOIN boards b ON "
-                             "b.board_id=t.board_id WHERE t.thread_id=?1 "
-                             "AND t.status='active' AND b.status='active' "
-                             "AND (b.guest_readable=1 OR EXISTS(SELECT 1 "
-                             "FROM users u WHERE u.handle=?2 AND "
-                             "u.origin_key='' AND u.status='active'))"}
-          : std::string_view{
-                "SELECT 1 FROM messages m JOIN threads t ON "
-                "t.thread_id=m.thread_id AND t.board_id=m.board_id "
-                "JOIN boards b ON b.board_id=m.board_id WHERE "
-                "m.message_id=?1 AND m.status='active' AND "
-                "t.status='active' AND b.status='active' AND "
-                "(b.guest_readable=1 OR EXISTS(SELECT 1 FROM users u "
-                "WHERE u.handle=?2 AND u.origin_key='' AND "
-                "u.status='active'))"};
+  std::string_view target_kind;
+  std::string_view target_sql;
+  if (report.target.kind == ContentKind::thread) {
+    target_kind = "thread";
+    target_sql = "SELECT 1 FROM threads t JOIN boards b ON "
+                 "b.board_id=t.board_id WHERE t.thread_id=?1 "
+                 "AND t.status='active' AND b.status='active' "
+                 "AND (b.guest_readable=1 OR EXISTS(SELECT 1 "
+                 "FROM users u WHERE u.handle=?2 AND "
+                 "u.origin_key='' AND u.status='active'))";
+  } else if (report.target.kind == ContentKind::message) {
+    target_kind = "message";
+    target_sql = "SELECT 1 FROM messages m JOIN threads t ON "
+                 "t.thread_id=m.thread_id AND t.board_id=m.board_id "
+                 "JOIN boards b ON b.board_id=m.board_id WHERE "
+                 "m.message_id=?1 AND m.status='active' AND "
+                 "t.status='active' AND b.status='active' AND "
+                 "(b.guest_readable=1 OR EXISTS(SELECT 1 FROM users u "
+                 "WHERE u.handle=?2 AND u.origin_key='' AND "
+                 "u.status='active'))";
+  } else {
+    target_kind = "oneliner";
+    target_sql = "SELECT 1 FROM oneliners o WHERE o.oneliner_id=?1 AND "
+                 "o.status='active' AND (?2 IS NULL OR EXISTS(SELECT 1 "
+                 "FROM users u WHERE u.handle=?2 AND u.origin_key='' AND "
+                 "u.status='active'))";
+  }
   auto target = prepare(backend->database(), target_sql,
                         "cannot prepare report target lookup");
   if (!target) {
@@ -2505,6 +2524,214 @@ auto SqliteStore::submit_report_impl(Transaction &transaction,
     return std::unexpected(std::move(error));
   }
   return {};
+}
+
+auto SqliteStore::create_oneliner_impl(Transaction &transaction,
+                                       const OnelinerCreate &oneliner,
+                                       const OnelinerPolicy &policy)
+    -> std::expected<OnelinerRecord, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+
+  constexpr std::string_view count_sql =
+      "SELECT count(*) FROM oneliners WHERE author_handle=?1 AND "
+      "author_origin_key='' AND received_at>?2";
+  auto count = prepare(backend->database(), count_sql,
+                       "cannot prepare one-liner rate lookup");
+  if (!count) {
+    return std::unexpected(count.error());
+  }
+  if (auto bound =
+          bind_text(backend->database(), count->get(), 1,
+                    oneliner.author_handle, "cannot bind one-liner author");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_integer(
+          backend->database(), count->get(), 2,
+          saturating_subtract(oneliner.received_at, policy.window_seconds),
+          "cannot bind one-liner rate window");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto counted = sqlite3_step(count->get());
+  if (counted != SQLITE_ROW) {
+    return std::unexpected(sqlite_error(backend->database(), counted,
+                                        "cannot count recent one-liners"));
+  }
+  auto recent = column_integer(count->get(), 0, "recent one-liner count");
+  if (!recent || *recent < 0) {
+    return std::unexpected(recent ? invalid_data("one-liner count is invalid")
+                                  : recent.error());
+  }
+  if (static_cast<std::uint64_t>(*recent) >= policy.max_posts) {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "one-liner rate limit reached"});
+  }
+
+  constexpr std::string_view insert_sql = R"sql(
+INSERT INTO oneliners(oneliner_id,author_handle,body,posted_at,received_at)
+SELECT ?1,?2,?3,?4,?5 FROM users
+WHERE handle=?2 AND origin_key='' AND status='active'
+)sql";
+  auto insert = prepare(backend->database(), insert_sql,
+                        "cannot prepare one-liner insert");
+  if (!insert) {
+    return std::unexpected(insert.error());
+  }
+  const std::array text_values{std::string_view{oneliner.oneliner_id},
+                               std::string_view{oneliner.author_handle},
+                               std::string_view{oneliner.body}};
+  for (std::size_t index = 0; index < text_values.size(); ++index) {
+    if (auto bound = bind_text(backend->database(), insert->get(),
+                               static_cast<int>(index + 1U), text_values[index],
+                               "cannot bind one-liner content");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (auto bound = bind_integer(backend->database(), insert->get(), 4,
+                                oneliner.posted_at.value,
+                                "cannot bind one-liner posted time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), insert->get(), 5,
+                                oneliner.received_at.value,
+                                "cannot bind one-liner received time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(insert->get());
+  if (inserted != SQLITE_DONE) {
+    auto error =
+        sqlite_error(backend->database(), inserted, "cannot create one-liner");
+    if (error.code == ErrorCode::constraint_violation) {
+      error.code = ErrorCode::conflict;
+    }
+    return std::unexpected(std::move(error));
+  }
+  if (sqlite3_changes64(backend->database()) != 1) {
+    return std::unexpected(Error{
+        ErrorCode::not_found, "one-liner author is not an active local user"});
+  }
+  return OnelinerRecord{.oneliner_id = oneliner.oneliner_id,
+                        .author_handle = oneliner.author_handle,
+                        .author_origin = std::nullopt,
+                        .body = oneliner.body,
+                        .posted_at = oneliner.posted_at,
+                        .received_at = oneliner.received_at,
+                        .status = ContentStatus::active};
+}
+
+auto SqliteStore::list_oneliners_impl(Transaction &transaction,
+                                      UtcEpochSeconds now,
+                                      const OnelinerPolicy &policy,
+                                      std::uint32_t limit)
+    -> std::expected<std::vector<OnelinerRecord>, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql = R"sql(
+SELECT oneliner_id,author_handle,author_origin,body,posted_at,received_at,status
+FROM oneliners
+WHERE status='active' AND received_at>?1
+ORDER BY received_at DESC,oneliner_id DESC
+LIMIT ?2
+)sql";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare one-liner list");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound =
+          bind_integer(backend->database(), statement->get(), 1,
+                       saturating_subtract(now, policy.retention_seconds),
+                       "cannot bind one-liner retention cutoff");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), statement->get(), 2,
+                                static_cast<std::int64_t>(limit),
+                                "cannot bind one-liner list limit");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+
+  std::vector<OnelinerRecord> result;
+  result.reserve(limit);
+  for (;;) {
+    const auto row = sqlite3_step(statement->get());
+    if (row == SQLITE_DONE) {
+      return result;
+    }
+    if (row != SQLITE_ROW) {
+      return std::unexpected(
+          sqlite_error(backend->database(), row, "cannot read one-liner list"));
+    }
+    auto id = column_text(statement->get(), 0, "one-liner ID");
+    auto author = column_text(statement->get(), 1, "one-liner author");
+    auto origin =
+        column_optional_text(statement->get(), 2, "one-liner author origin");
+    auto body = column_text(statement->get(), 3, "one-liner body");
+    auto posted = column_integer(statement->get(), 4, "one-liner posted_at");
+    auto received =
+        column_integer(statement->get(), 5, "one-liner received_at");
+    auto status = column_text(statement->get(), 6, "one-liner status");
+    if (!id || !author || !origin || !body || !posted || !received || !status ||
+        *status != "active") {
+      return std::unexpected(invalid_data("one-liner row is invalid"));
+    }
+    result.push_back({.oneliner_id = std::move(*id),
+                      .author_handle = std::move(*author),
+                      .author_origin = std::move(*origin),
+                      .body = std::move(*body),
+                      .posted_at = {*posted},
+                      .received_at = {*received},
+                      .status = ContentStatus::active});
+  }
+}
+
+auto SqliteStore::purge_expired_oneliners_impl(Transaction &transaction,
+                                               UtcEpochSeconds now,
+                                               const OnelinerPolicy &policy)
+    -> std::expected<std::uint64_t, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  auto statement = prepare(backend->database(),
+                           "DELETE FROM oneliners WHERE received_at<=?1",
+                           "cannot prepare one-liner purge");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound =
+          bind_integer(backend->database(), statement->get(), 1,
+                       saturating_subtract(now, policy.retention_seconds),
+                       "cannot bind one-liner purge cutoff");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto deleted = sqlite3_step(statement->get());
+  if (deleted != SQLITE_DONE) {
+    return std::unexpected(sqlite_error(backend->database(), deleted,
+                                        "cannot purge expired one-liners"));
+  }
+  const auto changes = sqlite3_changes64(backend->database());
+  if (changes < 0) {
+    return std::unexpected(invalid_data("one-liner purge count is invalid"));
+  }
+  return static_cast<std::uint64_t>(changes);
 }
 
 auto SqliteStore::execute_for_testing(Transaction &transaction,

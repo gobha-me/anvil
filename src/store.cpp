@@ -359,12 +359,35 @@ namespace {
   if (!valid_opaque_identifier(report.report_id, 128U) ||
       (report.reporter_handle && !valid_handle(*report.reporter_handle)) ||
       (report.target.kind != ContentKind::thread &&
-       report.target.kind != ContentKind::message) ||
+       report.target.kind != ContentKind::message &&
+       report.target.kind != ContentKind::oneliner) ||
       !valid_text(report.reason, 32'768U)) {
     return std::unexpected(
         invalid_identifier("report contains invalid bounded data"));
   }
   return validate_content_ref(report.target);
+}
+
+[[nodiscard]] auto validate_oneliner_policy(const OnelinerPolicy &policy)
+    -> std::expected<void, Error> {
+  if (policy.max_posts == 0U || policy.window_seconds == 0U ||
+      policy.retention_seconds == 0U) {
+    return std::unexpected(Error{ErrorCode::invalid_data,
+                                 "one-liner policy values must be positive"});
+  }
+  return {};
+}
+
+[[nodiscard]] auto validate_oneliner_create(const OnelinerCreate &oneliner)
+    -> std::expected<void, Error> {
+  if (!valid_opaque_identifier(oneliner.oneliner_id, 128U) ||
+      !valid_handle(oneliner.author_handle) || oneliner.body.empty() ||
+      !valid_text(oneliner.body, 8'960U) ||
+      oneliner.body.find_first_of("\r\n") != std::string::npos) {
+    return std::unexpected(
+        invalid_identifier("one-liner contains invalid bounded data"));
+  }
+  return {};
 }
 
 } // namespace
@@ -781,6 +804,61 @@ auto Store::submit_report(Transaction &transaction,
     return std::unexpected(valid.error());
   }
   return submit_report_impl(transaction, report);
+}
+
+auto Store::create_oneliner(Transaction &transaction,
+                            const OnelinerCreate &oneliner,
+                            const OnelinerPolicy &policy)
+    -> std::expected<OnelinerRecord, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(Error{ErrorCode::invalid_state,
+                                 "one-liner creation requires a write "
+                                 "transaction"});
+  }
+  if (auto valid = validate_oneliner_create(oneliner); !valid) {
+    return std::unexpected(valid.error());
+  }
+  if (auto valid = validate_oneliner_policy(policy); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return create_oneliner_impl(transaction, oneliner, policy);
+}
+
+auto Store::list_oneliners(Transaction &transaction, UtcEpochSeconds now,
+                           const OnelinerPolicy &policy, std::uint32_t limit)
+    -> std::expected<std::vector<OnelinerRecord>, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (auto valid = validate_oneliner_policy(policy); !valid) {
+    return std::unexpected(valid.error());
+  }
+  if (limit == 0U || limit > 100U) {
+    return std::unexpected(Error{ErrorCode::invalid_data,
+                                 "one-liner list limit must be 1 through 100"});
+  }
+  return list_oneliners_impl(transaction, now, policy, limit);
+}
+
+auto Store::purge_expired_oneliners(Transaction &transaction,
+                                    UtcEpochSeconds now,
+                                    const OnelinerPolicy &policy)
+    -> std::expected<std::uint64_t, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "one-liner purge requires a write transaction"});
+  }
+  if (auto valid = validate_oneliner_policy(policy); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return purge_expired_oneliners_impl(transaction, now, policy);
 }
 
 } // namespace anvil::store

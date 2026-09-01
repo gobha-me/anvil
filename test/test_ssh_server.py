@@ -64,6 +64,7 @@ def server_command(executable: pathlib.Path, port: int, host_key: pathlib.Path,
         "--session-cpu-burst-ms", "500",
         "--connection-rate-limit", "1000/1",
         "--auth-attempt-rate-limit", "1000/1",
+        "--oneliner-rate-limit", "100/300",
         "--database", str(database or client_key.with_name(f"anvil-{port}.db")),
         "--registration-mode", registration_mode,
         "--tos-version", tos_version,
@@ -172,6 +173,25 @@ def guest_command(port: int, user: str = "guest") -> list[str]:
 def shell_session(base: list[str], payload: bytes) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(base + ["-tt"], input=payload, capture_output=True,
                           timeout=15, check=False)
+
+
+def read_until(process: subprocess.Popen[bytes], needle: bytes,
+               timeout: float = 10) -> bytes:
+    assert process.stdout is not None
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([process.stdout], [], [], 0.1)
+        if readable:
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            output.extend(chunk)
+            if needle in output:
+                return bytes(output)
+        if process.poll() is not None:
+            break
+    raise AssertionError(f"did not observe {needle!r}; output={bytes(output)!r}")
 
 
 def assert_shell(result: subprocess.CompletedProcess[bytes], own: bytes,
@@ -353,6 +373,30 @@ def main() -> int:
             assert_shell(first, b"first-session\n")
             assert b"Signed in as tester" in first.stdout, first.stdout
 
+            watchers = [subprocess.Popen(base + ["-tt"], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE) for _ in range(2)]
+            try:
+                for watcher in watchers:
+                    read_until(watcher, b"Signed in as tester")
+                assert watchers[0].stdin is not None
+                watchers[0].stdin.write(b"live-fanout\n")
+                watchers[0].stdin.flush()
+                read_until(watchers[1], b"live-fanout")
+            finally:
+                for watcher in watchers:
+                    if watcher.poll() is None and watcher.stdin is not None:
+                        watcher.stdin.write(b"\x1b")
+                        watcher.stdin.flush()
+                for watcher in watchers:
+                    watcher.communicate(timeout=10)
+
+            wall_report = shell_session(
+                base, b"reportable-wall\n\t!Wall concern\n\x1b"
+            )
+            assert wall_report.returncode == 0, wall_report
+            assert b"Report submitted" in wall_report.stdout, wall_report.stdout
+
             issued = shell_session(base, b"/invite\n\x1b")
             assert issued.returncode == 0, issued
             token_match = re.search(
@@ -400,8 +444,8 @@ def main() -> int:
                 beta_future = executor.submit(shell_session, base, b"beta-only\n")
                 alpha = alpha_future.result(timeout=20)
                 beta = beta_future.result(timeout=20)
-            alpha_pid = assert_shell(alpha, b"alpha-only\n", b"beta-only\n")
-            beta_pid = assert_shell(beta, b"beta-only\n", b"alpha-only\n")
+            alpha_pid = assert_shell(alpha, b"alpha-only\n")
+            beta_pid = assert_shell(beta, b"beta-only\n")
             assert alpha_pid != beta_pid, (alpha_pid, beta_pid)
 
             denied = subprocess.run(base + ["forbidden-command"], capture_output=True,
@@ -447,8 +491,12 @@ def main() -> int:
                 ).fetchone() == (1,)
                 assert connection.execute(
                     "SELECT reporter_kind,reporter_handle,evidence FROM reports "
-                    "WHERE reporter_kind='registered'"
+                    "WHERE reporter_kind='registered' AND target_kind='message'"
                 ).fetchall() == [("registered", "tester", "Needs review")]
+                assert connection.execute(
+                    "SELECT count(*) FROM reports WHERE reporter_kind='registered' "
+                    "AND target_kind='oneliner' AND evidence='Wall concern'"
+                ).fetchone() == (1,)
                 assert connection.execute(
                     "SELECT count(*),count(reporter_handle) FROM reports "
                     "WHERE reporter_kind='guest'"

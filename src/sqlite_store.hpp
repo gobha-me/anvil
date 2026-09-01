@@ -134,6 +134,18 @@ private:
   [[nodiscard]] auto submit_report_impl(Transaction &transaction,
                                         const ReportSubmission &report)
       -> std::expected<void, Error> final;
+  [[nodiscard]] auto create_oneliner_impl(Transaction &transaction,
+                                          const OnelinerCreate &oneliner,
+                                          const OnelinerPolicy &policy)
+      -> std::expected<OnelinerRecord, Error> final;
+  [[nodiscard]] auto
+  list_oneliners_impl(Transaction &transaction, UtcEpochSeconds now,
+                      const OnelinerPolicy &policy, std::uint32_t limit)
+      -> std::expected<std::vector<OnelinerRecord>, Error> final;
+  [[nodiscard]] auto purge_expired_oneliners_impl(Transaction &transaction,
+                                                  UtcEpochSeconds now,
+                                                  const OnelinerPolicy &policy)
+      -> std::expected<std::uint64_t, Error> final;
 
   std::filesystem::path path_;
   SqliteOptions options_;

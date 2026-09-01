@@ -19,6 +19,8 @@ using anvil::store::Error;
 using anvil::store::ErrorCode;
 using anvil::store::LocalCredentialProvision;
 using anvil::store::MessageRecord;
+using anvil::store::OnelinerCreate;
+using anvil::store::OnelinerPolicy;
 using anvil::store::Store;
 using anvil::store::TransactionMode;
 using anvil::store::UserStatus;
@@ -790,4 +792,100 @@ TEST_CASE("database-free Store implements board posting and unread contracts") {
   REQUIRE(messages.has_value());
   REQUIRE(messages->size() == 2);
   CHECK(messages->back().parent_message_id == "message-1");
+}
+
+TEST_CASE("database-free Store bounds one-liners by rate and retention") {
+  anvil::testing::MemoryStore store;
+  store.seed_credential({.handle = "alice",
+                         .fingerprint = "SHA256:alice-oneliners",
+                         .public_key = "ssh-ed25519 ALICE-ONELINERS",
+                         .status = CredentialStatus::active});
+  constexpr OnelinerPolicy policy{
+      .max_posts = 3, .window_seconds = 300, .retention_seconds = 1'209'600};
+  auto post = [&](std::string id, std::int64_t at) {
+    auto write = store.begin(TransactionMode::read_write);
+    REQUIRE(write.has_value());
+    auto created =
+        store.create_oneliner(*write,
+                              OnelinerCreate{.oneliner_id = std::move(id),
+                                             .author_handle = "alice",
+                                             .body = "hello wall",
+                                             .posted_at = {at},
+                                             .received_at = {at}},
+                              policy);
+    if (created) {
+      REQUIRE(write->commit().has_value());
+    }
+    return created;
+  };
+
+  REQUIRE(post("line-1", 100).has_value());
+  REQUIRE(post("line-2", 101).has_value());
+  REQUIRE(post("line-3", 102).has_value());
+  const auto limited = post("line-4", 103);
+  REQUIRE_FALSE(limited.has_value());
+  CHECK(limited.error().code == ErrorCode::conflict);
+
+  auto tombstone = store.begin(TransactionMode::read_write);
+  REQUIRE(tombstone.has_value());
+  REQUIRE(
+      store
+          .tombstone(*tombstone, {ContentKind::oneliner, std::string{"line-1"}})
+          .has_value());
+  REQUIRE(tombstone->commit().has_value());
+  REQUIRE(post("line-4", 103).error().code == ErrorCode::conflict);
+  REQUIRE(post("line-5", 400).has_value());
+
+  auto read = store.begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  auto visible = store.list_oneliners(*read, {400}, policy, 100);
+  REQUIRE(visible.has_value());
+  REQUIRE(visible->size() == 3);
+  CHECK((*visible)[0].oneliner_id == "line-5");
+  CHECK((*visible)[1].oneliner_id == "line-3");
+  CHECK((*visible)[2].oneliner_id == "line-2");
+  REQUIRE(read->commit().has_value());
+
+  auto purge = store.begin(TransactionMode::read_write);
+  REQUIRE(purge.has_value());
+  const auto purged =
+      store.purge_expired_oneliners(*purge, {1'209'702}, policy);
+  REQUIRE(purged.has_value());
+  CHECK(*purged == 3);
+  REQUIRE(purge->commit().has_value());
+}
+
+TEST_CASE("one-liner Store validation rejects unsafe and unbounded requests") {
+  anvil::testing::MemoryStore store;
+  store.seed_credential({.handle = "alice",
+                         .fingerprint = "SHA256:alice-validation",
+                         .public_key = "ssh-ed25519 ALICE-VALIDATION",
+                         .status = CredentialStatus::active});
+  constexpr OnelinerPolicy policy{
+      .max_posts = 3, .window_seconds = 300, .retention_seconds = 1'209'600};
+  auto write = store.begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  auto multiline = store.create_oneliner(*write,
+                                         {.oneliner_id = "line-1",
+                                          .author_handle = "alice",
+                                          .body = "first\nsecond",
+                                          .posted_at = {1},
+                                          .received_at = {1}},
+                                         policy);
+  REQUIRE_FALSE(multiline.has_value());
+  CHECK(multiline.error().code == ErrorCode::invalid_data);
+  CHECK_FALSE(store.list_oneliners(*write, {1}, policy, 101).has_value());
+
+  auto read = store.begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  CHECK_FALSE(store
+                  .create_oneliner(*read,
+                                   {.oneliner_id = "line-2",
+                                    .author_handle = "alice",
+                                    .body = "hello",
+                                    .posted_at = {1},
+                                    .received_at = {1}},
+                                   policy)
+                  .has_value());
+  CHECK_FALSE(store.purge_expired_oneliners(*read, {1}, policy).has_value());
 }

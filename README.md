@@ -120,6 +120,8 @@ install -d -m 700 state
   --invite-regeneration-seconds 2592000 \
   --invite-expiration-seconds 604800 \
   --notify-inviters-on-moderation off \
+  --oneliner-rate-limit 3/300 \
+  --oneliner-retention-seconds 1209600 \
   --tos-version 2026-09 \
   --tos-file /run/secrets/anvil_tos \
   --backup-directory state/backups \
@@ -181,6 +183,22 @@ board or thread and Enter opens it. Active users press `n` to start a thread,
 not pasted terminal text. Post bodies remain inert plain text and ANSI is never
 stored. Opening a thread records an exact per-user message sequence, so posts
 received in the same second still produce correct unread counts.
+
+The entry screen also shows the newest one-liners in a four-row live wall.
+Tab switches focus between the wall and boards; arrows move, Enter opens the
+focused item, and `!` reports a focused one-liner. An active user posts by
+typing one logical line in the entry field. Each line is limited to 280
+graphemes, and unknown slash commands are rejected. The default rolling limit
+is three posts per 300 seconds per local account, configurable with
+`--oneliner-rate-limit COUNT/PERIOD_SECONDS`.
+
+Only active one-liners received within the last 14 days are visible. Startup
+purges expired rows before listening, and a short-lived maintenance worker
+repeats the purge every minute; failure makes readiness unhealthy and is
+retried. Override the live-data window with
+`--oneliner-retention-seconds SECONDS`. Backup snapshots follow their separate
+retention policy, so the default seven-day backup window can retain a deleted
+or expired line after it leaves the live database.
 
 Active users type `/invite` to issue a 32-character opaque bearer code. Anvil
 displays the raw code once, stores only its SHA-256 hash, and atomically claims
@@ -599,7 +617,9 @@ the otherwise empty file with application ID `ANVL`; version 2 adds the base
 17-table domain schema, version 3 adds invite economics, and version 4 adds
 board visibility, local message ordering, board/thread read markers, and
 anonymous reports. Existing boards migrate as public and legacy registered
-reports retain their identity and evidence. An unknown application ID, a non-empty unclaimed
+reports retain their identity and evidence. Version 5 adds the indexed
+one-liner visibility and author-rate queries. An unknown application ID, a
+non-empty unclaimed
 file, corrupt data, or a schema newer than the binary stops startup. There is
 no migration metadata table, private-chat table, or plugin-owned table.
 

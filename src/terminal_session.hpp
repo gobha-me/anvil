@@ -11,8 +11,9 @@
 #include "session_resources.hpp"
 
 namespace anvil::store {
+struct OnelinerPolicy;
 class Store;
-}
+} // namespace anvil::store
 
 namespace anvil::server {
 
@@ -65,6 +66,7 @@ struct SessionCpuProgress {
 };
 
 using SessionInputHook = void (*)(std::string_view, SessionResources &);
+using OnelinerPublishedHook = bool (*)(int, std::uint64_t) noexcept;
 
 [[nodiscard]] TerminalDimensions
 normalize_initial_dimensions(int columns, int rows, int pixel_width,
@@ -84,8 +86,12 @@ public:
                   const InvitePolicy &invite_policy,
                   const TosPolicy &tos_policy, SessionIdentity identity,
                   store::Store &identity_store,
+                  const store::OnelinerPolicy &oneliner_policy,
                   SessionInputHook input_hook_for_testing = nullptr,
-                  int guest_report_permit_descriptor = -1);
+                  int guest_report_permit_descriptor = -1,
+                  OnelinerPublishedHook oneliner_published_hook = nullptr,
+                  int worker_report_descriptor = -1,
+                  std::uint64_t session_id = 0);
   ~TerminalSession();
 
   TerminalSession(const TerminalSession &) = delete;
@@ -96,6 +102,7 @@ public:
   void start();
   void post_resize(TerminalDimensions dimensions);
   void post_notice(std::string notice);
+  void post_oneliners_changed();
   void request_stop();
   void join();
 

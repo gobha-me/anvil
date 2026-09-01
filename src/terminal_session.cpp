@@ -184,6 +184,8 @@ struct SharedState {
   SessionResources resources;
   std::atomic<std::uint64_t> progress_generation{};
   std::atomic<bool> stop_requested{false};
+  std::atomic<bool> oneliner_wall_visible{false};
+  std::atomic<bool> oneliners_dirty{false};
 };
 
 class EchoApp final : public termforge::App {
@@ -195,13 +197,20 @@ public:
           store::Store &identity_store, RegistrationMode registration_mode,
           InvitePolicy invite_policy, TosPolicy tos_policy,
           SessionInputHook input_hook_for_testing,
-          int guest_report_permit_descriptor)
+          int guest_report_permit_descriptor,
+          store::OnelinerPolicy oneliner_policy,
+          OnelinerPublishedHook oneliner_published_hook,
+          int worker_report_descriptor, std::uint64_t session_id)
       : sink_(descriptor, shared.resources, shared.stop_requested),
         channel_opened_(channel_opened), shared_(shared),
         identity_(std::move(identity)), identity_store_(identity_store),
         registration_mode_(registration_mode), invite_policy_(invite_policy),
         tos_policy_(std::move(tos_policy)),
         guest_report_permit_descriptor_(guest_report_permit_descriptor),
+        oneliner_policy_(oneliner_policy),
+        oneliner_published_hook_(oneliner_published_hook),
+        worker_report_descriptor_(worker_report_descriptor),
+        session_id_(session_id),
         screen_mode_((identity_.kind == IdentityKind::pending ||
                       identity_.kind == IdentityKind::tos_required)
                          ? ScreenMode::tos
@@ -233,6 +242,7 @@ public:
 
     input_.set_focused(true);
     board_list_.set_focused(true);
+    oneliner_list_.set_focused(false);
     thread_list_.set_focused(true);
     message_box_.set_focused(true);
     composer_.set_focused(true);
@@ -257,6 +267,7 @@ public:
     composer_.set_max_height(8);
     if (screen_mode_ == ScreenMode::boards) {
       load_boards();
+      load_oneliners();
     }
     set_render_mode(termforge::RenderMode::Demand);
     set_frame_observer([this](const termforge::FrameObservation &observation) {
@@ -305,6 +316,11 @@ public:
     if (const auto *key = std::get_if<termforge::KeyEvent>(&event)) {
       if (key->action == termforge::KeyAction::Press &&
           key->key == termforge::Key::Escape) {
+        if (screen_mode_ == ScreenMode::oneliner) {
+          screen_mode_ = ScreenMode::boards;
+          status_.clear();
+          return;
+        }
         if (screen_mode_ == ScreenMode::thread ||
             screen_mode_ == ScreenMode::subject ||
             screen_mode_ == ScreenMode::compose ||
@@ -313,6 +329,8 @@ public:
           input_.set_text({});
           if (screen_mode_ == ScreenMode::report) {
             report_target_.reset();
+            screen_mode_ = report_return_mode_;
+            return;
           }
           if (screen_mode_ == ScreenMode::thread) {
             open_selected_board();
@@ -323,10 +341,22 @@ public:
         }
         if (screen_mode_ == ScreenMode::threads) {
           load_boards();
+          load_oneliners();
           screen_mode_ = ScreenMode::boards;
           return;
         }
         quit();
+        return;
+      }
+      if (key->action == termforge::KeyAction::Press &&
+          key->key == termforge::Key::Tab &&
+          screen_mode_ == ScreenMode::boards) {
+        entry_focus_ = entry_focus_ == EntryFocus::boards
+                           ? EntryFocus::oneliners
+                           : EntryFocus::boards;
+        board_list_.set_focused(entry_focus_ == EntryFocus::boards);
+        oneliner_list_.set_focused(entry_focus_ == EntryFocus::oneliners);
+        status_.clear();
         return;
       }
       if (key->action == termforge::KeyAction::Press && key->ctrl &&
@@ -349,7 +379,11 @@ public:
           submit_report();
         } else if (screen_mode_ == ScreenMode::boards &&
                    input_.text().empty()) {
-          open_selected_board();
+          if (entry_focus_ == EntryFocus::oneliners) {
+            open_selected_oneliner();
+          } else {
+            open_selected_board();
+          }
         } else if (screen_mode_ == ScreenMode::threads &&
                    input_.text().empty()) {
           open_selected_thread();
@@ -364,6 +398,12 @@ public:
         } else if (identity_.kind == IdentityKind::active) {
           submit_active_command();
         }
+        return;
+      }
+      if (key->action == termforge::KeyAction::Press &&
+          screen_mode_ == ScreenMode::boards && !key->ctrl && !key->alt &&
+          key->ch == U'!' && input_.text().empty()) {
+        begin_oneliner_report();
         return;
       }
       if (key->action == termforge::KeyAction::Press &&
@@ -397,6 +437,7 @@ public:
           }
           report_target_ = store::ContentRef{store::ContentKind::message,
                                              messages_.back().message_id};
+          report_return_mode_ = ScreenMode::thread;
           composer_.clear();
           screen_mode_ = ScreenMode::report;
           status_.clear();
@@ -405,6 +446,7 @@ public:
         if (key->ch == U'T' && selected_thread_ < threads_.size()) {
           report_target_ = store::ContentRef{
               store::ContentKind::thread, threads_[selected_thread_].thread_id};
+          report_return_mode_ = ScreenMode::thread;
           composer_.clear();
           screen_mode_ = ScreenMode::report;
           status_.clear();
@@ -437,6 +479,13 @@ public:
         notice_ = shared_.notice;
         return;
       }
+      if (error->source == "oneliners") {
+        if (screen_mode_ == ScreenMode::boards) {
+          shared_.oneliners_dirty.store(false, std::memory_order_release);
+          load_oneliners();
+        }
+        return;
+      }
       status_ = error->message;
       if (error->severity == termforge::Severity::Error) {
         quit();
@@ -448,13 +497,20 @@ public:
       return;
     }
 
-    if (screen_mode_ == ScreenMode::boards && board_list_.on_event(event)) {
-      return;
+    if (screen_mode_ == ScreenMode::boards) {
+      auto &entry_list =
+          entry_focus_ == EntryFocus::oneliners ? oneliner_list_ : board_list_;
+      if (entry_list.on_event(event)) {
+        return;
+      }
     }
     if (screen_mode_ == ScreenMode::threads && thread_list_.on_event(event)) {
       return;
     }
     if (screen_mode_ == ScreenMode::thread && message_box_.on_event(event)) {
+      return;
+    }
+    if (screen_mode_ == ScreenMode::oneliner && oneliner_box_.on_event(event)) {
       return;
     }
     if ((screen_mode_ == ScreenMode::compose ||
@@ -476,6 +532,12 @@ public:
   }
 
   auto on_render(termforge::Screen &screen) -> void override {
+    shared_.oneliner_wall_visible.store(screen_mode_ == ScreenMode::boards,
+                                        std::memory_order_release);
+    if (screen_mode_ == ScreenMode::boards &&
+        shared_.oneliners_dirty.exchange(false, std::memory_order_acq_rel)) {
+      load_oneliners();
+    }
     constexpr termforge::Rgb foreground{0xE0, 0xE0, 0xF0};
     constexpr termforge::Rgb accent{0x70, 0xC0, 0xFF};
     constexpr termforge::Rgb background{0x0A, 0x0A, 0x14};
@@ -518,6 +580,7 @@ private:
   enum class RegistrationStep { invite_code, handle };
   enum class ScreenMode {
     boards,
+    oneliner,
     threads,
     thread,
     subject,
@@ -525,6 +588,7 @@ private:
     report,
     tos,
   };
+  enum class EntryFocus { boards, oneliners };
   enum class ComposeAction { new_thread, reply };
 
   void append_tos_text() {
@@ -582,6 +646,78 @@ private:
       board_list_.set_selected(
           static_cast<int>(std::min(selected_board_, boards_.size() - 1U)));
     }
+  }
+
+  void load_oneliners() {
+    const auto selected = oneliner_list_.selected();
+    const auto selected_id =
+        selected >= 0 && static_cast<std::size_t>(selected) < oneliners_.size()
+            ? oneliners_[static_cast<std::size_t>(selected)].oneliner_id
+            : std::string{};
+    auto read = identity_store_.begin(store::TransactionMode::read_only);
+    if (!read) {
+      status_ = "One-liners are temporarily unavailable.";
+      return;
+    }
+    auto oneliners =
+        identity_store_.list_oneliners(*read, utc_now(), oneliner_policy_, 100);
+    if (!oneliners || !read->commit()) {
+      status_ = "One-liners are temporarily unavailable.";
+      return;
+    }
+    oneliners_ = std::move(*oneliners);
+    std::vector<std::string> items;
+    items.reserve(oneliners_.size());
+    for (const auto &oneliner : oneliners_) {
+      items.push_back("@" + sanitize_prose_for_render(oneliner.author_handle) +
+                      ": " + sanitize_prose_for_render(oneliner.body));
+    }
+    oneliner_list_.set_items(std::move(items));
+    if (!selected_id.empty()) {
+      const auto match = std::ranges::find(oneliners_, selected_id,
+                                           &store::OnelinerRecord::oneliner_id);
+      if (match != oneliners_.end()) {
+        oneliner_list_.set_selected(
+            static_cast<int>(std::distance(oneliners_.begin(), match)));
+      }
+    }
+  }
+
+  void open_selected_oneliner() {
+    const auto selected = oneliner_list_.selected();
+    if (selected < 0 ||
+        static_cast<std::size_t>(selected) >= oneliners_.size()) {
+      status_ = "No one-liner is selected.";
+      return;
+    }
+    const auto &oneliner = oneliners_[static_cast<std::size_t>(selected)];
+    oneliner_box_.clear();
+    oneliner_box_.append("@" +
+                         sanitize_prose_for_render(oneliner.author_handle));
+    oneliner_box_.append(std::string{});
+    oneliner_box_.append(sanitize_prose_for_render(oneliner.body));
+    screen_mode_ = ScreenMode::oneliner;
+    status_.clear();
+  }
+
+  void begin_oneliner_report() {
+    if (entry_focus_ != EntryFocus::oneliners) {
+      status_ = "Select the one-liner wall with Tab before reporting.";
+      return;
+    }
+    const auto selected = oneliner_list_.selected();
+    if (selected < 0 ||
+        static_cast<std::size_t>(selected) >= oneliners_.size()) {
+      status_ = "There is no one-liner to report.";
+      return;
+    }
+    report_target_ = store::ContentRef{
+        store::ContentKind::oneliner,
+        oneliners_[static_cast<std::size_t>(selected)].oneliner_id};
+    report_return_mode_ = ScreenMode::boards;
+    composer_.clear();
+    screen_mode_ = ScreenMode::report;
+    status_.clear();
   }
 
   void open_selected_board() {
@@ -833,7 +969,7 @@ private:
     }
     composer_.clear();
     report_target_.reset();
-    screen_mode_ = ScreenMode::thread;
+    screen_mode_ = report_return_mode_;
     status_ = "Report submitted.";
   }
 
@@ -851,16 +987,27 @@ private:
     const auto body_height = std::max(1, screen.rows() - 7);
     if (screen_mode_ == ScreenMode::boards) {
       static_cast<void>(screen.write_text(
-          0, 3, "Boards - arrows move, Enter opens, Esc exits", accent,
-          background));
-      board_list_.set_geometry(
-          termforge::Rect{0, 4, screen.cols(), body_height});
+          0, 3, "One-liners - Tab focus, arrows move, Enter opens, ! reports",
+          accent, background));
+      oneliner_list_.set_geometry(termforge::Rect{0, 4, screen.cols(), 4});
+      oneliner_list_.draw(screen);
+      static_cast<void>(screen.write_text(
+          0, 8, "Boards - Tab focus, arrows move, Enter opens, Esc exits",
+          accent, background));
+      board_list_.set_geometry(termforge::Rect{
+          0, 9, screen.cols(), std::max(1, screen.rows() - 12)});
       board_list_.draw(screen);
       if (identity_.kind != IdentityKind::guest && screen.rows() > 2) {
         input_.set_geometry(
             termforge::Rect{0, screen.rows() - 2, screen.cols(), 1});
         input_.draw(screen);
       }
+    } else if (screen_mode_ == ScreenMode::oneliner) {
+      static_cast<void>(screen.write_text(0, 3, "One-liner detail - Esc back",
+                                          accent, background));
+      oneliner_box_.set_geometry(
+          termforge::Rect{0, 4, screen.cols(), body_height + 1});
+      oneliner_box_.draw(screen);
     } else if (screen_mode_ == ScreenMode::threads) {
       const auto board_title = selected_board_ < boards_.size()
                                    ? boards_[selected_board_].title
@@ -1027,6 +1174,7 @@ private:
       input_.set_text({});
       screen_mode_ = ScreenMode::boards;
       load_boards();
+      load_oneliners();
       status_ = "Read-only access. Type /tos to review the current terms.";
       return;
     }
@@ -1050,6 +1198,7 @@ private:
     identity_ = std::move(*accepted);
     screen_mode_ = ScreenMode::boards;
     load_boards();
+    load_oneliners();
     status_ = "Current terms accepted.";
   }
 
@@ -1066,10 +1215,19 @@ private:
   }
 
   void submit_active_command() {
-    if (input_.text() != "/invite") {
+    const auto command = input_.text();
+    if (command.empty()) {
       return;
     }
     input_.set_text({});
+    if (command.front() != '/') {
+      submit_oneliner(command);
+      return;
+    }
+    if (command != "/invite") {
+      status_ = "Unknown command.";
+      return;
+    }
     const auto now = store::UtcEpochSeconds{
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
@@ -1085,6 +1243,45 @@ private:
     issued_invite_code_ = std::move(issued->code);
     issued_invite_balance_ = issued->remaining_balance;
     status_.clear();
+  }
+
+  void submit_oneliner(std::string_view input) {
+    auto body = prepare_user_text_for_ingest(UserTextField::oneliner,
+                                             RemoteBytes::from_text(input));
+    if (!body || body->empty()) {
+      status_ = "One-liner must be one line containing 1 to 280 graphemes.";
+      return;
+    }
+    const auto now = utc_now();
+    auto write = identity_store_.begin(store::TransactionMode::read_write);
+    if (!write) {
+      status_ = "One-liner posting is temporarily unavailable.";
+      return;
+    }
+    auto created = identity_store_.create_oneliner(
+        *write,
+        {.oneliner_id = random_content_id("oneliner-"),
+         .author_handle = identity_.handle,
+         .body = std::move(*body),
+         .posted_at = now,
+         .received_at = now},
+        oneliner_policy_);
+    if (!created) {
+      status_ = created.error().code == store::ErrorCode::conflict
+                    ? "One-liner limit reached; try again later."
+                    : "One-liner posting failed; no partial post was saved.";
+      return;
+    }
+    if (!write->commit()) {
+      status_ = "One-liner posting failed; no partial post was saved.";
+      return;
+    }
+    load_oneliners();
+    const auto notified =
+        oneliner_published_hook_ == nullptr ||
+        oneliner_published_hook_(worker_report_descriptor_, session_id_);
+    status_ = notified ? "One-liner posted."
+                       : "One-liner posted; live refresh is unavailable.";
   }
 
   void clear_invite_code() noexcept {
@@ -1106,20 +1303,29 @@ private:
   InvitePolicy invite_policy_;
   TosPolicy tos_policy_;
   int guest_report_permit_descriptor_{-1};
+  store::OnelinerPolicy oneliner_policy_;
+  OnelinerPublishedHook oneliner_published_hook_{};
+  int worker_report_descriptor_{-1};
+  std::uint64_t session_id_{};
   ScreenMode screen_mode_{ScreenMode::boards};
   termforge::TextBox tos_box_;
   termforge::ListWidget board_list_;
+  termforge::ListWidget oneliner_list_;
   termforge::ListWidget thread_list_;
   termforge::TextBox message_box_;
+  termforge::TextBox oneliner_box_;
   termforge::Composer composer_;
   std::vector<store::BoardRecord> boards_;
   std::vector<store::ThreadRecord> threads_;
   std::vector<store::MessageRecord> messages_;
+  std::vector<store::OnelinerRecord> oneliners_;
   std::size_t selected_board_{};
   std::size_t selected_thread_{};
+  EntryFocus entry_focus_{EntryFocus::boards};
   ComposeAction compose_action_{ComposeAction::reply};
   std::optional<std::string> quote_parent_;
   std::optional<store::ContentRef> report_target_;
+  ScreenMode report_return_mode_{ScreenMode::thread};
   std::string pending_subject_;
   bool tos_positioned_{};
   RegistrationStep registration_step_{RegistrationStep::invite_code};
@@ -1181,12 +1387,17 @@ public:
        RegistrationMode registration_mode, InvitePolicy invite_policy,
        TosPolicy tos_policy, SessionIdentity identity,
        store::Store &identity_store, SessionInputHook input_hook_for_testing,
-       int guest_report_permit_descriptor)
+       int guest_report_permit_descriptor,
+       store::OnelinerPolicy oneliner_policy,
+       OnelinerPublishedHook oneliner_published_hook,
+       int worker_report_descriptor, std::uint64_t session_id)
       : shared_(dimensions, resource_limits),
         app_(io_descriptor, std::move(terminal_type), dimensions,
              channel_opened, shared_, std::move(identity), identity_store,
              registration_mode, invite_policy, std::move(tos_policy),
-             input_hook_for_testing, guest_report_permit_descriptor) {}
+             input_hook_for_testing, guest_report_permit_descriptor,
+             oneliner_policy, oneliner_published_hook, worker_report_descriptor,
+             session_id) {}
 
   ~Impl() {
     request_stop();
@@ -1248,6 +1459,14 @@ public:
     }
     app_.post(termforge::Event{termforge::ErrorEvent{
         termforge::Severity::Info, "ssh", "session notice changed"}});
+  }
+
+  void post_oneliners_changed() {
+    shared_.oneliners_dirty.store(true, std::memory_order_release);
+    if (shared_.oneliner_wall_visible.load(std::memory_order_acquire)) {
+      app_.post(termforge::Event{termforge::ErrorEvent{
+          termforge::Severity::Info, "oneliners", "one-liners changed"}});
+    }
   }
 
   void request_stop() {
@@ -1341,12 +1560,16 @@ TerminalSession::TerminalSession(
     SessionResourceLimits resource_limits, RegistrationMode registration_mode,
     const InvitePolicy &invite_policy, const TosPolicy &tos_policy,
     SessionIdentity identity, store::Store &identity_store,
-    SessionInputHook input_hook_for_testing, int guest_report_permit_descriptor)
+    const store::OnelinerPolicy &oneliner_policy,
+    SessionInputHook input_hook_for_testing, int guest_report_permit_descriptor,
+    OnelinerPublishedHook oneliner_published_hook, int worker_report_descriptor,
+    std::uint64_t session_id)
     : impl_(std::make_unique<Impl>(
           io_descriptor, std::move(terminal_type), dimensions, channel_opened,
           resource_limits, registration_mode, invite_policy, tos_policy,
           std::move(identity), identity_store, input_hook_for_testing,
-          guest_report_permit_descriptor)) {}
+          guest_report_permit_descriptor, oneliner_policy,
+          oneliner_published_hook, worker_report_descriptor, session_id)) {}
 
 TerminalSession::~TerminalSession() = default;
 
@@ -1358,6 +1581,10 @@ void TerminalSession::post_resize(TerminalDimensions dimensions) {
 
 void TerminalSession::post_notice(std::string notice) {
   impl_->post_notice(std::move(notice));
+}
+
+void TerminalSession::post_oneliners_changed() {
+  impl_->post_oneliners_changed();
 }
 
 void TerminalSession::request_stop() { impl_->request_stop(); }

@@ -71,6 +71,10 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"20/30"},
       std::string_view{"--auth-attempt-rate-limit"},
       std::string_view{"4/120"},
+      std::string_view{"--oneliner-rate-limit"},
+      std::string_view{"9/600"},
+      std::string_view{"--oneliner-retention-seconds"},
+      std::string_view{"86400"},
       std::string_view{"--max-auth-attempts-per-session"},
       std::string_view{"2"},
       std::string_view{"--max-tracked-ips"},
@@ -119,6 +123,9 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.connection_rate.period.count() == 30);
   CHECK(parsed.config.auth_attempt_rate.count == 4);
   CHECK(parsed.config.auth_attempt_rate.period.count() == 120);
+  CHECK(parsed.config.oneliner_policy.max_posts == 9);
+  CHECK(parsed.config.oneliner_policy.window_seconds == 600);
+  CHECK(parsed.config.oneliner_policy.retention_seconds == 86'400);
   CHECK(parsed.config.max_auth_attempts_per_session == 2);
   CHECK(parsed.config.max_tracked_ips == 100);
   CHECK(parsed.config.idle_timeout.count() == 600);
@@ -164,6 +171,12 @@ TEST_CASE("server CLI rejects malformed hostile values") {
   CHECK_THROWS_AS(parse("--connection-rate-limit", "0/10"), std::runtime_error);
   CHECK_THROWS_AS(parse("--connection-rate-limit", "10/0"), std::runtime_error);
   CHECK_THROWS_AS(parse("--auth-attempt-rate-limit", "1/2/3"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--oneliner-rate-limit", "0/300"), std::runtime_error);
+  CHECK_THROWS_AS(parse("--oneliner-retention-seconds", "0"),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--oneliner-retention-seconds",
+                        "18446744073709551616000000000000000000"),
                   std::runtime_error);
   CHECK_THROWS_AS(parse("--max-auth-attempts-per-session", "0"),
                   std::runtime_error);
@@ -286,6 +299,9 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   CHECK(parsed.config.backup_directory.empty());
   CHECK(parsed.config.backup_interval.count() == 86'400);
   CHECK(parsed.config.backup_retention.count() == 604'800);
+  CHECK(parsed.config.oneliner_policy.max_posts == 3);
+  CHECK(parsed.config.oneliner_policy.window_seconds == 300);
+  CHECK(parsed.config.oneliner_policy.retention_seconds == 1'209'600);
   CHECK(parsed.config.max_sessions_per_ip == 4);
   CHECK(parsed.config.connection_rate.count == 10);
   CHECK(parsed.config.connection_rate.period.count() == 10);
@@ -396,16 +412,11 @@ TEST_CASE("server CLI separates scheduled and offline backup modes") {
                   std::runtime_error);
 
   const std::array maintenance_tos{
-      std::string_view{"--backup-now"},
-      std::string_view{"backups"},
-      std::string_view{"--database"},
-      std::string_view{"state/anvil.db"},
-      std::string_view{"--host-key"},
-      std::string_view{"state/host_key"},
-      std::string_view{"--tos-version"},
-      std::string_view{"v1"},
-      std::string_view{"--tos-file"},
-      std::string_view{"tos.txt"},
+      std::string_view{"--backup-now"},  std::string_view{"backups"},
+      std::string_view{"--database"},    std::string_view{"state/anvil.db"},
+      std::string_view{"--host-key"},    std::string_view{"state/host_key"},
+      std::string_view{"--tos-version"}, std::string_view{"v1"},
+      std::string_view{"--tos-file"},    std::string_view{"tos.txt"},
   };
   CHECK_THROWS_AS(anvil::server::parse_arguments(maintenance_tos),
                   std::runtime_error);
@@ -450,6 +461,8 @@ TEST_CASE("server CLI help does not require operational arguments") {
   CHECK(anvil::server::usage().find("--registration-mode") !=
         std::string_view::npos);
   CHECK(anvil::server::usage().find("--tos-version") != std::string_view::npos);
+  CHECK(anvil::server::usage().find("--oneliner-rate-limit") !=
+        std::string_view::npos);
 }
 
 TEST_CASE("SSH terminal dimensions bound hostile peer claims") {

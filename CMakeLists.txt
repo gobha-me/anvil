@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(anvil VERSION 0.30.0 LANGUAGES CXX)
+project(anvil VERSION 0.31.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "anvil::loader currently requires Linux ELF/glibc")
@@ -126,9 +126,9 @@ if(ANVIL_SERVER)
     $<TARGET_PROPERTY:httplib::httplib,INTERFACE_INCLUDE_DIRECTORIES>
   )
   target_link_libraries(anvil_server
-    PUBLIC ${ANVIL_LIBSSH_TARGET}
-    PRIVATE anvil::store termforge::lib httplib::httplib SQLite::SQLite3
-            OpenSSL::Crypto Threads::Threads utf8proc::utf8proc
+    PUBLIC ${ANVIL_LIBSSH_TARGET} anvil::store
+    PRIVATE termforge::lib httplib::httplib SQLite::SQLite3 OpenSSL::Crypto
+            Threads::Threads utf8proc::utf8proc
   )
   anvil_apply_input_safety(anvil_server)
 
