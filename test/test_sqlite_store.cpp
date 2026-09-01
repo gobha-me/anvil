@@ -208,6 +208,61 @@ TEST_CASE("SQLite active bootstrap is idempotent and adds exact-user keys") {
         2);
 }
 
+TEST_CASE("SQLite records versioned TOS acceptance and activates atomically") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto provision = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(provision.has_value());
+  REQUIRE((*store)
+              ->provision_local_credential(*provision,
+                                           {.handle = "alice",
+                                            .fingerprint = "SHA256:alice",
+                                            .public_key = "ssh-ed25519 ALICE",
+                                            .created_at = {1},
+                                            .user_status = UserStatus::pending})
+              .has_value());
+  REQUIRE(provision->commit().has_value());
+
+  auto accept = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(accept.has_value());
+  REQUIRE((*store)
+              ->accept_tos(*accept, {.user_handle = "alice",
+                                     .tos_version = "v1",
+                                     .accepted_at = {10}})
+              .has_value());
+  REQUIRE(accept->commit().has_value());
+
+  auto repeat = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(repeat.has_value());
+  REQUIRE((*store)
+              ->accept_tos(*repeat, {.user_handle = "alice",
+                                     .tos_version = "v1",
+                                     .accepted_at = {99}})
+              .has_value());
+  REQUIRE((*store)
+              ->accept_tos(*repeat, {.user_handle = "alice",
+                                     .tos_version = "v2",
+                                     .accepted_at = {20}})
+              .has_value());
+  REQUIRE(repeat->commit().has_value());
+
+  auto verify = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(verify.has_value());
+  CHECK((*store)->has_tos_acceptance(*verify, "alice", "v1").value());
+  CHECK((*store)->has_tos_acceptance(*verify, "alice", "v2").value());
+  CHECK_FALSE((*store)->has_tos_acceptance(*verify, "alice", "v3").value());
+  CHECK((*store)->scalar_text_for_testing(
+            *verify, "SELECT status FROM users WHERE handle='alice'") ==
+        "active");
+  CHECK((*store)->scalar_for_testing(
+            *verify, "SELECT count(*) FROM tos_acceptances") == 2);
+  CHECK((*store)->scalar_for_testing(
+            *verify,
+            "SELECT accepted_at FROM tos_acceptances WHERE tos_version='v1'") ==
+        10);
+}
+
 TEST_CASE("SQLite revoked credentials never become unknown registrations") {
   TemporaryDatabase database;
   auto store = SqliteStore::open(database.path());

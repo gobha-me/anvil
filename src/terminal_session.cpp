@@ -22,6 +22,7 @@
 #include <string_view>
 #include <termforge/core/app.hpp>
 #include <termforge/core/byte_sink.hpp>
+#include <termforge/widgets/text_box.hpp>
 #include <termforge/widgets/text_input.hpp>
 #include <thread>
 #include <utility>
@@ -158,11 +159,17 @@ public:
           std::chrono::steady_clock::time_point channel_opened,
           SharedState &shared, SessionIdentity identity,
           store::Store &identity_store, RegistrationMode registration_mode,
-          InvitePolicy invite_policy, SessionInputHook input_hook_for_testing)
+          InvitePolicy invite_policy, TosPolicy tos_policy,
+          SessionInputHook input_hook_for_testing)
       : sink_(descriptor, shared.resources, shared.stop_requested),
         channel_opened_(channel_opened), shared_(shared),
         identity_(std::move(identity)), identity_store_(identity_store),
-        registration_mode_(registration_mode), invite_policy_(invite_policy) {
+        registration_mode_(registration_mode), invite_policy_(invite_policy),
+        tos_policy_(std::move(tos_policy)),
+        screen_mode_((identity_.kind == IdentityKind::pending ||
+                      identity_.kind == IdentityKind::tos_required)
+                         ? ScreenMode::tos
+                         : ScreenMode::shell) {
     const auto io =
         terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
     if (!io) {
@@ -190,6 +197,7 @@ public:
 
     input_.set_focused(true);
     input_.set_placeholder("Type here");
+    append_tos_text();
     input_.on_change([this, input_hook_for_testing](const std::string &text) {
       clear_issued_invite_code();
       auto sanitized = sanitize_prose_for_render(text);
@@ -264,6 +272,12 @@ public:
                           key->ch == U'm' || key->ch == U'M')))) {
         if (identity_.kind == IdentityKind::registration) {
           submit_registration();
+        } else if (screen_mode_ == ScreenMode::tos &&
+                   (identity_.kind == IdentityKind::pending ||
+                    identity_.kind == IdentityKind::tos_required)) {
+          submit_tos_command();
+        } else if (identity_.kind == IdentityKind::tos_required) {
+          submit_restricted_command();
         } else if (identity_.kind == IdentityKind::active) {
           submit_active_command();
         }
@@ -302,8 +316,14 @@ public:
       return;
     }
 
+    if (screen_mode_ == ScreenMode::tos && tos_box_.on_event(event)) {
+      return;
+    }
+
     if (((identity_.kind == IdentityKind::registration &&
           registration_mode_ != RegistrationMode::closed) ||
+         identity_.kind == IdentityKind::pending ||
+         identity_.kind == IdentityKind::tos_required ||
          identity_.kind == IdentityKind::active) &&
         input_.on_event(event)) {
       return;
@@ -337,14 +357,21 @@ public:
       }
     } else if (identity_.kind == IdentityKind::registration) {
       render_registration(screen, foreground, accent, background);
-    } else if (identity_.kind == IdentityKind::pending) {
+    } else if ((identity_.kind == IdentityKind::pending ||
+                identity_.kind == IdentityKind::tos_required) &&
+               screen_mode_ == ScreenMode::tos) {
+      render_tos(screen, foreground, accent, background);
+    } else if (identity_.kind == IdentityKind::tos_required) {
       static_cast<void>(screen.write_text(
-          0, 2, "Registration pending for " + identity_.handle + '.', accent,
-          background));
+          0, 2, "TOS changed: read-only until the current version is accepted.",
+          accent, background));
       if (screen.rows() > 3) {
-        static_cast<void>(screen.write_text(
-            0, 3, "TOS acceptance will complete registration in issue #40.",
-            foreground, background));
+        static_cast<void>(
+            screen.write_text(0, 3, "Boards  (none yet)", accent, background));
+      }
+      if (screen.rows() > 4) {
+        input_.set_geometry(termforge::Rect{0, 4, screen.cols(), 1});
+        input_.draw(screen);
       }
     } else {
       static_cast<void>(
@@ -377,6 +404,49 @@ public:
 
 private:
   enum class RegistrationStep { invite_code, handle };
+  enum class ScreenMode { shell, tos };
+
+  void append_tos_text() {
+    std::size_t start = 0;
+    while (start <= tos_policy_.text.size()) {
+      const auto end = tos_policy_.text.find('\n', start);
+      auto line = tos_policy_.text.substr(
+          start, end == std::string::npos ? std::string::npos : end - start);
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      tos_box_.append(std::move(line));
+      if (end == std::string::npos) {
+        break;
+      }
+      start = end + 1U;
+    }
+  }
+
+  void render_tos(termforge::Screen &screen, termforge::Rgb foreground,
+                  termforge::Rgb accent, termforge::Rgb background) {
+    const auto version = sanitize_prose_for_render(tos_policy_.version);
+    static_cast<void>(screen.write_text(0, 2, "Terms of service " + version,
+                                        accent, background));
+    const auto body_height = std::max(0, screen.rows() - 6);
+    tos_box_.set_geometry(termforge::Rect{0, 3, screen.cols(), body_height});
+    if (!tos_positioned_) {
+      tos_box_.scroll(-std::numeric_limits<int>::max());
+      tos_positioned_ = true;
+    }
+    tos_box_.draw(screen);
+    if (screen.rows() > 3) {
+      const auto prompt_row = std::max(3, screen.rows() - 3);
+      const auto prompt = identity_.kind == IdentityKind::tos_required
+                              ? "Type ACCEPT, or /browse for read-only access."
+                              : "Type ACCEPT to complete registration.";
+      static_cast<void>(
+          screen.write_text(0, prompt_row, prompt, foreground, background));
+      input_.set_geometry(termforge::Rect{
+          0, std::min(screen.rows() - 2, prompt_row + 1), screen.cols(), 1});
+      input_.draw(screen);
+    }
+  }
 
   void render_registration(termforge::Screen &screen, termforge::Rgb foreground,
                            termforge::Rgb accent, termforge::Rgb background) {
@@ -463,7 +533,51 @@ private:
     identity_ = std::move(*provisioned);
     clear_invite_code();
     input_.set_text({});
-    status_ = "Key saved. Registration awaits TOS acceptance.";
+    screen_mode_ = ScreenMode::tos;
+    tos_positioned_ = false;
+    status_ = "Key saved. Review and accept the current TOS.";
+  }
+
+  void submit_tos_command() {
+    if (input_.text() == "/browse" &&
+        identity_.kind == IdentityKind::tos_required) {
+      input_.set_text({});
+      screen_mode_ = ScreenMode::shell;
+      status_ = "Read-only access. Type /tos to review the current terms.";
+      return;
+    }
+    if (input_.text() != "ACCEPT") {
+      status_ = identity_.kind == IdentityKind::tos_required
+                    ? "Type ACCEPT to agree, or /browse for read-only access."
+                    : "Type ACCEPT exactly to complete registration.";
+      return;
+    }
+    input_.set_text({});
+    const auto now = store::UtcEpochSeconds{
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count()};
+    auto accepted = accept_current_tos(identity_store_, identity_,
+                                       tos_policy_.version, now);
+    if (!accepted) {
+      status_ = "TOS acceptance is temporarily unavailable.";
+      return;
+    }
+    identity_ = std::move(*accepted);
+    screen_mode_ = ScreenMode::shell;
+    status_ = "Current terms accepted.";
+  }
+
+  void submit_restricted_command() {
+    if (input_.text() == "/tos") {
+      input_.set_text({});
+      screen_mode_ = ScreenMode::tos;
+      tos_positioned_ = false;
+      status_.clear();
+      return;
+    }
+    input_.set_text({});
+    status_ = "Accept the current TOS before using write actions.";
   }
 
   void submit_active_command() {
@@ -505,6 +619,10 @@ private:
   store::Store &identity_store_;
   RegistrationMode registration_mode_{RegistrationMode::open};
   InvitePolicy invite_policy_;
+  TosPolicy tos_policy_;
+  ScreenMode screen_mode_{ScreenMode::shell};
+  termforge::TextBox tos_box_;
+  bool tos_positioned_{};
   RegistrationStep registration_step_{RegistrationStep::invite_code};
   termforge::TextInput input_;
   std::string invite_code_;
@@ -562,12 +680,13 @@ public:
        std::chrono::steady_clock::time_point channel_opened,
        SessionResourceLimits resource_limits,
        RegistrationMode registration_mode, InvitePolicy invite_policy,
-       SessionIdentity identity, store::Store &identity_store,
-       SessionInputHook input_hook_for_testing)
+       TosPolicy tos_policy, SessionIdentity identity,
+       store::Store &identity_store, SessionInputHook input_hook_for_testing)
       : shared_(dimensions, resource_limits),
         app_(io_descriptor, std::move(terminal_type), dimensions,
              channel_opened, shared_, std::move(identity), identity_store,
-             registration_mode, invite_policy, input_hook_for_testing) {}
+             registration_mode, invite_policy, std::move(tos_policy),
+             input_hook_for_testing) {}
 
   ~Impl() {
     request_stop();
@@ -720,11 +839,12 @@ TerminalSession::TerminalSession(
     int io_descriptor, std::string terminal_type, TerminalDimensions dimensions,
     std::chrono::steady_clock::time_point channel_opened,
     SessionResourceLimits resource_limits, RegistrationMode registration_mode,
-    const InvitePolicy &invite_policy, SessionIdentity identity,
-    store::Store &identity_store, SessionInputHook input_hook_for_testing)
+    const InvitePolicy &invite_policy, const TosPolicy &tos_policy,
+    SessionIdentity identity, store::Store &identity_store,
+    SessionInputHook input_hook_for_testing)
     : impl_(std::make_unique<Impl>(
           io_descriptor, std::move(terminal_type), dimensions, channel_opened,
-          resource_limits, registration_mode, invite_policy,
+          resource_limits, registration_mode, invite_policy, tos_policy,
           std::move(identity), identity_store, input_hook_for_testing)) {}
 
 TerminalSession::~TerminalSession() = default;

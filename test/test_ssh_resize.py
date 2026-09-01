@@ -76,6 +76,7 @@ def main() -> int:
         directory = pathlib.Path(directory_name)
         host_key = directory / "host_key"
         client_key = directory / "client_key"
+        (directory / "tos.txt").write_text("Test terms\n", encoding="utf-8")
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
                      "-f", str(client_key)])
 

@@ -28,6 +28,8 @@ enum class UserTextError : std::uint8_t {
   line_too_long,
 };
 
+[[nodiscard]] auto is_well_formed_utf8(std::string_view input) noexcept -> bool;
+
 // Validate one complete user submission before any sanitizer can replace or
 // escape malformed bytes. Prose is returned in the visible, inert storage
 // form; handles use a strict ASCII grammar and are returned byte-for-byte.

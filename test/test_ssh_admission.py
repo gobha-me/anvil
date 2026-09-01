@@ -50,6 +50,8 @@ def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
             "--port", str(port),
             "--health-port", str(reserve_port()),
             "--database", str(host_key.with_name(f"anvil-{port}.db")),
+            "--tos-version", "v1",
+            "--tos-file", str(client_key.with_name("tos.txt")),
             "--host-key", str(host_key),
             "--authorized-key", f"tester={client_key}.pub",
         ] + options,
@@ -57,6 +59,12 @@ def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
         stderr=subprocess.PIPE,
     )
     wait_until_listening(process)
+    with sqlite3.connect(host_key.with_name(f"anvil-{port}.db")) as connection:
+        connection.execute(
+            "INSERT INTO tos_acceptances(user_handle,tos_version,accepted_at) "
+            "VALUES('tester','v1',?)",
+            (int(time.time()),),
+        )
     return process
 
 
@@ -278,6 +286,7 @@ def main() -> int:
         directory = pathlib.Path(directory_name)
         client_key = directory / "client_key"
         wrong_key = directory / "wrong_key"
+        (directory / "tos.txt").write_text("Test terms\n", encoding="utf-8")
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)])
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(wrong_key)])
         test_concurrency(executable, directory, client_key)

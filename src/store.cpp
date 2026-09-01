@@ -146,6 +146,82 @@ namespace {
   return {};
 }
 
+[[nodiscard]] auto valid_tos_version(std::string_view version) -> bool {
+  if (!valid_opaque_identifier(version, 128)) {
+    return false;
+  }
+  const auto continuation = [](unsigned char value) {
+    return value >= 0x80U && value <= 0xbfU;
+  };
+  for (std::size_t offset = 0; offset < version.size();) {
+    const auto first = static_cast<unsigned char>(version[offset]);
+    if (first <= 0x7fU) {
+      if (first < 0x20U || first == 0x7fU) {
+        return false;
+      }
+      ++offset;
+      continue;
+    }
+    if (first >= 0xc2U && first <= 0xdfU) {
+      if (offset + 1U >= version.size()) {
+        return false;
+      }
+      const auto second = static_cast<unsigned char>(version[offset + 1U]);
+      if (!continuation(second) || (first == 0xc2U && second <= 0x9fU)) {
+        return false;
+      }
+      offset += 2U;
+      continue;
+    }
+    if (first >= 0xe0U && first <= 0xefU) {
+      if (offset + 2U >= version.size()) {
+        return false;
+      }
+      const auto second = static_cast<unsigned char>(version[offset + 1U]);
+      const auto third = static_cast<unsigned char>(version[offset + 2U]);
+      if (!continuation(second) || !continuation(third) ||
+          (first == 0xe0U && second < 0xa0U) ||
+          (first == 0xedU && second > 0x9fU)) {
+        return false;
+      }
+      offset += 3U;
+      continue;
+    }
+    if (first >= 0xf0U && first <= 0xf4U) {
+      if (offset + 3U >= version.size()) {
+        return false;
+      }
+      const auto second = static_cast<unsigned char>(version[offset + 1U]);
+      const auto third = static_cast<unsigned char>(version[offset + 2U]);
+      const auto fourth = static_cast<unsigned char>(version[offset + 3U]);
+      if (!continuation(second) || !continuation(third) ||
+          !continuation(fourth) || (first == 0xf0U && second < 0x90U) ||
+          (first == 0xf4U && second > 0x8fU)) {
+        return false;
+      }
+      offset += 4U;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+[[nodiscard]] auto validate_tos_identity(std::string_view handle,
+                                         std::string_view version)
+    -> std::expected<void, Error> {
+  if (!valid_handle(handle)) {
+    return std::unexpected(invalid_identifier(
+        "TOS user violates the M1 handle grammar or is reserved"));
+  }
+  if (!valid_tos_version(version)) {
+    return std::unexpected(invalid_identifier(
+        "TOS version must contain 1 to 128 bytes of valid UTF-8 and no "
+        "controls"));
+  }
+  return {};
+}
+
 [[nodiscard]] auto valid_sha256_hex(std::string_view value) -> bool {
   if (value.size() != 64) {
     return false;
@@ -377,6 +453,38 @@ auto Store::provision_local_credential(
     return std::unexpected(valid.error());
   }
   return provision_local_credential_impl(transaction, provision);
+}
+
+auto Store::has_tos_acceptance(Transaction &transaction,
+                               std::string_view user_handle,
+                               std::string_view tos_version)
+    -> std::expected<bool, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (auto valid = validate_tos_identity(user_handle, tos_version); !valid) {
+    return std::unexpected(valid.error());
+  }
+  return has_tos_acceptance_impl(transaction, user_handle, tos_version);
+}
+
+auto Store::accept_tos(Transaction &transaction,
+                       const TosAcceptance &acceptance)
+    -> std::expected<UserStatus, Error> {
+  if (transaction_backend(transaction) == nullptr) {
+    return std::unexpected(inactive_transaction_error());
+  }
+  if (transaction.mode() != TransactionMode::read_write) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state,
+              "TOS acceptance requires a write transaction"});
+  }
+  if (auto valid =
+          validate_tos_identity(acceptance.user_handle, acceptance.tos_version);
+      !valid) {
+    return std::unexpected(valid.error());
+  }
+  return accept_tos_impl(transaction, acceptance);
 }
 
 auto Store::claim_invite(Transaction &transaction, const InviteClaim &claim)

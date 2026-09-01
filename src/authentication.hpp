@@ -16,6 +16,7 @@ enum class IdentityKind {
   guest,
   registration,
   pending,
+  tos_required,
   active,
 };
 
@@ -31,6 +32,11 @@ struct SessionIdentity {
   IdentityKind kind{IdentityKind::guest};
   std::string handle;
   PublicKeyMaterial key;
+
+  [[nodiscard]] auto can_read() const noexcept -> bool {
+    return kind == IdentityKind::guest || kind == IdentityKind::tos_required ||
+           kind == IdentityKind::active;
+  }
 
   [[nodiscard]] auto can_write() const noexcept -> bool {
     return kind == IdentityKind::active;
@@ -59,12 +65,17 @@ enum class AuthenticationError {
 [[nodiscard]] auto canonical_public_key(ssh_key key)
     -> std::expected<PublicKeyMaterial, AuthenticationError>;
 [[nodiscard]] auto resolve_public_key(store::Store &store,
-                                      const PublicKeyMaterial &key)
+                                      const PublicKeyMaterial &key,
+                                      std::string_view tos_version)
     -> std::expected<SessionIdentity, AuthenticationError>;
 [[nodiscard]] auto provision_pending_identity(
     store::Store &store, const SessionIdentity &identity, std::string handle,
     store::UtcEpochSeconds now,
     std::optional<std::string_view> invite_code = std::nullopt)
+    -> std::expected<SessionIdentity, AuthenticationError>;
+[[nodiscard]] auto
+accept_current_tos(store::Store &store, const SessionIdentity &identity,
+                   std::string_view tos_version, store::UtcEpochSeconds now)
     -> std::expected<SessionIdentity, AuthenticationError>;
 [[nodiscard]] auto hash_invite_code(std::string_view code)
     -> std::expected<std::string, AuthenticationError>;

@@ -35,6 +35,8 @@ def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
             "--idle-warning-seconds", str(warning),
             "--session-cap-seconds", str(cap),
             "--database", str(host_key.with_name(f"anvil-{port}.db")),
+            "--tos-version", "v1",
+            "--tos-file", str(client_key.with_name("tos.txt")),
             "--host-key", str(host_key),
             "--authorized-key", f"tester={client_key}.pub",
         ],
@@ -42,6 +44,8 @@ def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
         stderr=subprocess.PIPE,
     )
     wait_until_listening(process)
+    accepted = shell_session(ssh_command(port, client_key), b"ACCEPT\n\x1b")
+    assert b"Current terms accepted" in accepted.stdout, accepted.stdout
     return process
 
 
@@ -114,6 +118,7 @@ def main() -> int:
         directory = pathlib.Path(directory_name)
         host_key = directory / "host_key"
         client_key = directory / "client_key"
+        (directory / "tos.txt").write_text("Test terms\n", encoding="utf-8")
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
                      "-f", str(client_key)])
 

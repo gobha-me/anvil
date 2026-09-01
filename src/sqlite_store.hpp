@@ -83,6 +83,13 @@ private:
   provision_local_credential_impl(Transaction &transaction,
                                   const LocalCredentialProvision &provision)
       -> std::expected<void, Error> final;
+  [[nodiscard]] auto has_tos_acceptance_impl(Transaction &transaction,
+                                             std::string_view user_handle,
+                                             std::string_view tos_version)
+      -> std::expected<bool, Error> final;
+  [[nodiscard]] auto accept_tos_impl(Transaction &transaction,
+                                     const TosAcceptance &acceptance)
+      -> std::expected<UserStatus, Error> final;
   [[nodiscard]] auto claim_invite_impl(Transaction &transaction,
                                        const InviteClaim &claim)
       -> std::expected<void, Error> final;

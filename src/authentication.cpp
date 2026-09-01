@@ -183,7 +183,8 @@ auto canonical_public_key(ssh_key key)
   };
 }
 
-auto resolve_public_key(store::Store &store, const PublicKeyMaterial &key)
+auto resolve_public_key(store::Store &store, const PublicKeyMaterial &key,
+                        std::string_view tos_version)
     -> std::expected<SessionIdentity, AuthenticationError> {
   auto transaction = store.begin(store::TransactionMode::read_only);
   if (!transaction) {
@@ -192,6 +193,16 @@ auto resolve_public_key(store::Store &store, const PublicKeyMaterial &key)
   auto record = store.find_local_credential(*transaction, key.fingerprint);
   if (!record) {
     return std::unexpected(authentication_error(record.error()));
+  }
+  std::optional<bool> accepted;
+  if (record->has_value() &&
+      (*record)->status == store::CredentialStatus::active) {
+    auto current =
+        store.has_tos_acceptance(*transaction, (*record)->handle, tos_version);
+    if (!current) {
+      return std::unexpected(authentication_error(current.error()));
+    }
+    accepted = *current;
   }
   if (auto committed = transaction->commit(); !committed) {
     return std::unexpected(authentication_error(committed.error()));
@@ -208,10 +219,42 @@ auto resolve_public_key(store::Store &store, const PublicKeyMaterial &key)
         .kind = IdentityKind::pending, .handle = (*record)->handle, .key = key};
   }
   if ((*record)->status == store::CredentialStatus::active) {
-    return SessionIdentity{
-        .kind = IdentityKind::active, .handle = (*record)->handle, .key = key};
+    return SessionIdentity{.kind = *accepted ? IdentityKind::active
+                                             : IdentityKind::tos_required,
+                           .handle = (*record)->handle,
+                           .key = key};
   }
   return std::unexpected(AuthenticationError::denied);
+}
+
+auto accept_current_tos(store::Store &store, const SessionIdentity &identity,
+                        std::string_view tos_version,
+                        store::UtcEpochSeconds now)
+    -> std::expected<SessionIdentity, AuthenticationError> {
+  if ((identity.kind != IdentityKind::pending &&
+       identity.kind != IdentityKind::tos_required) ||
+      identity.handle.empty()) {
+    return std::unexpected(AuthenticationError::denied);
+  }
+  auto transaction = store.begin(store::TransactionMode::read_write);
+  if (!transaction) {
+    return std::unexpected(authentication_error(transaction.error()));
+  }
+  auto accepted = store.accept_tos(
+      *transaction,
+      store::TosAcceptance{.user_handle = identity.handle,
+                           .tos_version = std::string(tos_version),
+                           .accepted_at = now});
+  if (!accepted || *accepted != store::UserStatus::active) {
+    return std::unexpected(accepted ? AuthenticationError::unavailable
+                                    : authentication_error(accepted.error()));
+  }
+  if (auto committed = transaction->commit(); !committed) {
+    return std::unexpected(authentication_error(committed.error()));
+  }
+  auto result = identity;
+  result.kind = IdentityKind::active;
+  return result;
 }
 
 auto provision_pending_identity(store::Store &store,

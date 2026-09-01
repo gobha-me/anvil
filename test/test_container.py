@@ -173,6 +173,10 @@ def assert_compose_posture(configuration: dict[str, object], inspection: dict[st
         isinstance(secret, dict) and secret.get("source") == "authorized_key" for secret in secrets
     ):
         raise AssertionError("Compose does not mount the authorized key as a secret")
+    if not any(
+        isinstance(secret, dict) and secret.get("source") == "tos_text" for secret in secrets
+    ):
+        raise AssertionError("Compose does not mount the TOS text as a secret")
     command = service.get("command")
     if not isinstance(command, list) or not any(
         isinstance(argument, str) and argument.endswith("=/run/secrets/authorized_key")
@@ -183,6 +187,10 @@ def assert_compose_posture(configuration: dict[str, object], inspection: dict[st
         raise AssertionError("Compose does not keep the health listener on loopback")
     if "--backup-directory" not in command or "/var/lib/anvil/backups" not in command:
         raise AssertionError("Compose does not keep backups on the persistent volume")
+    if "--tos-version" not in command or "--tos-file" not in command:
+        raise AssertionError("Compose does not configure the versioned TOS")
+    if command[command.index("--tos-file") + 1] != "/run/secrets/tos_text":
+        raise AssertionError("Compose does not read TOS text from its secret mount")
     invite_defaults = {
         "--invites-per-user": "5",
         "--invite-regeneration-seconds": "2592000",
@@ -244,7 +252,9 @@ def assert_ssh_session(port: int, user: str) -> None:
         "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
         f"{user}@127.0.0.1",
     ]
-    result = run(command, check=False, input_bytes=b"container-smoke\x1b", timeout=15)
+    result = run(
+        command, check=False, input_bytes=b"ACCEPT\ncontainer-smoke\x1b", timeout=15
+    )
     if b"container-smoke" not in result.stdout:
         raise AssertionError(
             f"SSH smoke test did not echo input\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
@@ -282,12 +292,16 @@ def main(runtime_target: str = "runtime") -> int:
         image_context.mkdir()
         (image_context / "Dockerfile").write_text(
             f"FROM {RUNTIME_IMAGE}\n"
-            "COPY --chown=65532:65532 client_key.pub /run/anvil-test-authorized-key\n",
+            "COPY --chown=65532:65532 client_key.pub /run/anvil-test-authorized-key\n"
+            "COPY --chown=65532:65532 tos.txt /run/anvil-test-tos\n",
             encoding="utf-8",
         )
         (image_context / "client_key.pub").write_bytes(
             private_key.with_suffix(".pub").read_bytes()
         )
+        (image_context / "tos.txt").write_text("Test terms\n", encoding="utf-8")
+        tos_file = directory / "tos.txt"
+        tos_file.write_text("Test terms\n", encoding="utf-8")
         run(["docker", "build", "--tag", COMPOSE_TEST_IMAGE, str(image_context)], timeout=120)
 
         ssh_context = directory / "ssh-client"
@@ -313,6 +327,10 @@ def main(runtime_target: str = "runtime") -> int:
             "      - '2222'\n"
             "      - --database\n"
             "      - /var/lib/anvil/anvil.db\n"
+            "      - --tos-version\n"
+            "      - v1\n"
+            "      - --tos-file\n"
+            "      - /run/anvil-test-tos\n"
             "      - --backup-directory\n"
             "      - /var/lib/anvil/backups\n"
             "      - --backup-interval-seconds\n"
@@ -329,6 +347,8 @@ def main(runtime_target: str = "runtime") -> int:
         env = os.environ.copy()
         env.update({
             "ANVIL_AUTHORIZED_KEY": str(private_key) + ".pub",
+            "ANVIL_TOS_FILE": str(tos_file),
+            "ANVIL_TOS_VERSION": "v1",
             "ANVIL_IMAGE_TAG": "container-test",
             "ANVIL_PORT": "0",
             "ANVIL_USER": "container-test",

@@ -18,9 +18,9 @@ constexpr std::string_view invite_hash =
 
 } // namespace
 
-TEST_CASE("unknown, pending, and active keys resolve to explicit identities") {
+TEST_CASE("unknown, pending, TOS-gated, and active keys resolve explicitly") {
   anvil::testing::MemoryStore store;
-  auto unknown = anvil::server::resolve_public_key(store, alice_key);
+  auto unknown = anvil::server::resolve_public_key(store, alice_key, "v1");
   REQUIRE(unknown.has_value());
   CHECK(unknown->kind == IdentityKind::registration);
   CHECK_FALSE(unknown->can_write());
@@ -30,7 +30,8 @@ TEST_CASE("unknown, pending, and active keys resolve to explicit identities") {
   REQUIRE(pending.has_value());
   CHECK(pending->kind == IdentityKind::pending);
   CHECK_FALSE(pending->can_write());
-  auto resolved_pending = anvil::server::resolve_public_key(store, alice_key);
+  auto resolved_pending =
+      anvil::server::resolve_public_key(store, alice_key, "v1");
   REQUIRE(resolved_pending.has_value());
   CHECK(resolved_pending->kind == IdentityKind::pending);
 
@@ -40,11 +41,20 @@ TEST_CASE("unknown, pending, and active keys resolve to explicit identities") {
       anvil::server::bootstrap_active_identity(
           store, "operator", operator_key, anvil::store::UtcEpochSeconds{11})
           .has_value());
-  auto active = anvil::server::resolve_public_key(store, operator_key);
+  auto gated = anvil::server::resolve_public_key(store, operator_key, "v1");
+  REQUIRE(gated.has_value());
+  CHECK(gated->kind == IdentityKind::tos_required);
+  CHECK(gated->handle == "operator");
+  CHECK(gated->can_read());
+  CHECK_FALSE(gated->can_write());
+  auto accepted = anvil::server::accept_current_tos(
+      store, *gated, "v1", anvil::store::UtcEpochSeconds{12});
+  REQUIRE(accepted.has_value());
+  CHECK(accepted->kind == IdentityKind::active);
+  CHECK(accepted->can_write());
+  auto active = anvil::server::resolve_public_key(store, operator_key, "v1");
   REQUIRE(active.has_value());
   CHECK(active->kind == IdentityKind::active);
-  CHECK(active->handle == "operator");
-  CHECK(active->can_write());
 }
 
 TEST_CASE("invite codes are bounded opaque tokens with stable SHA256 hashes") {
@@ -109,7 +119,8 @@ TEST_CASE("invite registration claims once and rolls back the losing account") {
   REQUIRE_FALSE(refused.has_value());
   CHECK(refused.error() == AuthenticationError::invite_unavailable);
   CHECK(store.invite_claimant(invite_hash) == "alice");
-  const auto unresolved = anvil::server::resolve_public_key(store, bob_key);
+  const auto unresolved =
+      anvil::server::resolve_public_key(store, bob_key, "v1");
   REQUIRE(unresolved.has_value());
   CHECK(unresolved->kind == IdentityKind::registration);
 }
@@ -122,7 +133,8 @@ TEST_CASE("revoked and mismatched credentials fail closed") {
       .public_key = alice_key.public_key,
       .status = anvil::store::CredentialStatus::revoked,
   });
-  const auto revoked = anvil::server::resolve_public_key(store, alice_key);
+  const auto revoked =
+      anvil::server::resolve_public_key(store, alice_key, "v1");
   REQUIRE_FALSE(revoked.has_value());
   CHECK(revoked.error() == AuthenticationError::denied);
 
@@ -133,7 +145,7 @@ TEST_CASE("revoked and mismatched credentials fail closed") {
       .status = anvil::store::CredentialStatus::active,
   });
   const auto mismatched = anvil::server::resolve_public_key(
-      store, {"SHA256:collision", "ssh-ed25519 OFFERED"});
+      store, {"SHA256:collision", "ssh-ed25519 OFFERED"}, "v1");
   REQUIRE_FALSE(mismatched.has_value());
   CHECK(mismatched.error() == AuthenticationError::denied);
 }

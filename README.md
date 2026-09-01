@@ -120,6 +120,8 @@ install -d -m 700 state
   --invite-regeneration-seconds 2592000 \
   --invite-expiration-seconds 604800 \
   --notify-inviters-on-moderation off \
+  --tos-version 2026-09 \
+  --tos-file /run/secrets/anvil_tos \
   --backup-directory state/backups \
   --backup-interval-seconds 86400 \
   --backup-retention-seconds 604800 \
@@ -151,7 +153,13 @@ selection, `invite` requires a valid single-use invite before handle selection,
 and `closed` explains that the board is not accepting registrations while
 preserving guest browsing. The default is `open`, and mode changes affect only
 new registrations. The key and chosen handle are stored as pending; pending
-identities remain gated until versioned TOS acceptance lands in issue #40.
+identities must review the complete operator-supplied TOS and type `ACCEPT`
+before becoming active. Acceptance is append-only and keyed by the operator's
+opaque version string. Changing that version re-gates active users at their
+next connection: they may use `/browse` for read-only access, but posting,
+invite issuance, and every other mutation remain unavailable until they accept
+the current version. Operators must change the version whenever the text
+changes; Anvil compares identifiers and does not interpret legal text.
 There is no email or recovery address: losing every registered key loses the
 account.
 
@@ -265,6 +273,8 @@ server, then start the default egress-closed deployment:
 ```sh
 export ANVIL_AUTHORIZED_KEY="$PWD/demo_ed25519.pub"
 export ANVIL_USER=demo
+export ANVIL_TOS_VERSION=2026-09
+export ANVIL_TOS_FILE="$PWD/tos.txt"
 docker compose up --build --detach
 ssh -p 2222 demo@127.0.0.1
 ```
@@ -279,6 +289,10 @@ ssh -p 2222 demo@127.0.0.1
 control invite economics. `ANVIL_NOTIFY_INVITERS_ON_MODERATION` accepts `on`
 or `off` and defaults to `off`; issue #55 will consume that privacy-sensitive
 policy when moderation actions and user notifications exist.
+`ANVIL_TOS_VERSION` and `ANVIL_TOS_FILE` are required: Compose mounts the
+UTF-8 text as a read-only secret, and Anvil exits before opening its listeners
+if either setting or the bounded text file is invalid. No TOS text or default
+jurisdiction ships with Anvil.
 
 The default Docker bridge disables IP masquerading, so sessions and future
 plugins have no outbound Internet route while the published SSH port remains

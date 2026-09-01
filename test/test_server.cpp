@@ -13,11 +13,25 @@ TEST_CASE("server CLI requires a host key") {
                   std::runtime_error);
 }
 
+TEST_CASE("server CLI requires both TOS version and file in serve mode") {
+  const std::array host_only{std::string_view{"--host-key"},
+                             std::string_view{"host_key"}};
+  CHECK_THROWS_AS(anvil::server::parse_arguments(host_only),
+                  std::runtime_error);
+
+  const std::array version_only{
+      std::string_view{"--host-key"}, std::string_view{"host_key"},
+      std::string_view{"--tos-version"}, std::string_view{"v1"}};
+  CHECK_THROWS_AS(anvil::server::parse_arguments(version_only),
+                  std::runtime_error);
+}
+
 TEST_CASE("server CLI permits guest and registration service without bootstrap "
           "keys") {
   const std::array arguments{
-      std::string_view{"--host-key"},
-      std::string_view{"host_key"},
+      std::string_view{"--host-key"},    std::string_view{"host_key"},
+      std::string_view{"--tos-version"}, std::string_view{"v1"},
+      std::string_view{"--tos-file"},    std::string_view{"tos.txt"},
   };
   const auto parsed = anvil::server::parse_arguments(arguments);
   CHECK(parsed.config.authorized_keys.empty());
@@ -45,6 +59,10 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
       std::string_view{"120"},
       std::string_view{"--notify-inviters-on-moderation"},
       std::string_view{"on"},
+      std::string_view{"--tos-version"},
+      std::string_view{"2026-09"},
+      std::string_view{"--tos-file"},
+      std::string_view{"state/tos.txt"},
       std::string_view{"--max-sessions"},
       std::string_view{"12"},
       std::string_view{"--max-sessions-per-ip"},
@@ -93,6 +111,8 @@ TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
   CHECK(parsed.config.invite_policy.regeneration == std::chrono::seconds(60));
   CHECK(parsed.config.invite_policy.expiration == std::chrono::seconds(120));
   CHECK(parsed.config.invite_policy.notify_inviters_on_moderation);
+  CHECK(parsed.config.tos_version == "2026-09");
+  CHECK(parsed.config.tos_file == "state/tos.txt");
   CHECK(parsed.config.max_sessions == 12);
   CHECK(parsed.config.max_sessions_per_ip == 3);
   CHECK(parsed.config.connection_rate.count == 20);
@@ -120,6 +140,10 @@ TEST_CASE("server CLI rejects malformed hostile values") {
     const std::array arguments{
         std::string_view{"--host-key"},
         std::string_view{"host_key"},
+        std::string_view{"--tos-version"},
+        std::string_view{"v1"},
+        std::string_view{"--tos-file"},
+        std::string_view{"tos.txt"},
         std::string_view{"--authorized-key"},
         std::string_view{"user=key.pub"},
         option,
@@ -153,6 +177,12 @@ TEST_CASE("server CLI rejects malformed hostile values") {
                   std::runtime_error);
   CHECK_THROWS_AS(parse("--notify-inviters-on-moderation", "yes"),
                   std::runtime_error);
+  CHECK_THROWS_AS(parse("--tos-version", std::string_view{"bad\xff", 4}),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--tos-version", std::string_view{"v\xc2\x85", 3}),
+                  std::runtime_error);
+  CHECK_THROWS_AS(parse("--tos-version", std::string(129, 'v')),
+                  std::runtime_error);
   CHECK_THROWS_AS(
       parse("--max-tracked-ips", "18446744073709551616000000000000000000"),
       std::runtime_error);
@@ -179,10 +209,10 @@ TEST_CASE("server CLI rejects malformed hostile values") {
 
 TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   const std::array required{
-      std::string_view{"--host-key"},
-      std::string_view{"host_key"},
-      std::string_view{"--authorized-key"},
-      std::string_view{"user=key.pub"},
+      std::string_view{"--host-key"},       std::string_view{"host_key"},
+      std::string_view{"--tos-version"},    std::string_view{"v1"},
+      std::string_view{"--tos-file"},       std::string_view{"tos.txt"},
+      std::string_view{"--authorized-key"}, std::string_view{"user=key.pub"},
   };
   const auto parsed = anvil::server::parse_arguments(required);
   CHECK(parsed.config.idle_timeout.count() == 300);
@@ -219,6 +249,10 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   const std::array invalid{
       std::string_view{"--host-key"},
       std::string_view{"host_key"},
+      std::string_view{"--tos-version"},
+      std::string_view{"v1"},
+      std::string_view{"--tos-file"},
+      std::string_view{"tos.txt"},
       std::string_view{"--authorized-key"},
       std::string_view{"user=key.pub"},
       std::string_view{"--idle-timeout-seconds"},
@@ -231,6 +265,10 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   const std::array invalid_cross_field{
       std::string_view{"--host-key"},
       std::string_view{"host_key"},
+      std::string_view{"--tos-version"},
+      std::string_view{"v1"},
+      std::string_view{"--tos-file"},
+      std::string_view{"tos.txt"},
       std::string_view{"--authorized-key"},
       std::string_view{"user=key.pub"},
       std::string_view{"--max-sessions"},
@@ -243,6 +281,8 @@ TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
 
   const std::array conflicting_ports{
       std::string_view{"--host-key"},       std::string_view{"host_key"},
+      std::string_view{"--tos-version"},    std::string_view{"v1"},
+      std::string_view{"--tos-file"},       std::string_view{"tos.txt"},
       std::string_view{"--authorized-key"}, std::string_view{"user=key.pub"},
       std::string_view{"--port"},           std::string_view{"8080"},
   };
@@ -254,6 +294,10 @@ TEST_CASE("server CLI separates scheduled and offline backup modes") {
   const std::array scheduled{
       std::string_view{"--host-key"},
       std::string_view{"host_key"},
+      std::string_view{"--tos-version"},
+      std::string_view{"v1"},
+      std::string_view{"--tos-file"},
+      std::string_view{"tos.txt"},
       std::string_view{"--authorized-key"},
       std::string_view{"user=key.pub"},
       std::string_view{"--backup-directory"},
@@ -303,6 +347,21 @@ TEST_CASE("server CLI separates scheduled and offline backup modes") {
   CHECK_THROWS_AS(anvil::server::parse_arguments(maintenance_invites),
                   std::runtime_error);
 
+  const std::array maintenance_tos{
+      std::string_view{"--backup-now"},
+      std::string_view{"backups"},
+      std::string_view{"--database"},
+      std::string_view{"state/anvil.db"},
+      std::string_view{"--host-key"},
+      std::string_view{"state/host_key"},
+      std::string_view{"--tos-version"},
+      std::string_view{"v1"},
+      std::string_view{"--tos-file"},
+      std::string_view{"tos.txt"},
+  };
+  CHECK_THROWS_AS(anvil::server::parse_arguments(maintenance_tos),
+                  std::runtime_error);
+
   const std::array restore{
       std::string_view{"--restore-backup"}, std::string_view{"snapshot"},
       std::string_view{"--database"},       std::string_view{"state/anvil.db"},
@@ -323,6 +382,10 @@ TEST_CASE("server CLI separates scheduled and offline backup modes") {
   const std::array schedule_without_directory{
       std::string_view{"--host-key"},
       std::string_view{"host_key"},
+      std::string_view{"--tos-version"},
+      std::string_view{"v1"},
+      std::string_view{"--tos-file"},
+      std::string_view{"tos.txt"},
       std::string_view{"--authorized-key"},
       std::string_view{"user=key.pub"},
       std::string_view{"--backup-retention-seconds"},
@@ -338,6 +401,7 @@ TEST_CASE("server CLI help does not require operational arguments") {
   CHECK(parsed.show_help);
   CHECK(anvil::server::usage().find("--registration-mode") !=
         std::string_view::npos);
+  CHECK(anvil::server::usage().find("--tos-version") != std::string_view::npos);
 }
 
 TEST_CASE("SSH terminal dimensions bound hostile peer claims") {

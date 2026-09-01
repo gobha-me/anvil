@@ -52,6 +52,22 @@ constexpr std::array kUserTextPolicies{
 
 } // namespace
 
+auto is_well_formed_utf8(std::string_view input) noexcept -> bool {
+  std::size_t offset = 0;
+  while (offset < input.size()) {
+    utf8proc_int32_t codepoint = 0;
+    const auto remaining = input.substr(offset);
+    const auto width = utf8proc_iterate(
+        reinterpret_cast<const utf8proc_uint8_t *>(remaining.data()),
+        static_cast<utf8proc_ssize_t>(remaining.size()), &codepoint);
+    if (width <= 0) {
+      return false;
+    }
+    offset += static_cast<std::size_t>(width);
+  }
+  return true;
+}
+
 auto prepare_user_text_for_ingest(UserTextField field, RemoteBytes remote_input)
     -> std::expected<std::string, UserTextError> {
   const auto input = remote_input.text();

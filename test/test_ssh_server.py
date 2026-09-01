@@ -51,7 +51,9 @@ def wait_until_listening(process: subprocess.Popen[bytes]) -> None:
 def server_command(executable: pathlib.Path, port: int, host_key: pathlib.Path,
                    client_key: pathlib.Path, *,
                    database: pathlib.Path | None = None,
-                   registration_mode: str = "open") -> list[str]:
+                   registration_mode: str = "open",
+                   tos_version: str = "v1",
+                   tos_file: pathlib.Path | None = None) -> list[str]:
     command = [
         str(executable),
         "--bind-address", "127.0.0.1",
@@ -59,10 +61,13 @@ def server_command(executable: pathlib.Path, port: int, host_key: pathlib.Path,
         "--health-port", str(reserve_port()),
         "--max-sessions", "8",
         "--max-sessions-per-ip", "8",
+        "--session-cpu-burst-ms", "500",
         "--connection-rate-limit", "1000/1",
         "--auth-attempt-rate-limit", "1000/1",
         "--database", str(database or client_key.with_name(f"anvil-{port}.db")),
         "--registration-mode", registration_mode,
+        "--tos-version", tos_version,
+        "--tos-file", str(tos_file or client_key.with_name("tos.txt")),
         "--host-key", str(host_key),
         "--authorized-key", f"tester={client_key}.pub",
     ]
@@ -72,14 +77,30 @@ def server_command(executable: pathlib.Path, port: int, host_key: pathlib.Path,
 def start_server(executable: pathlib.Path, port: int, host_key: pathlib.Path,
                  client_key: pathlib.Path, *,
                  database: pathlib.Path | None = None,
-                 registration_mode: str = "open") -> subprocess.Popen[bytes]:
+                 registration_mode: str = "open", tos_version: str = "v1",
+                 accept_bootstrap: bool = True,
+                 tos_file: pathlib.Path | None = None) -> subprocess.Popen[bytes]:
+    database_path = database or client_key.with_name(f"anvil-{port}.db")
     process = subprocess.Popen(
         server_command(executable, port, host_key, client_key,
-                       database=database, registration_mode=registration_mode),
+                       database=database_path, registration_mode=registration_mode,
+                       tos_version=tos_version, tos_file=tos_file),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     wait_until_listening(process)
+    if accept_bootstrap:
+        with sqlite3.connect(database_path) as connection:
+            already_accepted = connection.execute(
+                "SELECT 1 FROM tos_acceptances "
+                "WHERE user_handle='tester' AND user_origin IS NULL "
+                "AND tos_version=?",
+                (tos_version,),
+            ).fetchone()
+        if already_accepted is None:
+            accepted = shell_session(ssh_command(port, client_key), b"ACCEPT\n\x1b")
+            assert accepted.returncode == 0, accepted
+            assert b"Current terms accepted" in accepted.stdout, accepted.stdout
     return process
 
 
@@ -176,6 +197,11 @@ def main() -> int:
         wrong_key = directory / "wrong_key"
         invite_key = directory / "invite_key"
         losing_invite_key = directory / "losing_invite_key"
+        tos_file = directory / "tos.txt"
+        tos_file.write_text(
+            "Anvil test terms\n\nUse this board responsibly.\n",
+            encoding="utf-8",
+        )
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(client_key)])
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(wrong_key)])
         run_checked(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(invite_key)])
@@ -186,6 +212,42 @@ def main() -> int:
                      "-f", str(provided_host_key)])
         invalid_command = server_command(
             executable, reserve_port(), provided_host_key, client_key
+        )
+
+        empty_tos = directory / "empty-tos.txt"
+        empty_tos.write_bytes(b"")
+        assert_refused(
+            server_command(executable, reserve_port(), provided_host_key,
+                           client_key, tos_file=empty_tos),
+            b"must contain 1 to 262144 bytes",
+        )
+        invalid_tos = directory / "invalid-tos.txt"
+        invalid_tos.write_bytes(b"terms\xff")
+        assert_refused(
+            server_command(executable, reserve_port(), provided_host_key,
+                           client_key, tos_file=invalid_tos),
+            b"not valid UTF-8",
+        )
+        hidden_tos = directory / "hidden-tos.txt"
+        hidden_tos.write_bytes(b"\x1b[31m\x1b[0m")
+        assert_refused(
+            server_command(executable, reserve_port(), provided_host_key,
+                           client_key, tos_file=hidden_tos),
+            b"has no visible text",
+        )
+        oversized_tos = directory / "oversized-tos.txt"
+        oversized_tos.write_bytes(b"x" * (256 * 1024 + 1))
+        assert_refused(
+            server_command(executable, reserve_port(), provided_host_key,
+                           client_key, tos_file=oversized_tos),
+            b"must contain 1 to 262144 bytes",
+        )
+        linked_tos = directory / "linked-tos.txt"
+        linked_tos.symlink_to(tos_file.name)
+        assert_refused(
+            server_command(executable, reserve_port(), provided_host_key,
+                           client_key, tos_file=linked_tos),
+            b"cannot open TOS file",
         )
 
         original_key = provided_host_key.read_bytes()
@@ -253,6 +315,7 @@ def main() -> int:
         linked_key.symlink_to(f"{client_key}.pub")
         assert_refused(
             [str(executable), "--database", str(directory / "linked-key.db"),
+             "--tos-version", "v1", "--tos-file", str(tos_file),
              "--host-key", str(provided_host_key),
              "--authorized-key", f"tester={linked_key}"],
             b"cannot open key file",
@@ -349,12 +412,17 @@ def main() -> int:
 
             registering = shell_session(ssh_command(port, wrong_key), b"new_user\n")
             assert registering.returncode == 0, registering
-            assert b"Registration pending for new_user" in registering.stdout, registering.stdout
+            assert b"Terms of service v1" in registering.stdout, registering.stdout
 
-            pending = shell_session(ssh_command(port, wrong_key), b"ignored\n")
+            pending = shell_session(ssh_command(port, wrong_key), b"\x1b")
             assert pending.returncode == 0, pending
-            assert b"Registration pending for new_user" in pending.stdout, pending.stdout
-            assert b"ignored" not in pending.stdout, pending.stdout
+            assert b"Type ACCEPT to complete registration" in pending.stdout, pending.stdout
+
+            accepted_registration = shell_session(
+                ssh_command(port, wrong_key), b"ACCEPT\n\x1b"
+            )
+            assert accepted_registration.returncode == 0, accepted_registration
+            assert b"Signed in as new_user" in accepted_registration.stdout
 
             with sqlite3.connect(database) as connection:
                 connection.execute(
@@ -365,6 +433,32 @@ def main() -> int:
             assert b"revoked" not in revoked.stdout, revoked.stdout
         finally:
             stop_server(process)
+
+        regated_port = reserve_port()
+        regated = start_server(
+            executable, regated_port, host_key, client_key,
+            database=database, tos_version="v2", accept_bootstrap=False,
+        )
+        try:
+            gate = shell_session(ssh_command(regated_port, client_key), b"\x1b")
+            assert b"Terms of service v2" in gate.stdout, gate.stdout
+            browse = shell_session(
+                ssh_command(regated_port, client_key), b"/browse\n/invite\n\x1b"
+            )
+            assert b"TOS changed: read-only" in browse.stdout, browse.stdout
+            assert b"Accept the current TOS before using write actions" in browse.stdout
+            assert b"Invite:" not in browse.stdout
+            accepted_v2 = shell_session(
+                ssh_command(regated_port, client_key), b"ACCEPT\n\x1b"
+            )
+            assert b"Signed in as tester" in accepted_v2.stdout, accepted_v2.stdout
+        finally:
+            stop_server(regated)
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT tos_version FROM tos_acceptances "
+                "WHERE user_handle='tester' ORDER BY tos_version"
+            ).fetchall() == [("v1",), ("v2",)]
 
         closed_port = reserve_port()
         closed = start_server(
@@ -412,10 +506,10 @@ def main() -> int:
         try:
             invited = shell_session(
                 ssh_command(invite_port, invite_key),
-                b"invite-123\ninvited_user\n",
+                b"invite-123\ninvited_user\nACCEPT\n\x1b",
             )
             assert invited.returncode == 0, invited
-            assert b"Registration pending for invited_user" in invited.stdout
+            assert b"Signed in as invited_user" in invited.stdout
 
             losing = shell_session(
                 ssh_command(invite_port, losing_invite_key),

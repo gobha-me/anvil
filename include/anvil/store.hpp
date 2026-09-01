@@ -110,6 +110,14 @@ struct LocalCredentialProvision {
       -> bool = default;
 };
 
+struct TosAcceptance {
+  std::string user_handle;
+  std::string tos_version;
+  UtcEpochSeconds accepted_at;
+
+  [[nodiscard]] auto operator==(const TosAcceptance &) const -> bool = default;
+};
+
 struct InviteClaim {
   std::string code_hash;
   std::string claimed_by_handle;
@@ -255,6 +263,18 @@ public:
                              const LocalCredentialProvision &provision)
       -> std::expected<void, Error>;
 
+  // TOS versions are opaque exact-match identifiers. Recording acceptance is
+  // append-only and promotes a pending local account to active in the same
+  // write transaction. Repeating the same acceptance is idempotent and keeps
+  // the original timestamp.
+  [[nodiscard]] auto has_tos_acceptance(Transaction &transaction,
+                                        std::string_view user_handle,
+                                        std::string_view tos_version)
+      -> std::expected<bool, Error>;
+  [[nodiscard]] auto accept_tos(Transaction &transaction,
+                                const TosAcceptance &acceptance)
+      -> std::expected<UserStatus, Error>;
+
   // Invite redemption participates in the caller's write transaction so a
   // pending account and its single-use invite become visible together. The
   // raw bearer code never reaches the storage boundary.
@@ -318,6 +338,12 @@ protected:
   provision_local_credential_impl(Transaction &transaction,
                                   const LocalCredentialProvision &provision)
       -> std::expected<void, Error> = 0;
+  [[nodiscard]] virtual auto has_tos_acceptance_impl(
+      Transaction &transaction, std::string_view user_handle,
+      std::string_view tos_version) -> std::expected<bool, Error> = 0;
+  [[nodiscard]] virtual auto accept_tos_impl(Transaction &transaction,
+                                             const TosAcceptance &acceptance)
+      -> std::expected<UserStatus, Error> = 0;
   [[nodiscard]] virtual auto claim_invite_impl(Transaction &transaction,
                                                const InviteClaim &claim)
       -> std::expected<void, Error> = 0;
