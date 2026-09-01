@@ -40,14 +40,19 @@ class AdmissionController {
  public:
   using Clock = std::chrono::steady_clock;
 
-  AdmissionController(std::uint32_t max_sessions, std::uint32_t max_sessions_per_ip,
+  AdmissionController(std::uint32_t max_sessions,
+                      std::uint32_t max_sessions_per_ip,
                       RateLimit connection_rate, RateLimit auth_attempt_rate,
-                      std::uint32_t max_tracked_ips);
+                      std::uint32_t max_tracked_ips,
+                      RateLimit guest_report_rate = RateLimit{
+                          5, std::chrono::seconds(3600)});
 
   [[nodiscard]] AdmissionDecision admit(const PeerAddress &peer, Clock::time_point now);
   void release(const PeerAddress &peer, Clock::time_point now) noexcept;
   void denied_auth_attempt(const PeerAddress &peer, Clock::time_point now) noexcept;
   void exhaust_auth_attempts(const PeerAddress &peer, Clock::time_point now) noexcept;
+  [[nodiscard]] bool consume_guest_report(const PeerAddress &peer,
+                                          Clock::time_point now) noexcept;
 
   [[nodiscard]] std::size_t active_sessions() const noexcept { return active_sessions_; }
   [[nodiscard]] std::size_t tracked_ips() const noexcept { return peers_.size(); }
@@ -71,12 +76,16 @@ class AdmissionController {
   };
 
   struct PeerState {
-    PeerState(RateLimit connection_rate, RateLimit auth_attempt_rate, Clock::time_point now)
-        : connections(connection_rate, now), auth_attempts(auth_attempt_rate, now),
-          last_seen(now) {}
+    PeerState(RateLimit connection_rate, RateLimit auth_attempt_rate,
+              RateLimit guest_report_rate, Clock::time_point now)
+        : connections(connection_rate, now),
+          auth_attempts(auth_attempt_rate, now),
+          guest_reports(guest_report_rate, now), last_seen(now) {}
 
     TokenBucket connections;
     TokenBucket auth_attempts;
+    TokenBucket guest_reports;
+    bool guest_report_used{};
     Clock::time_point last_seen;
     std::uint32_t active_sessions{};
   };
@@ -89,8 +98,10 @@ class AdmissionController {
   std::uint32_t max_sessions_per_ip_;
   RateLimit connection_rate_;
   RateLimit auth_attempt_rate_;
+  RateLimit guest_report_rate_;
   std::uint32_t max_tracked_ips_;
   std::chrono::seconds idle_retention_;
+  std::chrono::seconds guest_report_retention_;
   PeerMap peers_;
   std::size_t active_sessions_{};
 };

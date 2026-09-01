@@ -394,4 +394,119 @@ CREATE UNIQUE INDEX invites_one_edge_per_account
   WHERE claimed_by_handle IS NOT NULL;
 )sql";
 
+// Version 4 makes board visibility and unread state first-class Store
+// concerns. Existing boards remain public. Message sequence is local ordering
+// metadata only; globally stable message identifiers remain authoritative.
+// Reports are rebuilt so an anonymous guest can report visible content without
+// persisting a network identity or inventing a synthetic account.
+inline constexpr std::string_view message_boards_v4 = R"sql(
+ALTER TABLE boards ADD COLUMN guest_readable INTEGER NOT NULL DEFAULT 1
+  CHECK(guest_readable IN (0, 1));
+
+ALTER TABLE messages ADD COLUMN local_sequence INTEGER NOT NULL DEFAULT 0
+  CHECK(typeof(local_sequence) = 'integer' AND local_sequence >= 0);
+WITH ranked(row_id,sequence) AS (
+  SELECT rowid,row_number() OVER (ORDER BY received_at,message_id)
+  FROM messages
+)
+UPDATE messages
+SET local_sequence = (
+  SELECT sequence FROM ranked WHERE ranked.row_id=messages.rowid
+);
+CREATE UNIQUE INDEX messages_local_sequence ON messages(local_sequence)
+  WHERE local_sequence > 0;
+CREATE TRIGGER messages_assign_local_sequence
+AFTER INSERT ON messages
+WHEN NEW.local_sequence = 0
+BEGIN
+  UPDATE messages
+     SET local_sequence = (
+       SELECT coalesce(max(local_sequence), 0) + 1
+         FROM messages
+        WHERE rowid != NEW.rowid)
+   WHERE rowid = NEW.rowid;
+END;
+
+CREATE TABLE board_reads(
+  user_handle TEXT NOT NULL,
+  user_origin TEXT CHECK(user_origin IS NULL OR
+                         (typeof(user_origin) = 'text' AND
+                          length(user_origin) > 0)),
+  user_origin_key TEXT
+    GENERATED ALWAYS AS (coalesce(user_origin, '')) STORED,
+  board_id TEXT NOT NULL,
+  read_through_sequence INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(read_through_sequence) = 'integer' AND
+          read_through_sequence >= 0),
+  UNIQUE(user_handle, user_origin_key, board_id),
+  FOREIGN KEY(user_handle, user_origin_key)
+    REFERENCES users(handle, origin_key) ON UPDATE CASCADE ON DELETE RESTRICT,
+  FOREIGN KEY(board_id) REFERENCES boards(board_id)
+    ON UPDATE CASCADE ON DELETE RESTRICT
+);
+
+CREATE TABLE thread_reads(
+  user_handle TEXT NOT NULL,
+  user_origin TEXT CHECK(user_origin IS NULL OR
+                         (typeof(user_origin) = 'text' AND
+                          length(user_origin) > 0)),
+  user_origin_key TEXT
+    GENERATED ALWAYS AS (coalesce(user_origin, '')) STORED,
+  board_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  read_through_sequence INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(read_through_sequence) = 'integer' AND
+          read_through_sequence >= 0),
+  UNIQUE(user_handle, user_origin_key, thread_id),
+  FOREIGN KEY(user_handle, user_origin_key)
+    REFERENCES users(handle, origin_key) ON UPDATE CASCADE ON DELETE RESTRICT,
+  FOREIGN KEY(thread_id, board_id) REFERENCES threads(thread_id, board_id)
+    ON UPDATE CASCADE ON DELETE RESTRICT
+);
+
+CREATE TABLE reports_v4(
+  report_id TEXT PRIMARY KEY
+    CHECK(typeof(report_id) = 'text' AND length(report_id) BETWEEN 1 AND 128),
+  reporter_kind TEXT NOT NULL DEFAULT 'registered'
+    CHECK(reporter_kind IN ('registered', 'guest')),
+  reporter_handle TEXT,
+  reporter_origin TEXT CHECK(reporter_origin IS NULL OR
+                             (typeof(reporter_origin) = 'text' AND
+                              length(reporter_origin) > 0)),
+  reporter_origin_key TEXT
+    GENERATED ALWAYS AS (coalesce(reporter_origin, '')) STORED,
+  target_kind TEXT NOT NULL CHECK(typeof(target_kind) = 'text'),
+  target_id TEXT NOT NULL CHECK(typeof(target_id) = 'text'),
+  target_origin TEXT CHECK(target_origin IS NULL OR
+                           (target_kind = 'user' AND
+                            typeof(target_origin) = 'text' AND
+                            length(target_origin) > 0)),
+  target_user_handle TEXT GENERATED ALWAYS AS (
+    CASE WHEN target_kind = 'user' THEN target_id END) STORED,
+  target_user_origin_key TEXT GENERATED ALWAYS AS (
+    CASE WHEN target_kind = 'user' THEN coalesce(target_origin, '') END) STORED,
+  evidence TEXT NOT NULL DEFAULT '' CHECK(typeof(evidence) = 'text'),
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK(status IN ('open', 'resolved', 'tombstoned')),
+  created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer'),
+  resolved_at INTEGER CHECK(resolved_at IS NULL OR
+                            typeof(resolved_at) = 'integer'),
+  CHECK((reporter_kind = 'guest' AND reporter_handle IS NULL AND
+         reporter_origin IS NULL) OR
+        (reporter_kind = 'registered' AND reporter_handle IS NOT NULL)),
+  FOREIGN KEY(reporter_handle, reporter_origin_key)
+    REFERENCES users(handle, origin_key) ON UPDATE CASCADE ON DELETE RESTRICT,
+  FOREIGN KEY(target_user_handle, target_user_origin_key)
+    REFERENCES users(handle, origin_key) ON UPDATE CASCADE ON DELETE RESTRICT
+);
+INSERT INTO reports_v4(
+  report_id, reporter_kind, reporter_handle, reporter_origin, target_kind,
+  target_id, target_origin, evidence, status, created_at, resolved_at)
+SELECT report_id, 'registered', reporter_handle, reporter_origin, target_kind,
+       target_id, target_origin, evidence, status, created_at, resolved_at
+FROM reports;
+DROP TABLE reports;
+ALTER TABLE reports_v4 RENAME TO reports;
+)sql";
+
 } // namespace anvil::store::detail

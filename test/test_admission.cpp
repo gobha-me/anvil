@@ -152,11 +152,31 @@ TEST_CASE("inactive limiter state is bounded and evicted after refill") {
   CHECK(admission.tracked_ips() == 1);
 }
 
+TEST_CASE("anonymous report permits are bounded per peer and refill") {
+  const auto start = AdmissionController::Clock::time_point{};
+  AdmissionController admission(2, 2, RateLimit{10, 10s}, RateLimit{10, 10s}, 4,
+                                RateLimit{2, 100s});
+  const auto first = ipv4("203.0.113.10");
+  const auto second = ipv4("203.0.113.11");
+
+  CHECK_FALSE(admission.consume_guest_report(first, start));
+  REQUIRE(admission.admit(first, start) == AdmissionDecision::allowed);
+  REQUIRE(admission.admit(second, start) == AdmissionDecision::allowed);
+  CHECK(admission.consume_guest_report(first, start));
+  CHECK(admission.consume_guest_report(first, start));
+  CHECK_FALSE(admission.consume_guest_report(first, start));
+  CHECK(admission.consume_guest_report(second, start));
+  CHECK(admission.consume_guest_report(first, start + 50s));
+}
+
 TEST_CASE("admission rejects invalid programmatic configuration") {
   CHECK_THROWS_AS(AdmissionController(0, 1, RateLimit{1, 1s}, RateLimit{1, 1s}, 1),
                   std::invalid_argument);
   CHECK_THROWS_AS(AdmissionController(2, 3, RateLimit{1, 1s}, RateLimit{1, 1s}, 2),
                   std::invalid_argument);
   CHECK_THROWS_AS(AdmissionController(2, 1, RateLimit{1, 1s}, RateLimit{0, 1s}, 2),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(AdmissionController(2, 1, RateLimit{1, 1s}, RateLimit{1, 1s},
+                                      2, RateLimit{0, 1s}),
                   std::invalid_argument);
 }

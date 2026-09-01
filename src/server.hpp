@@ -42,6 +42,15 @@ struct TosPolicy {
       -> bool = default;
 };
 
+struct BoardDeclaration {
+  std::string name;
+  std::string title;
+  bool registered_only{};
+
+  [[nodiscard]] auto operator==(const BoardDeclaration &) const noexcept
+      -> bool = default;
+};
+
 struct Config {
   Operation operation{Operation::serve};
   std::string bind_address{"127.0.0.1"};
@@ -61,6 +70,7 @@ struct Config {
   std::uint32_t max_sessions_per_ip{4};
   RateLimit connection_rate{10, std::chrono::seconds(10)};
   RateLimit auth_attempt_rate{6, std::chrono::seconds(60)};
+  RateLimit guest_report_rate{5, std::chrono::seconds(3600)};
   std::uint32_t max_auth_attempts_per_session{6};
   std::uint32_t max_tracked_ips{4096};
   std::chrono::seconds idle_timeout{300};
@@ -71,6 +81,7 @@ struct Config {
                                          SessionResources &){};
   std::string host_key_path;
   std::vector<AuthorizedKeySpec> authorized_keys;
+  std::vector<BoardDeclaration> boards;
 };
 
 struct ParseResult {

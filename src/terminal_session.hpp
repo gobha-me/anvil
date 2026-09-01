@@ -84,7 +84,8 @@ public:
                   const InvitePolicy &invite_policy,
                   const TosPolicy &tos_policy, SessionIdentity identity,
                   store::Store &identity_store,
-                  SessionInputHook input_hook_for_testing = nullptr);
+                  SessionInputHook input_hook_for_testing = nullptr,
+                  int guest_report_permit_descriptor = -1);
   ~TerminalSession();
 
   TerminalSession(const TerminalSession &) = delete;

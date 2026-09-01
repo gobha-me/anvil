@@ -207,6 +207,54 @@ TEST_CASE("server CLI rejects malformed hostile values") {
   CHECK_THROWS_AS(parse("--unknown", "value"), std::runtime_error);
 }
 
+TEST_CASE("server CLI parses bounded board declarations and guest reports") {
+  const std::array arguments{
+      std::string_view{"--host-key"},
+      std::string_view{"host_key"},
+      std::string_view{"--tos-version"},
+      std::string_view{"v1"},
+      std::string_view{"--tos-file"},
+      std::string_view{"tos.txt"},
+      std::string_view{"--board"},
+      std::string_view{"general=General"},
+      std::string_view{"--member-board"},
+      std::string_view{"staff=Staff room"},
+      std::string_view{"--guest-report-rate-limit"},
+      std::string_view{"7/1800"},
+  };
+  const auto parsed = anvil::server::parse_arguments(arguments);
+  REQUIRE(parsed.config.boards.size() == 2);
+  CHECK(parsed.config.boards[0] ==
+        anvil::server::BoardDeclaration{.name = "general", .title = "General"});
+  CHECK(parsed.config.boards[1] ==
+        anvil::server::BoardDeclaration{
+            .name = "staff", .title = "Staff room", .registered_only = true});
+  CHECK(parsed.config.guest_report_rate.count == 7);
+  CHECK(parsed.config.guest_report_rate.period == std::chrono::seconds(1800));
+
+  const auto parse_board = [](std::string_view option,
+                              std::string_view declaration) {
+    const std::array hostile{std::string_view{"--host-key"},
+                             std::string_view{"host_key"},
+                             std::string_view{"--tos-version"},
+                             std::string_view{"v1"},
+                             std::string_view{"--tos-file"},
+                             std::string_view{"tos.txt"},
+                             option,
+                             declaration};
+    return anvil::server::parse_arguments(hostile);
+  };
+  CHECK_THROWS_AS(parse_board("--board", "General=Title"), std::runtime_error);
+  CHECK_THROWS_AS(parse_board("--board", "general="), std::runtime_error);
+  CHECK_THROWS_AS(parse_board("--member-board", "general=bad\nline"),
+                  std::runtime_error);
+
+  auto duplicate = arguments;
+  duplicate[9] = "general=Duplicate";
+  CHECK_THROWS_AS(anvil::server::parse_arguments(duplicate),
+                  std::runtime_error);
+}
+
 TEST_CASE("server CLI applies lifecycle defaults and validates warning order") {
   const std::array required{
       std::string_view{"--host-key"},       std::string_view{"host_key"},

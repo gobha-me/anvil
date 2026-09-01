@@ -28,6 +28,7 @@ constexpr std::array production_migrations{
     detail::SqliteMigration{1, {}},
     detail::SqliteMigration{2, detail::domain_schema_v2},
     detail::SqliteMigration{3, detail::invite_economics_v3},
+    detail::SqliteMigration{4, detail::message_boards_v4},
 };
 
 struct DatabaseDeleter {
@@ -278,7 +279,7 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
 
 [[nodiscard]] auto read_message(sqlite3_stmt *statement)
     -> std::expected<MessageRecord, Error> {
-  if (sqlite3_column_count(statement) != 10) {
+  if (sqlite3_column_count(statement) != 11) {
     return std::unexpected(
         invalid_data("message query returned an unexpected shape"));
   }
@@ -293,9 +294,11 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
   auto body = column_text(statement, 6, "message body");
   auto posted_at = column_integer(statement, 7, "message posted_at");
   auto received_at = column_integer(statement, 8, "message received_at");
-  auto status = column_text(statement, 9, "message status");
+  auto local_sequence = column_integer(statement, 9, "message local sequence");
+  auto status = column_text(statement, 10, "message status");
   if (!message_id || !board_id || !thread_id || !parent_id || !author_handle ||
-      !author_origin || !body || !posted_at || !received_at || !status) {
+      !author_origin || !body || !posted_at || !received_at ||
+      !local_sequence || !status) {
     if (!message_id) {
       return std::unexpected(message_id.error());
     }
@@ -323,6 +326,9 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
     if (!received_at) {
       return std::unexpected(received_at.error());
     }
+    if (!local_sequence) {
+      return std::unexpected(local_sequence.error());
+    }
     return std::unexpected(status.error());
   }
 
@@ -345,6 +351,7 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
       .body = std::move(*body),
       .posted_at = UtcEpochSeconds{*posted_at},
       .received_at = UtcEpochSeconds{*received_at},
+      .local_sequence = *local_sequence,
       .status = lifecycle,
   };
 }
@@ -417,8 +424,8 @@ bind_content_identifier(sqlite3 *database, sqlite3_stmt *statement,
 
 constexpr std::string_view message_columns =
     "m.message_id,m.board_id,m.thread_id,m.parent_message_id,"
-    "m.author_handle,m.author_origin,m.body,m.posted_at,m.received_at,m."
-    "status ";
+    "m.author_handle,m.author_origin,m.body,m.posted_at,m.received_at,"
+    "m.local_sequence,m.status ";
 
 [[nodiscard]] auto query_messages(sqlite3 *database, std::string_view sql,
                                   std::string_view identifier, bool at_most_one)
@@ -737,6 +744,84 @@ private:
   bool active_{true};
 };
 
+[[nodiscard]] auto next_message_sequence(sqlite3 *database)
+    -> std::expected<std::int64_t, Error> {
+  auto current = scalar_integer(
+      database, "SELECT coalesce(max(local_sequence),0) FROM messages",
+      "cannot allocate message sequence");
+  if (!current) {
+    return std::unexpected(current.error());
+  }
+  if (*current == std::numeric_limits<std::int64_t>::max()) {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "message sequence is exhausted"});
+  }
+  return *current + 1;
+}
+
+[[nodiscard]] auto insert_message(sqlite3 *database,
+                                  const MessageRecord &message)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "INSERT INTO messages(message_id,board_id,thread_id,parent_message_id,"
+      "author_handle,body,posted_at,received_at,local_sequence) "
+      "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+  auto statement = prepare(database, sql, "cannot prepare message insert");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array values{std::string_view{message.message_id},
+                          std::string_view{message.board_id},
+                          std::string_view{message.thread_id}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 1U),
+                      values[index], "cannot bind message identity");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  auto parent =
+      message.parent_message_id
+          ? bind_text(database, statement->get(), 4, *message.parent_message_id,
+                      "cannot bind parent message")
+          : bind_null(database, statement->get(), 4,
+                      "cannot bind absent parent message");
+  if (!parent) {
+    return std::unexpected(parent.error());
+  }
+  if (auto bound =
+          bind_text(database, statement->get(), 5, message.author_handle,
+                    "cannot bind message author");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 6, message.body,
+                             "cannot bind message body");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const std::array integers{message.posted_at.value, message.received_at.value,
+                            message.local_sequence};
+  for (std::size_t index = 0; index < integers.size(); ++index) {
+    if (auto bound = bind_integer(database, statement->get(),
+                                  static_cast<int>(index + 7U), integers[index],
+                                  "cannot bind message metadata");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted != SQLITE_DONE) {
+    auto error = sqlite_error(database, inserted, "cannot insert message");
+    if (error.code == ErrorCode::constraint_violation) {
+      error.code = ErrorCode::conflict;
+    }
+    return std::unexpected(std::move(error));
+  }
+  return {};
+}
+
 } // namespace
 
 SqliteStore::SqliteStore(std::filesystem::path path, SqliteOptions options,
@@ -921,7 +1006,7 @@ auto SqliteStore::find_message_impl(Transaction &transaction,
          "b.board_id=m.board_id WHERE m.message_id=?1";
   if (visibility == ContentVisibility::active_only) {
     sql += " AND m.status!='tombstoned' AND t.status!='tombstoned' AND "
-           "b.status!='tombstoned'";
+           "b.status!='tombstoned' AND b.guest_readable=1";
   }
   auto messages = query_messages(backend->database(), sql, message_id, true);
   if (!messages) {
@@ -950,7 +1035,7 @@ auto SqliteStore::list_messages_for_board_impl(Transaction &transaction,
          "b.board_id=m.board_id WHERE m.board_id=?1";
   if (visibility == ContentVisibility::active_only) {
     sql += " AND m.status!='tombstoned' AND t.status!='tombstoned' AND "
-           "b.status!='tombstoned'";
+           "b.status!='tombstoned' AND b.guest_readable=1";
   }
   sql += " ORDER BY m.received_at,m.message_id";
   return query_messages(backend->database(), sql, board_id, false);
@@ -1687,6 +1772,739 @@ SELECT u.handle,u.origin,u.status,d.depth
         sqlite_error(backend->database(), row, "cannot read invite subtree"));
   }
   return result;
+}
+
+auto SqliteStore::reconcile_board_impl(Transaction &transaction,
+                                       const BoardProvision &board)
+    -> std::expected<BoardRecord, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view find_sql =
+      "SELECT board_id,title,description,status,guest_readable FROM boards "
+      "WHERE name=?1 AND origin_key=''";
+  auto find = prepare(backend->database(), find_sql,
+                      "cannot prepare board declaration lookup");
+  if (!find) {
+    return std::unexpected(find.error());
+  }
+  if (auto bound = bind_text(backend->database(), find->get(), 1, board.name,
+                             "cannot bind board declaration name");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto found = sqlite3_step(find->get());
+  std::string board_id = board.board_id;
+  if (found == SQLITE_ROW) {
+    auto existing_id = column_text(find->get(), 0, "declared board ID");
+    auto status = column_text(find->get(), 3, "declared board status");
+    if (!existing_id || !status) {
+      return std::unexpected(!existing_id ? existing_id.error()
+                                          : status.error());
+    }
+    if (*status != "active") {
+      return std::unexpected(Error{
+          ErrorCode::conflict, "board declaration matches a tombstoned board"});
+    }
+    board_id = std::move(*existing_id);
+    constexpr std::string_view update_sql =
+        "UPDATE boards SET title=?1,guest_readable=?2 WHERE board_id=?3 AND "
+        "origin_key='' AND status='active'";
+    auto update = prepare(backend->database(), update_sql,
+                          "cannot prepare board declaration update");
+    if (!update) {
+      return std::unexpected(update.error());
+    }
+    if (auto bound = bind_text(backend->database(), update->get(), 1,
+                               board.title, "cannot bind board title");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    if (auto bound = bind_integer(
+            backend->database(), update->get(), 2,
+            board.visibility == BoardVisibility::public_read ? 1 : 0,
+            "cannot bind board visibility");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    if (auto bound = bind_text(backend->database(), update->get(), 3, board_id,
+                               "cannot bind declared board ID");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    if (const auto updated = sqlite3_step(update->get());
+        updated != SQLITE_DONE) {
+      return std::unexpected(sqlite_error(backend->database(), updated,
+                                          "cannot update declared board"));
+    }
+  } else if (found == SQLITE_DONE) {
+    constexpr std::string_view insert_sql =
+        "INSERT INTO boards(board_id,name,title,guest_readable,created_at) "
+        "VALUES(?1,?2,?3,?4,?5)";
+    auto insert = prepare(backend->database(), insert_sql,
+                          "cannot prepare board declaration insert");
+    if (!insert) {
+      return std::unexpected(insert.error());
+    }
+    const std::array texts{std::string_view{board_id},
+                           std::string_view{board.name},
+                           std::string_view{board.title}};
+    for (std::size_t index = 0; index < texts.size(); ++index) {
+      if (auto bound = bind_text(backend->database(), insert->get(),
+                                 static_cast<int>(index + 1U), texts[index],
+                                 "cannot bind board declaration");
+          !bound) {
+        return std::unexpected(bound.error());
+      }
+    }
+    if (auto bound = bind_integer(
+            backend->database(), insert->get(), 4,
+            board.visibility == BoardVisibility::public_read ? 1 : 0,
+            "cannot bind board visibility");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    if (auto bound = bind_integer(backend->database(), insert->get(), 5,
+                                  board.created_at.value,
+                                  "cannot bind board creation time");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+    const auto inserted = sqlite3_step(insert->get());
+    if (inserted != SQLITE_DONE) {
+      auto error = sqlite_error(backend->database(), inserted,
+                                "cannot insert declared board");
+      if (error.code == ErrorCode::constraint_violation) {
+        error.code = ErrorCode::conflict;
+      }
+      return std::unexpected(std::move(error));
+    }
+  } else {
+    return std::unexpected(sqlite_error(backend->database(), found,
+                                        "cannot look up declared board"));
+  }
+  return BoardRecord{.board_id = std::move(board_id),
+                     .name = board.name,
+                     .title = board.title,
+                     .description = {},
+                     .visibility = board.visibility,
+                     .unread_messages = 0};
+}
+
+auto SqliteStore::list_boards_impl(Transaction &transaction,
+                                   const BoardReader &reader)
+    -> std::expected<std::vector<BoardRecord>, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql = R"sql(
+SELECT b.board_id,b.name,b.title,b.description,b.guest_readable,
+       CASE WHEN ?1 IS NULL THEN 0 ELSE (
+         SELECT count(*) FROM messages m
+         JOIN threads t ON t.thread_id=m.thread_id AND t.board_id=m.board_id
+         LEFT JOIN board_reads br ON br.user_handle=?1 AND
+              br.user_origin_key='' AND br.board_id=b.board_id
+         LEFT JOIN thread_reads tr ON tr.user_handle=?1 AND
+              tr.user_origin_key='' AND tr.thread_id=m.thread_id
+         WHERE m.board_id=b.board_id AND m.status='active' AND
+               t.status='active' AND m.local_sequence >
+               max(coalesce(br.read_through_sequence,0),
+                   coalesce(tr.read_through_sequence,0))
+       ) END
+FROM boards b
+WHERE b.status='active' AND (?2=1 OR b.guest_readable=1)
+ORDER BY b.name,b.board_id
+)sql";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare visible board list");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  auto handle_bound =
+      reader.handle ? bind_text(backend->database(), statement->get(), 1,
+                                *reader.handle, "cannot bind board reader")
+                    : bind_null(backend->database(), statement->get(), 1,
+                                "cannot bind guest board reader");
+  if (!handle_bound) {
+    return std::unexpected(handle_bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), statement->get(), 2,
+                                reader.may_read_registered ? 1 : 0,
+                                "cannot bind board read scope");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  std::vector<BoardRecord> result;
+  for (;;) {
+    const auto row = sqlite3_step(statement->get());
+    if (row == SQLITE_DONE) {
+      return result;
+    }
+    if (row != SQLITE_ROW) {
+      return std::unexpected(
+          sqlite_error(backend->database(), row, "cannot read visible boards"));
+    }
+    auto id = column_text(statement->get(), 0, "board ID");
+    auto name = column_text(statement->get(), 1, "board name");
+    auto title = column_text(statement->get(), 2, "board title");
+    auto description = column_text(statement->get(), 3, "board description");
+    auto guest = column_integer(statement->get(), 4, "board guest visibility");
+    auto unread = column_integer(statement->get(), 5, "board unread count");
+    if (!id || !name || !title || !description || !guest || !unread ||
+        (*guest != 0 && *guest != 1) || *unread < 0) {
+      return std::unexpected(invalid_data("visible board row is invalid"));
+    }
+    result.push_back({.board_id = std::move(*id),
+                      .name = std::move(*name),
+                      .title = std::move(*title),
+                      .description = std::move(*description),
+                      .visibility = *guest == 1
+                                        ? BoardVisibility::public_read
+                                        : BoardVisibility::registered_only,
+                      .unread_messages = static_cast<std::uint64_t>(*unread)});
+  }
+}
+
+auto SqliteStore::list_threads_impl(Transaction &transaction,
+                                    std::string_view board_id,
+                                    const BoardReader &reader)
+    -> std::expected<std::vector<ThreadRecord>, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql = R"sql(
+SELECT t.thread_id,t.board_id,t.author_handle,t.subject,t.created_at,
+       t.updated_at,t.locked_at,count(m.message_id),
+       CASE WHEN ?2 IS NULL THEN 0 ELSE sum(CASE WHEN m.local_sequence >
+         max(coalesce(br.read_through_sequence,0),
+             coalesce(tr.read_through_sequence,0)) THEN 1 ELSE 0 END) END
+FROM threads t JOIN boards b ON b.board_id=t.board_id
+LEFT JOIN messages m ON m.thread_id=t.thread_id AND m.board_id=t.board_id AND
+     m.status='active'
+LEFT JOIN board_reads br ON br.user_handle=?2 AND br.user_origin_key='' AND
+     br.board_id=t.board_id
+LEFT JOIN thread_reads tr ON tr.user_handle=?2 AND tr.user_origin_key='' AND
+     tr.thread_id=t.thread_id
+WHERE t.board_id=?1 AND t.status='active' AND b.status='active' AND
+      (?3=1 OR b.guest_readable=1)
+GROUP BY t.thread_id
+ORDER BY t.updated_at DESC,t.thread_id
+)sql";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare visible thread list");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 1, board_id,
+                             "cannot bind thread board");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  auto handle_bound =
+      reader.handle ? bind_text(backend->database(), statement->get(), 2,
+                                *reader.handle, "cannot bind thread reader")
+                    : bind_null(backend->database(), statement->get(), 2,
+                                "cannot bind guest thread reader");
+  if (!handle_bound) {
+    return std::unexpected(handle_bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), statement->get(), 3,
+                                reader.may_read_registered ? 1 : 0,
+                                "cannot bind thread read scope");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  std::vector<ThreadRecord> result;
+  for (;;) {
+    const auto row = sqlite3_step(statement->get());
+    if (row == SQLITE_DONE) {
+      return result;
+    }
+    if (row != SQLITE_ROW) {
+      return std::unexpected(sqlite_error(backend->database(), row,
+                                          "cannot read visible threads"));
+    }
+    auto id = column_text(statement->get(), 0, "thread ID");
+    auto stored_board = column_text(statement->get(), 1, "thread board ID");
+    auto author = column_text(statement->get(), 2, "thread author");
+    auto subject = column_text(statement->get(), 3, "thread subject");
+    auto created = column_integer(statement->get(), 4, "thread created_at");
+    auto updated = column_integer(statement->get(), 5, "thread updated_at");
+    auto count = column_integer(statement->get(), 7, "thread message count");
+    auto unread = column_integer(statement->get(), 8, "thread unread count");
+    if (!id || !stored_board || !author || !subject || !created || !updated ||
+        !count || !unread || *count < 0 || *unread < 0) {
+      return std::unexpected(invalid_data("visible thread row is invalid"));
+    }
+    result.push_back(
+        {.thread_id = std::move(*id),
+         .board_id = std::move(*stored_board),
+         .author_handle = std::move(*author),
+         .subject = std::move(*subject),
+         .created_at = {*created},
+         .updated_at = {*updated},
+         .locked = sqlite3_column_type(statement->get(), 6) != SQLITE_NULL,
+         .message_count = static_cast<std::uint64_t>(*count),
+         .unread_messages = static_cast<std::uint64_t>(*unread)});
+  }
+}
+
+auto SqliteStore::list_messages_for_thread_impl(Transaction &transaction,
+                                                std::string_view board_id,
+                                                std::string_view thread_id,
+                                                const BoardReader &reader)
+    -> std::expected<std::vector<MessageRecord>, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  std::string sql = "SELECT ";
+  sql += message_columns;
+  sql += "FROM messages m JOIN threads t ON t.thread_id=m.thread_id AND "
+         "t.board_id=m.board_id JOIN boards b ON b.board_id=m.board_id "
+         "WHERE m.board_id=?1 AND m.thread_id=?2 AND m.status='active' AND "
+         "t.status='active' AND b.status='active' AND (?3=1 OR "
+         "b.guest_readable=1) ORDER BY m.local_sequence";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare visible message list");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 1, board_id,
+                             "cannot bind message board");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 2,
+                             thread_id, "cannot bind message thread");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_integer(backend->database(), statement->get(), 3,
+                                reader.may_read_registered ? 1 : 0,
+                                "cannot bind message read scope");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  std::vector<MessageRecord> result;
+  for (;;) {
+    const auto row = sqlite3_step(statement->get());
+    if (row == SQLITE_DONE) {
+      return result;
+    }
+    if (row != SQLITE_ROW) {
+      return std::unexpected(sqlite_error(backend->database(), row,
+                                          "cannot read visible messages"));
+    }
+    auto message = read_message(statement->get());
+    if (!message) {
+      return std::unexpected(message.error());
+    }
+    result.push_back(std::move(*message));
+  }
+}
+
+auto SqliteStore::create_thread_impl(Transaction &transaction,
+                                     const ThreadCreate &thread)
+    -> std::expected<MessageRecord, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  auto sequence = next_message_sequence(backend->database());
+  if (!sequence) {
+    return std::unexpected(sequence.error());
+  }
+  constexpr std::string_view sql =
+      "INSERT INTO threads(thread_id,board_id,author_handle,subject,created_at,"
+      "updated_at) SELECT ?1,?2,?3,?4,?5,?5 FROM boards WHERE board_id=?2 "
+      "AND status='active' AND EXISTS(SELECT 1 FROM users WHERE handle=?3 "
+      "AND origin_key='' AND status='active')";
+  auto statement = prepare(backend->database(), sql, "cannot prepare thread");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array texts{
+      std::string_view{thread.thread_id}, std::string_view{thread.board_id},
+      std::string_view{thread.author_handle}, std::string_view{thread.subject}};
+  for (std::size_t index = 0; index < texts.size(); ++index) {
+    if (auto bound = bind_text(backend->database(), statement->get(),
+                               static_cast<int>(index + 1U), texts[index],
+                               "cannot bind thread creation");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (auto bound = bind_integer(backend->database(), statement->get(), 5,
+                                thread.created_at.value,
+                                "cannot bind thread creation time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted != SQLITE_DONE || sqlite3_changes64(backend->database()) != 1) {
+    if (inserted == SQLITE_DONE) {
+      return std::unexpected(
+          Error{ErrorCode::not_found, "thread board does not exist"});
+    }
+    return std::unexpected(
+        sqlite_error(backend->database(), inserted, "cannot create thread"));
+  }
+  MessageRecord message{.message_id = thread.message_id,
+                        .board_id = thread.board_id,
+                        .thread_id = thread.thread_id,
+                        .parent_message_id = std::nullopt,
+                        .author_handle = thread.author_handle,
+                        .author_origin = std::nullopt,
+                        .body = thread.body,
+                        .posted_at = thread.created_at,
+                        .received_at = thread.created_at,
+                        .local_sequence = *sequence,
+                        .status = ContentStatus::active};
+  if (auto stored = insert_message(backend->database(), message); !stored) {
+    return std::unexpected(stored.error());
+  }
+  return message;
+}
+
+auto SqliteStore::create_reply_impl(Transaction &transaction,
+                                    const ReplyCreate &reply)
+    -> std::expected<MessageRecord, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view thread_sql =
+      "SELECT 1 FROM threads t JOIN boards b ON b.board_id=t.board_id WHERE "
+      "t.thread_id=?1 AND t.board_id=?2 AND t.status='active' AND "
+      "t.locked_at IS NULL AND b.status='active' AND EXISTS(SELECT 1 FROM "
+      "users WHERE handle=?3 AND origin_key='' AND status='active')";
+  auto thread = prepare(backend->database(), thread_sql,
+                        "cannot prepare reply thread lookup");
+  if (!thread) {
+    return std::unexpected(thread.error());
+  }
+  if (auto bound = bind_text(backend->database(), thread->get(), 1,
+                             reply.thread_id, "cannot bind reply thread");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), thread->get(), 2,
+                             reply.board_id, "cannot bind reply board");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), thread->get(), 3,
+                             reply.author_handle, "cannot bind reply author");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (const auto found = sqlite3_step(thread->get()); found != SQLITE_ROW) {
+    return std::unexpected(Error{ErrorCode::not_found,
+                                 "reply thread is absent, deleted, or locked"});
+  }
+  if (reply.parent_message_id) {
+    constexpr std::string_view parent_sql =
+        "SELECT 1 FROM messages WHERE message_id=?1 AND thread_id=?2 AND "
+        "board_id=?3 AND status='active'";
+    auto parent = prepare(backend->database(), parent_sql,
+                          "cannot prepare quote parent lookup");
+    if (!parent) {
+      return std::unexpected(parent.error());
+    }
+    const std::array values{std::string_view{*reply.parent_message_id},
+                            std::string_view{reply.thread_id},
+                            std::string_view{reply.board_id}};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      if (auto bound = bind_text(backend->database(), parent->get(),
+                                 static_cast<int>(index + 1U), values[index],
+                                 "cannot bind quote parent");
+          !bound) {
+        return std::unexpected(bound.error());
+      }
+    }
+    if (const auto found = sqlite3_step(parent->get()); found != SQLITE_ROW) {
+      return std::unexpected(
+          Error{ErrorCode::not_found, "quote parent is not active in thread"});
+    }
+  }
+  auto sequence = next_message_sequence(backend->database());
+  if (!sequence) {
+    return std::unexpected(sequence.error());
+  }
+  MessageRecord message{.message_id = reply.message_id,
+                        .board_id = reply.board_id,
+                        .thread_id = reply.thread_id,
+                        .parent_message_id = reply.parent_message_id,
+                        .author_handle = reply.author_handle,
+                        .author_origin = std::nullopt,
+                        .body = reply.body,
+                        .posted_at = reply.created_at,
+                        .received_at = reply.created_at,
+                        .local_sequence = *sequence,
+                        .status = ContentStatus::active};
+  if (auto stored = insert_message(backend->database(), message); !stored) {
+    return std::unexpected(stored.error());
+  }
+  constexpr std::string_view update_sql =
+      "UPDATE threads SET updated_at=max(updated_at,?1) WHERE thread_id=?2 "
+      "AND board_id=?3";
+  auto update = prepare(backend->database(), update_sql,
+                        "cannot prepare thread activity update");
+  if (!update) {
+    return std::unexpected(update.error());
+  }
+  if (auto bound = bind_integer(backend->database(), update->get(), 1,
+                                reply.created_at.value,
+                                "cannot bind thread activity time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), update->get(), 2,
+                             reply.thread_id, "cannot bind updated thread");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), update->get(), 3,
+                             reply.board_id, "cannot bind updated board");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (const auto updated = sqlite3_step(update->get());
+      updated != SQLITE_DONE) {
+    return std::unexpected(sqlite_error(backend->database(), updated,
+                                        "cannot update thread activity"));
+  }
+  return message;
+}
+
+auto SqliteStore::mark_thread_read_impl(Transaction &transaction,
+                                        std::string_view user_handle,
+                                        std::string_view board_id,
+                                        std::string_view thread_id)
+    -> std::expected<void, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql = R"sql(
+INSERT INTO thread_reads(user_handle,board_id,thread_id,read_through_sequence)
+SELECT ?1,?2,?3,coalesce(max(m.local_sequence),0)
+FROM threads t JOIN boards b ON b.board_id=t.board_id
+LEFT JOIN messages m ON m.thread_id=t.thread_id AND
+     m.board_id=t.board_id AND m.status='active'
+WHERE t.thread_id=?3 AND t.board_id=?2 AND t.status='active' AND
+      b.status='active' AND EXISTS(
+        SELECT 1 FROM users u WHERE u.handle=?1 AND u.origin_key='' AND
+               u.status='active')
+HAVING count(t.thread_id)>0
+ON CONFLICT(user_handle,user_origin_key,thread_id) DO UPDATE SET
+read_through_sequence=max(thread_reads.read_through_sequence,
+                          excluded.read_through_sequence)
+)sql";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare thread read marker");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array values{user_handle, board_id, thread_id};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound = bind_text(backend->database(), statement->get(),
+                               static_cast<int>(index + 1U), values[index],
+                               "cannot bind thread read marker");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  const auto updated = sqlite3_step(statement->get());
+  if (updated != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(backend->database(), updated, "cannot mark thread read"));
+  }
+  if (sqlite3_changes64(backend->database()) == 0) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "thread read target does not exist"});
+  }
+  return {};
+}
+
+auto SqliteStore::catch_up_board_impl(Transaction &transaction,
+                                      std::string_view user_handle,
+                                      std::string_view board_id)
+    -> std::expected<void, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  constexpr std::string_view sql = R"sql(
+INSERT INTO board_reads(user_handle,board_id,read_through_sequence)
+SELECT ?1,b.board_id,coalesce(max(m.local_sequence),0)
+FROM boards b LEFT JOIN threads t ON t.board_id=b.board_id AND
+     t.status='active'
+LEFT JOIN messages m ON m.thread_id=t.thread_id AND m.board_id=b.board_id AND
+     m.status='active'
+WHERE b.board_id=?2 AND b.status='active' AND EXISTS(
+  SELECT 1 FROM users u WHERE u.handle=?1 AND u.origin_key='' AND
+         u.status='active')
+GROUP BY b.board_id
+ON CONFLICT(user_handle,user_origin_key,board_id) DO UPDATE SET
+read_through_sequence=max(board_reads.read_through_sequence,
+                          excluded.read_through_sequence)
+)sql";
+  auto statement =
+      prepare(backend->database(), sql, "cannot prepare board catch-up marker");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 1,
+                             user_handle, "cannot bind board reader");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), statement->get(), 2, board_id,
+                             "cannot bind catch-up board");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto updated = sqlite3_step(statement->get());
+  if (updated != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(backend->database(), updated, "cannot catch up board"));
+  }
+  if (sqlite3_changes64(backend->database()) == 0) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "catch-up board does not exist"});
+  }
+  return {};
+}
+
+auto SqliteStore::submit_report_impl(Transaction &transaction,
+                                     const ReportSubmission &report)
+    -> std::expected<void, Error> {
+  auto *backend = dynamic_cast<SqliteTransactionBackend *>(
+      transaction_backend(transaction));
+  if (backend == nullptr) {
+    return std::unexpected(
+        Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
+  }
+  const auto &target_id = std::get<std::string>(report.target.id);
+  const auto target_kind = report.target.kind == ContentKind::thread
+                               ? std::string_view{"thread"}
+                               : std::string_view{"message"};
+  const auto target_sql =
+      report.target.kind == ContentKind::thread
+          ? std::string_view{"SELECT 1 FROM threads t JOIN boards b ON "
+                             "b.board_id=t.board_id WHERE t.thread_id=?1 "
+                             "AND t.status='active' AND b.status='active' "
+                             "AND (b.guest_readable=1 OR EXISTS(SELECT 1 "
+                             "FROM users u WHERE u.handle=?2 AND "
+                             "u.origin_key='' AND u.status='active'))"}
+          : std::string_view{
+                "SELECT 1 FROM messages m JOIN threads t ON "
+                "t.thread_id=m.thread_id AND t.board_id=m.board_id "
+                "JOIN boards b ON b.board_id=m.board_id WHERE "
+                "m.message_id=?1 AND m.status='active' AND "
+                "t.status='active' AND b.status='active' AND "
+                "(b.guest_readable=1 OR EXISTS(SELECT 1 FROM users u "
+                "WHERE u.handle=?2 AND u.origin_key='' AND "
+                "u.status='active'))"};
+  auto target = prepare(backend->database(), target_sql,
+                        "cannot prepare report target lookup");
+  if (!target) {
+    return std::unexpected(target.error());
+  }
+  if (auto bound = bind_text(backend->database(), target->get(), 1, target_id,
+                             "cannot bind report target");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  auto reporter_scope =
+      report.reporter_handle
+          ? bind_text(backend->database(), target->get(), 2,
+                      *report.reporter_handle,
+                      "cannot bind report visibility scope")
+          : bind_null(backend->database(), target->get(), 2,
+                      "cannot bind guest report visibility scope");
+  if (!reporter_scope) {
+    return std::unexpected(reporter_scope.error());
+  }
+  if (const auto found = sqlite3_step(target->get()); found != SQLITE_ROW) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "report target is not visible"});
+  }
+  constexpr std::string_view insert_sql =
+      "INSERT INTO reports(report_id,reporter_kind,reporter_handle,target_kind,"
+      "target_id,evidence,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)";
+  auto insert =
+      prepare(backend->database(), insert_sql, "cannot prepare report insert");
+  if (!insert) {
+    return std::unexpected(insert.error());
+  }
+  if (auto bound = bind_text(backend->database(), insert->get(), 1,
+                             report.report_id, "cannot bind report ID");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(backend->database(), insert->get(), 2,
+                             report.reporter_handle ? "registered" : "guest",
+                             "cannot bind reporter kind");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  auto reporter =
+      report.reporter_handle
+          ? bind_text(backend->database(), insert->get(), 3,
+                      *report.reporter_handle, "cannot bind reporter handle")
+          : bind_null(backend->database(), insert->get(), 3,
+                      "cannot bind anonymous reporter");
+  if (!reporter) {
+    return std::unexpected(reporter.error());
+  }
+  const std::array values{target_kind, std::string_view{target_id},
+                          std::string_view{report.reason}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound = bind_text(backend->database(), insert->get(),
+                               static_cast<int>(index + 4U), values[index],
+                               "cannot bind report content");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (auto bound = bind_integer(backend->database(), insert->get(), 7,
+                                report.created_at.value,
+                                "cannot bind report creation time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(insert->get());
+  if (inserted != SQLITE_DONE) {
+    auto error =
+        sqlite_error(backend->database(), inserted, "cannot submit report");
+    if (error.code == ErrorCode::constraint_violation) {
+      error.code = ErrorCode::conflict;
+    }
+    return std::unexpected(std::move(error));
+  }
+  return {};
 }
 
 auto SqliteStore::execute_for_testing(Transaction &transaction,

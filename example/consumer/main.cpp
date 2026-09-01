@@ -121,6 +121,82 @@ private:
         anvil::store::Error{anvil::store::ErrorCode::unavailable,
                             "consumer fixture has no invite backend"});
   }
+
+  [[nodiscard]] auto reconcile_board_impl(anvil::store::Transaction &,
+                                          const anvil::store::BoardProvision &)
+      -> std::expected<anvil::store::BoardRecord,
+                       anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no board backend"});
+  }
+
+  [[nodiscard]] auto list_boards_impl(anvil::store::Transaction &,
+                                      const anvil::store::BoardReader &)
+      -> std::expected<std::vector<anvil::store::BoardRecord>,
+                       anvil::store::Error> override {
+    return std::vector<anvil::store::BoardRecord>{};
+  }
+
+  [[nodiscard]] auto list_threads_impl(anvil::store::Transaction &,
+                                       std::string_view,
+                                       const anvil::store::BoardReader &)
+      -> std::expected<std::vector<anvil::store::ThreadRecord>,
+                       anvil::store::Error> override {
+    return std::vector<anvil::store::ThreadRecord>{};
+  }
+
+  [[nodiscard]] auto
+  list_messages_for_thread_impl(anvil::store::Transaction &, std::string_view,
+                                std::string_view,
+                                const anvil::store::BoardReader &)
+      -> std::expected<std::vector<anvil::store::MessageRecord>,
+                       anvil::store::Error> override {
+    return std::vector<anvil::store::MessageRecord>{};
+  }
+
+  [[nodiscard]] auto create_thread_impl(anvil::store::Transaction &,
+                                        const anvil::store::ThreadCreate &)
+      -> std::expected<anvil::store::MessageRecord,
+                       anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no board backend"});
+  }
+
+  [[nodiscard]] auto create_reply_impl(anvil::store::Transaction &,
+                                       const anvil::store::ReplyCreate &)
+      -> std::expected<anvil::store::MessageRecord,
+                       anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no board backend"});
+  }
+
+  [[nodiscard]] auto mark_thread_read_impl(anvil::store::Transaction &,
+                                           std::string_view, std::string_view,
+                                           std::string_view)
+      -> std::expected<void, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no board backend"});
+  }
+
+  [[nodiscard]] auto catch_up_board_impl(anvil::store::Transaction &,
+                                         std::string_view, std::string_view)
+      -> std::expected<void, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no board backend"});
+  }
+
+  [[nodiscard]] auto submit_report_impl(anvil::store::Transaction &,
+                                        const anvil::store::ReportSubmission &)
+      -> std::expected<void, anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no board backend"});
+  }
 };
 
 } // namespace

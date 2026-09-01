@@ -19,14 +19,20 @@
 
 namespace {
 
+using anvil::store::BoardProvision;
+using anvil::store::BoardReader;
+using anvil::store::BoardVisibility;
 using anvil::store::ContentKind;
 using anvil::store::ContentRef;
 using anvil::store::ContentStatus;
 using anvil::store::CredentialStatus;
 using anvil::store::ErrorCode;
 using anvil::store::LocalCredentialProvision;
+using anvil::store::ReplyCreate;
+using anvil::store::ReportSubmission;
 using anvil::store::SqliteOptions;
 using anvil::store::SqliteStore;
+using anvil::store::ThreadCreate;
 using anvil::store::TransactionMode;
 using anvil::store::UserStatus;
 using anvil::store::detail::SqliteMigration;
@@ -115,12 +121,12 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
   auto store = SqliteStore::open(database.path());
 
   REQUIRE(store.has_value());
-  CHECK((*store)->schema_version() == 3);
+  CHECK((*store)->schema_version() == 4);
   auto transaction = (*store)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA application_id") ==
         0x414E564C);
-  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") == 3);
+  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") == 4);
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA synchronous") == 2);
   CHECK((*store)->scalar_for_testing(*transaction,
                                      "PRAGMA wal_autocheckpoint") == 1000);
@@ -129,9 +135,9 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
             "SELECT group_concat(name, ',') FROM "
             "(SELECT name FROM sqlite_schema WHERE type = 'table' AND "
             "name NOT LIKE 'sqlite_%' ORDER BY name)") ==
-        "blocks,boards,files,invites,leaderboards,messages,moderation_log,"
-        "oneliners,plugin_state,plugins,presence,reports,sessions_log,threads,"
-        "tos_acceptances,user_keys,users");
+        "blocks,board_reads,boards,files,invites,leaderboards,messages,"
+        "moderation_log,oneliners,plugin_state,plugins,presence,reports,"
+        "sessions_log,thread_reads,threads,tos_acceptances,user_keys,users");
   CHECK(transaction->commit().has_value());
 
   struct stat metadata{};
@@ -140,7 +146,329 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
 
   auto reopened = SqliteStore::open(database.path());
   REQUIRE(reopened.has_value());
-  CHECK((*reopened)->schema_version() == 3);
+  CHECK((*reopened)->schema_version() == 4);
+}
+
+TEST_CASE("SQLite board visibility is enforced inside every board read") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write, "INSERT INTO users(handle,status,created_at) VALUES"
+                          "('alice','active',1),('bob','active',1),"
+                          "('pending','pending',1)")
+              .has_value());
+  REQUIRE(
+      (*store)
+          ->reconcile_board(
+              *write, BoardProvision{.board_id = std::string(board_id),
+                                     .name = "general",
+                                     .title = "General",
+                                     .visibility = BoardVisibility::public_read,
+                                     .created_at = {2}})
+          .has_value());
+  constexpr std::string_view members_id =
+      "00000000-0000-0000-0000-000000000002";
+  REQUIRE((*store)
+              ->reconcile_board(
+                  *write,
+                  BoardProvision{.board_id = std::string(members_id),
+                                 .name = "members",
+                                 .title = "Members",
+                                 .visibility = BoardVisibility::registered_only,
+                                 .created_at = {2}})
+              .has_value());
+  REQUIRE((*store)
+              ->create_thread(*write,
+                              ThreadCreate{.board_id = std::string(members_id),
+                                           .thread_id = "private-thread",
+                                           .message_id = "private-message",
+                                           .author_handle = "alice",
+                                           .subject = "Private",
+                                           .body = "secret",
+                                           .created_at = {3}})
+              .has_value());
+
+  const BoardReader guest{};
+  auto public_boards = (*store)->list_boards(*write, guest);
+  REQUIRE(public_boards.has_value());
+  REQUIRE(public_boards->size() == 1);
+  CHECK(public_boards->front().name == "general");
+  auto hidden_threads = (*store)->list_threads(*write, members_id, guest);
+  REQUIRE(hidden_threads.has_value());
+  CHECK(hidden_threads->empty());
+  auto hidden_messages = (*store)->list_messages_for_thread(
+      *write, members_id, "private-thread", guest);
+  REQUIRE(hidden_messages.has_value());
+  CHECK(hidden_messages->empty());
+
+  const BoardReader member{.handle = "bob", .may_read_registered = true};
+  auto member_boards = (*store)->list_boards(*write, member);
+  REQUIRE(member_boards.has_value());
+  REQUIRE(member_boards->size() == 2);
+  auto member_messages = (*store)->list_messages_for_thread(
+      *write, members_id, "private-thread", member);
+  REQUIRE(member_messages.has_value());
+  REQUIRE(member_messages->size() == 1);
+  CHECK(member_messages->front().body == "secret");
+}
+
+TEST_CASE("SQLite unread markers use exact message sequence ordering") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write, "INSERT INTO users(handle,status,created_at) VALUES"
+                          "('alice','active',1),('bob','active',1)")
+              .has_value());
+  REQUIRE((*store)
+              ->reconcile_board(
+                  *write, BoardProvision{.board_id = std::string(board_id),
+                                         .name = "general",
+                                         .title = "General",
+                                         .created_at = {2}})
+              .has_value());
+  REQUIRE((*store)
+              ->create_thread(*write,
+                              ThreadCreate{.board_id = std::string(board_id),
+                                           .thread_id = "thread-1",
+                                           .message_id = "message-1",
+                                           .author_handle = "alice",
+                                           .subject = "Welcome",
+                                           .body = "first",
+                                           .created_at = {10}})
+              .has_value());
+  const BoardReader bob{.handle = "bob", .may_read_registered = true};
+  auto before = (*store)->list_boards(*write, bob);
+  REQUIRE(before.has_value());
+  REQUIRE(before->size() == 1);
+  CHECK(before->front().unread_messages == 1);
+  CHECK_FALSE((*store)
+                  ->mark_thread_read(*write, "pending", board_id, "thread-1")
+                  .has_value());
+  CHECK_FALSE(
+      (*store)->catch_up_board(*write, "pending", board_id).has_value());
+  REQUIRE((*store)
+              ->mark_thread_read(*write, "bob", board_id, "thread-1")
+              .has_value());
+  REQUIRE(
+      (*store)
+          ->create_reply(*write, ReplyCreate{.board_id = std::string(board_id),
+                                             .thread_id = "thread-1",
+                                             .message_id = "message-2",
+                                             .parent_message_id = std::nullopt,
+                                             .author_handle = "alice",
+                                             .body = "same second",
+                                             .created_at = {10}})
+          .has_value());
+  auto exact = (*store)->list_threads(*write, board_id, bob);
+  REQUIRE(exact.has_value());
+  REQUIRE(exact->size() == 1);
+  CHECK(exact->front().unread_messages == 1);
+  REQUIRE((*store)->catch_up_board(*write, "bob", board_id).has_value());
+  auto caught_up = (*store)->list_boards(*write, bob);
+  REQUIRE(caught_up.has_value());
+  CHECK(caught_up->front().unread_messages == 0);
+  REQUIRE(
+      (*store)
+          ->create_reply(*write, ReplyCreate{.board_id = std::string(board_id),
+                                             .thread_id = "thread-1",
+                                             .message_id = "message-3",
+                                             .parent_message_id = "message-1",
+                                             .author_handle = "alice",
+                                             .body = "structured quote",
+                                             .created_at = {10}})
+          .has_value());
+  auto messages =
+      (*store)->list_messages_for_thread(*write, board_id, "thread-1", bob);
+  REQUIRE(messages.has_value());
+  REQUIRE(messages->size() == 3);
+  CHECK(messages->back().parent_message_id == "message-1");
+  CHECK(messages->back().body == "structured quote");
+}
+
+TEST_CASE("SQLite reports preserve anonymity and obey board visibility") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write, "INSERT INTO users(handle,status,created_at) VALUES"
+                          "('alice','active',1),('pending','pending',1)")
+              .has_value());
+  REQUIRE((*store)
+              ->reconcile_board(
+                  *write, BoardProvision{.board_id = std::string(board_id),
+                                         .name = "general",
+                                         .title = "General",
+                                         .created_at = {2}})
+              .has_value());
+  REQUIRE((*store)
+              ->create_thread(*write,
+                              ThreadCreate{.board_id = std::string(board_id),
+                                           .thread_id = "thread-1",
+                                           .message_id = "message-1",
+                                           .author_handle = "alice",
+                                           .subject = "Welcome",
+                                           .body = "first",
+                                           .created_at = {3}})
+              .has_value());
+  REQUIRE((*store)
+              ->submit_report(
+                  *write, ReportSubmission{.report_id = "guest-report",
+                                           .reporter_handle = std::nullopt,
+                                           .target = {ContentKind::message,
+                                                      std::string("message-1")},
+                                           .reason = "spam",
+                                           .created_at = {4}})
+              .has_value());
+  REQUIRE((*store)
+              ->submit_report(
+                  *write, ReportSubmission{.report_id = "guest-thread-report",
+                                           .reporter_handle = std::nullopt,
+                                           .target = {ContentKind::thread,
+                                                      std::string("thread-1")},
+                                           .reason = "off topic",
+                                           .created_at = {4}})
+              .has_value());
+  CHECK((*store)->scalar_text_for_testing(
+            *write,
+            "SELECT reporter_kind || ':' || coalesce(reporter_handle,'') "
+            "FROM reports WHERE report_id='guest-report'") == "guest:");
+  REQUIRE((*store)
+              ->reconcile_board(
+                  *write,
+                  BoardProvision{.board_id = std::string(board_id),
+                                 .name = "general",
+                                 .title = "General",
+                                 .visibility = BoardVisibility::registered_only,
+                                 .created_at = {2}})
+              .has_value());
+  const auto hidden = (*store)->submit_report(
+      *write, ReportSubmission{
+                  .report_id = "hidden-report",
+                  .reporter_handle = std::nullopt,
+                  .target = {ContentKind::message, std::string("message-1")},
+                  .reason = "spam",
+                  .created_at = {5}});
+  REQUIRE_FALSE(hidden.has_value());
+  CHECK(hidden.error().code == ErrorCode::not_found);
+  REQUIRE((*store)
+              ->submit_report(
+                  *write, ReportSubmission{.report_id = "member-hidden-report",
+                                           .reporter_handle = "alice",
+                                           .target = {ContentKind::message,
+                                                      std::string("message-1")},
+                                           .reason = "spam",
+                                           .created_at = {5}})
+              .has_value());
+  const auto pending_hidden = (*store)->submit_report(
+      *write, ReportSubmission{
+                  .report_id = "pending-hidden-report",
+                  .reporter_handle = "pending",
+                  .target = {ContentKind::message, std::string("message-1")},
+                  .reason = "spam",
+                  .created_at = {5}});
+  REQUIRE_FALSE(pending_hidden.has_value());
+  CHECK(pending_hidden.error().code == ErrorCode::not_found);
+}
+
+TEST_CASE(
+    "SQLite posting fails closed for locked and unrelated quote targets") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write, "INSERT INTO users(handle,status,created_at) VALUES"
+                          "('alice','active',1),('pending','pending',1)")
+              .has_value());
+  REQUIRE((*store)
+              ->reconcile_board(
+                  *write, BoardProvision{.board_id = std::string(board_id),
+                                         .name = "general",
+                                         .title = "General",
+                                         .created_at = {2}})
+              .has_value());
+  REQUIRE((*store)
+              ->create_thread(*write, {.board_id = std::string(board_id),
+                                       .thread_id = "thread-1",
+                                       .message_id = "message-1",
+                                       .author_handle = "alice",
+                                       .subject = "One",
+                                       .body = "first",
+                                       .created_at = {3}})
+              .has_value());
+  REQUIRE((*store)
+              ->create_thread(*write, {.board_id = std::string(board_id),
+                                       .thread_id = "thread-2",
+                                       .message_id = "message-2",
+                                       .author_handle = "alice",
+                                       .subject = "Two",
+                                       .body = "second",
+                                       .created_at = {4}})
+              .has_value());
+  const auto cross_thread =
+      (*store)->create_reply(*write, {.board_id = std::string(board_id),
+                                      .thread_id = "thread-1",
+                                      .message_id = "message-cross",
+                                      .parent_message_id = "message-2",
+                                      .author_handle = "alice",
+                                      .body = "not allowed",
+                                      .created_at = {5}});
+  REQUIRE_FALSE(cross_thread.has_value());
+  CHECK(cross_thread.error().code == ErrorCode::not_found);
+  const auto pending =
+      (*store)->create_reply(*write, {.board_id = std::string(board_id),
+                                      .thread_id = "thread-1",
+                                      .message_id = "message-pending",
+                                      .parent_message_id = std::nullopt,
+                                      .author_handle = "pending",
+                                      .body = "not active",
+                                      .created_at = {5}});
+  REQUIRE_FALSE(pending.has_value());
+  CHECK(pending.error().code == ErrorCode::not_found);
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "UPDATE threads SET locked_at=6 WHERE thread_id='thread-1'")
+              .has_value());
+  const auto locked =
+      (*store)->create_reply(*write, {.board_id = std::string(board_id),
+                                      .thread_id = "thread-1",
+                                      .message_id = "message-locked",
+                                      .parent_message_id = std::nullopt,
+                                      .author_handle = "alice",
+                                      .body = "not allowed",
+                                      .created_at = {7}});
+  REQUIRE_FALSE(locked.has_value());
+  CHECK(locked.error().code == ErrorCode::not_found);
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "UPDATE messages SET local_sequence=9223372036854775807 "
+                  "WHERE message_id='message-2'")
+              .has_value());
+  const auto exhausted =
+      (*store)->create_reply(*write, {.board_id = std::string(board_id),
+                                      .thread_id = "thread-2",
+                                      .message_id = "message-overflow",
+                                      .parent_message_id = std::nullopt,
+                                      .author_handle = "alice",
+                                      .body = "not allowed",
+                                      .created_at = {8}});
+  REQUIRE_FALSE(exhausted.has_value());
+  CHECK(exhausted.error().code == ErrorCode::conflict);
 }
 
 TEST_CASE("SQLite provisions and resolves local credentials atomically") {
@@ -546,7 +874,7 @@ TEST_CASE("SQLite version-three migration expires legacy bearer codes") {
 
   auto upgraded = SqliteStore::open(database.path());
   REQUIRE(upgraded.has_value());
-  CHECK((*upgraded)->schema_version() == 3);
+  CHECK((*upgraded)->schema_version() == 4);
   auto claim = (*upgraded)->begin(TransactionMode::read_write);
   REQUIRE(claim.has_value());
   const auto expired =
@@ -557,6 +885,62 @@ TEST_CASE("SQLite version-three migration expires legacy bearer codes") {
   CHECK(expired.error().code == ErrorCode::conflict);
   CHECK((*upgraded)->scalar_for_testing(*claim,
                                         "SELECT expires_at FROM invites") == 0);
+}
+
+TEST_CASE("SQLite version-four migration preserves boards reports and order") {
+  TemporaryDatabase database;
+  constexpr std::array version_three_migrations{
+      SqliteMigration{1, {}},
+      SqliteMigration{2, anvil::store::detail::domain_schema_v2},
+      SqliteMigration{3, anvil::store::detail::invite_economics_v3},
+  };
+  auto old = anvil::store::detail::open_sqlite_store(database.path(),
+                                                     version_three_migrations);
+  REQUIRE(old.has_value());
+  auto seed = (*old)->begin(TransactionMode::read_write);
+  REQUIRE(seed.has_value());
+  REQUIRE((*old)
+              ->execute_for_testing(
+                  *seed,
+                  "INSERT INTO users(handle,status,created_at) VALUES"
+                  "('alice','active',1);"
+                  "INSERT INTO boards(board_id,name,title,created_at) VALUES"
+                  "('00000000-0000-0000-0000-000000000001','general',"
+                  "'General',2);"
+                  "INSERT INTO threads(thread_id,board_id,author_handle,"
+                  "subject,created_at,updated_at) VALUES"
+                  "('thread-1','00000000-0000-0000-0000-000000000001',"
+                  "'alice','Welcome',3,3);"
+                  "INSERT INTO messages(message_id,board_id,thread_id,"
+                  "author_handle,body,posted_at,received_at) VALUES"
+                  "('message-b','00000000-0000-0000-0000-000000000001',"
+                  "'thread-1','alice','second',4,5),"
+                  "('message-a','00000000-0000-0000-0000-000000000001',"
+                  "'thread-1','alice','first',4,5);"
+                  "INSERT INTO reports(report_id,reporter_handle,target_kind,"
+                  "target_id,evidence,created_at) VALUES"
+                  "('report-1','alice','message','message-a','reason',6)")
+              .has_value());
+  REQUIRE(seed->commit().has_value());
+  old->reset();
+
+  auto upgraded = SqliteStore::open(database.path());
+  REQUIRE(upgraded.has_value());
+  CHECK((*upgraded)->schema_version() == 4);
+  auto read = (*upgraded)->begin(TransactionMode::read_only);
+  REQUIRE(read.has_value());
+  CHECK((*upgraded)->scalar_for_testing(
+            *read, "SELECT guest_readable FROM boards") == 1);
+  CHECK((*upgraded)->scalar_text_for_testing(
+            *read,
+            "SELECT group_concat(message_id, ',') FROM "
+            "(SELECT message_id FROM messages ORDER BY local_sequence)") ==
+        "message-a,message-b");
+  CHECK((*upgraded)->scalar_text_for_testing(
+            *read, "SELECT reporter_kind || ':' || reporter_handle || ':' || "
+                   "evidence FROM reports") == "registered:alice:reason");
+  CHECK((*upgraded)->scalar_for_testing(
+            *read, "SELECT count(*) FROM pragma_foreign_key_check") == 0);
 }
 
 TEST_CASE("SQLite upgrades the claimed version-one database") {
@@ -571,13 +955,13 @@ TEST_CASE("SQLite upgrades the claimed version-one database") {
   auto upgraded = SqliteStore::open(database.path());
 
   REQUIRE(upgraded.has_value());
-  CHECK((*upgraded)->schema_version() == 3);
+  CHECK((*upgraded)->schema_version() == 4);
   auto transaction = (*upgraded)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
   CHECK((*upgraded)->scalar_for_testing(
             *transaction,
             "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND "
-            "name NOT LIKE 'sqlite_%'") == 17);
+            "name NOT LIKE 'sqlite_%'") == 19);
 }
 
 TEST_CASE("domain schema preserves federation-safe storage contracts") {
@@ -946,7 +1330,7 @@ TEST_CASE("SQLite startup rejects newer and foreign databases") {
     auto transaction = (*store)->begin(TransactionMode::read_write);
     REQUIRE(transaction.has_value());
     REQUIRE((*store)
-                ->execute_for_testing(*transaction, "PRAGMA user_version=4")
+                ->execute_for_testing(*transaction, "PRAGMA user_version=5")
                 .has_value());
     REQUIRE(transaction->commit().has_value());
 

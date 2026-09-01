@@ -52,6 +52,10 @@ services:
       - "${ANVIL_TOS_VERSION:?set ANVIL_TOS_VERSION to the current opaque version}"
       - --tos-file
       - /run/secrets/tos_text
+      - --board
+      - "general=${ANVIL_GENERAL_BOARD_TITLE:-General}"
+      - --guest-report-rate-limit
+      - "${ANVIL_GUEST_REPORT_RATE_LIMIT:-5/3600}"
       - --backup-directory
       - /var/lib/anvil/backups
       - --backup-interval-seconds

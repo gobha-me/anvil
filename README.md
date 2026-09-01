@@ -147,7 +147,10 @@ refuses symlinked key files, oversized or malformed key material, and host
 private keys accessible by group or others.
 
 Connect anonymously with `ssh guest@HOST`. Guest sessions can see the board
-and door-menu shell but have no writable controls. Any signed key not yet in
+and door-menu shell but have no posting controls. Guests may report a visible
+thread or post; anonymous reports are limited in supervisor memory per source
+address (default `5/3600`), and no network address is persisted with a report.
+Any signed key not yet in
 the database is governed by `--registration-mode`: `open` permits handle
 selection, `invite` requires a valid single-use invite before handle selection,
 and `closed` explains that the board is not accepting registrations while
@@ -162,6 +165,22 @@ the current version. Operators must change the version whenever the text
 changes; Anvil compares identifiers and does not interpret legal text.
 There is no email or recovery address: losing every registered key loses the
 account.
+
+Boards are provisioned declaratively at startup with repeatable
+`--board NAME=TITLE` and `--member-board NAME=TITLE` options. Names are stable
+lowercase slugs; repeating a declaration updates its title and visibility
+without replacing its identity. Public boards are visible to guests.
+Registered-only boards are hidden completely from guests, including their
+existence and content. A fresh database with no declarations receives the
+public `general=General` board; later starts do not synthesize another board.
+
+The board screen is designed for an 80x24 tier-1 terminal. Arrow keys select a
+board or thread and Enter opens it. Active users press `n` to start a thread,
+`r` to reply, or `q` for a structural quote-reply; `c` catches up a board and
+`!` reports the current post. Quote relationships are stored as message IDs,
+not pasted terminal text. Post bodies remain inert plain text and ANSI is never
+stored. Opening a thread records an exact per-user message sequence, so posts
+received in the same second still produce correct unread counts.
 
 Active users type `/invite` to issue a 32-character opaque bearer code. Anvil
 displays the raw code once, stores only its SHA-256 hash, and atomically claims
@@ -576,10 +595,11 @@ At startup Anvil creates `anvil.db` in the working directory unless
 applies every pending migration in one transaction before opening either
 listener or forking. Migrations are compiled into the binary, strictly
 forward-only, and tracked with SQLite's `user_version`. Schema version 1 claims
-the otherwise empty file with application ID `ANVL`; version 2 adds the exact
-17-table domain schema, and version 3 adds invite balances, expiry, and the
-single-edge graph constraint without adding a table. Legacy unclaimed codes
-expire during that migration. An unknown application ID, a non-empty unclaimed
+the otherwise empty file with application ID `ANVL`; version 2 adds the base
+17-table domain schema, version 3 adds invite economics, and version 4 adds
+board visibility, local message ordering, board/thread read markers, and
+anonymous reports. Existing boards migrate as public and legacy registered
+reports retain their identity and evidence. An unknown application ID, a non-empty unclaimed
 file, corrupt data, or a schema newer than the binary stops startup. There is
 no migration metadata table, private-chat table, or plugin-owned table.
 

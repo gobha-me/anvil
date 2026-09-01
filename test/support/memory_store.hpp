@@ -201,6 +201,18 @@ private:
     store::UtcEpochSeconds accepted_at;
   };
 
+  struct BoardEntry {
+    store::BoardRecord record;
+    store::UtcEpochSeconds created_at;
+  };
+
+  struct ReadEntry {
+    std::string user_handle;
+    std::string board_id;
+    std::optional<std::string> thread_id;
+    std::int64_t sequence{};
+  };
+
   struct State {
     std::vector<TransactionObservation> observations;
     std::optional<store::Error> next_commit_error;
@@ -210,6 +222,10 @@ private:
     std::vector<store::CredentialRecord> credentials;
     std::vector<InviteEntry> invites;
     std::vector<TosEntry> tos_acceptances;
+    std::vector<BoardEntry> boards;
+    std::vector<store::ThreadRecord> threads;
+    std::vector<ReadEntry> reads;
+    std::vector<store::ReportSubmission> reports;
   };
 
   static void upsert_content(std::vector<ContentEntry> &contents,
@@ -249,8 +265,9 @@ private:
         : state_(std::move(state)), index_(index), mode_(mode),
           contents_(state_->contents), messages_(state_->messages),
           users_(state_->users), credentials_(state_->credentials),
-          invites_(state_->invites), tos_acceptances_(state_->tos_acceptances) {
-    }
+          invites_(state_->invites), tos_acceptances_(state_->tos_acceptances),
+          boards_(state_->boards), threads_(state_->threads),
+          reads_(state_->reads), reports_(state_->reports) {}
 
     [[nodiscard]] auto commit() -> std::expected<void, store::Error> override {
       ++state_->observations.at(index_).commit_attempts;
@@ -266,6 +283,10 @@ private:
         state_->credentials = credentials_;
         state_->invites = invites_;
         state_->tos_acceptances = tos_acceptances_;
+        state_->boards = boards_;
+        state_->threads = threads_;
+        state_->reads = reads_;
+        state_->reports = reports_;
       }
       return {};
     }
@@ -288,6 +309,11 @@ private:
       return messages_;
     }
 
+    [[nodiscard]] auto messages() const noexcept
+        -> const std::vector<store::MessageRecord> & {
+      return messages_;
+    }
+
     [[nodiscard]] auto users() noexcept -> std::vector<UserEntry> & {
       return users_;
     }
@@ -305,6 +331,39 @@ private:
       return tos_acceptances_;
     }
 
+    [[nodiscard]] auto boards() noexcept -> std::vector<BoardEntry> & {
+      return boards_;
+    }
+
+    [[nodiscard]] auto boards() const noexcept
+        -> const std::vector<BoardEntry> & {
+      return boards_;
+    }
+
+    [[nodiscard]] auto threads() noexcept
+        -> std::vector<store::ThreadRecord> & {
+      return threads_;
+    }
+
+    [[nodiscard]] auto threads() const noexcept
+        -> const std::vector<store::ThreadRecord> & {
+      return threads_;
+    }
+
+    [[nodiscard]] auto reads() noexcept -> std::vector<ReadEntry> & {
+      return reads_;
+    }
+
+    [[nodiscard]] auto reads() const noexcept
+        -> const std::vector<ReadEntry> & {
+      return reads_;
+    }
+
+    [[nodiscard]] auto reports() noexcept
+        -> std::vector<store::ReportSubmission> & {
+      return reports_;
+    }
+
   private:
     std::shared_ptr<State> state_;
     std::size_t index_;
@@ -315,6 +374,10 @@ private:
     std::vector<store::CredentialRecord> credentials_;
     std::vector<InviteEntry> invites_;
     std::vector<TosEntry> tos_acceptances_;
+    std::vector<BoardEntry> boards_;
+    std::vector<store::ThreadRecord> threads_;
+    std::vector<ReadEntry> reads_;
+    std::vector<store::ReportSubmission> reports_;
   };
 
   [[nodiscard]] auto backend(store::Transaction &transaction) const noexcept
@@ -712,6 +775,441 @@ private:
       frontier = std::move(next);
     }
     return result;
+  }
+
+  [[nodiscard]] static bool active_content(const Backend &active,
+                                           store::ContentKind kind,
+                                           std::string_view identifier) {
+    return status_of(active.contents(), {kind, std::string(identifier)}) ==
+           store::ContentStatus::active;
+  }
+
+  [[nodiscard]] static std::int64_t next_sequence(const Backend &active) {
+    std::int64_t sequence = 0;
+    for (const auto &message : active.messages()) {
+      sequence = std::max(sequence, message.local_sequence);
+    }
+    return sequence + 1;
+  }
+
+  [[nodiscard]] static std::int64_t
+  read_through(const Backend &active, std::string_view user_handle,
+               std::string_view board_id,
+               const std::optional<std::string> &thread_id) {
+    const auto found =
+        std::ranges::find_if(active.reads(), [&](const ReadEntry &entry) {
+          return entry.user_handle == user_handle &&
+                 entry.board_id == board_id && entry.thread_id == thread_id;
+        });
+    return found == active.reads().end() ? 0 : found->sequence;
+  }
+
+  [[nodiscard]] auto reconcile_board_impl(store::Transaction &transaction,
+                                          const store::BoardProvision &board)
+      -> std::expected<store::BoardRecord, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    auto existing =
+        std::ranges::find_if(active->boards(), [&](const BoardEntry &entry) {
+          return entry.record.name == board.name;
+        });
+    if (existing != active->boards().end()) {
+      if (!active_content(*active, store::ContentKind::board,
+                          existing->record.board_id)) {
+        return std::unexpected(
+            store::Error{store::ErrorCode::conflict,
+                         "board declaration matches a tombstoned board"});
+      }
+      existing->record.title = board.title;
+      existing->record.visibility = board.visibility;
+      return existing->record;
+    }
+    store::BoardRecord record{.board_id = board.board_id,
+                              .name = board.name,
+                              .title = board.title,
+                              .description = {},
+                              .visibility = board.visibility,
+                              .unread_messages = 0};
+    active->boards().push_back({record, board.created_at});
+    upsert_content(active->contents(),
+                   {store::ContentKind::board, record.board_id},
+                   store::ContentStatus::active);
+    return record;
+  }
+
+  [[nodiscard]] auto list_boards_impl(store::Transaction &transaction,
+                                      const store::BoardReader &reader)
+      -> std::expected<std::vector<store::BoardRecord>, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    std::vector<store::BoardRecord> result;
+    for (const auto &entry : active->boards()) {
+      if (!active_content(*active, store::ContentKind::board,
+                          entry.record.board_id) ||
+          (!reader.may_read_registered &&
+           entry.record.visibility ==
+               store::BoardVisibility::registered_only)) {
+        continue;
+      }
+      auto record = entry.record;
+      record.unread_messages = 0;
+      if (reader.handle) {
+        const auto board_marker = read_through(*active, *reader.handle,
+                                               record.board_id, std::nullopt);
+        for (const auto &message : active->messages()) {
+          if (message.board_id != record.board_id ||
+              !active_content(*active, store::ContentKind::message,
+                              message.message_id) ||
+              !active_content(*active, store::ContentKind::thread,
+                              message.thread_id)) {
+            continue;
+          }
+          const auto thread_marker = read_through(
+              *active, *reader.handle, record.board_id, message.thread_id);
+          if (message.local_sequence > std::max(board_marker, thread_marker)) {
+            ++record.unread_messages;
+          }
+        }
+      }
+      result.push_back(std::move(record));
+    }
+    std::ranges::sort(result, {}, &store::BoardRecord::name);
+    return result;
+  }
+
+  [[nodiscard]] auto list_threads_impl(store::Transaction &transaction,
+                                       std::string_view board_id,
+                                       const store::BoardReader &reader)
+      -> std::expected<std::vector<store::ThreadRecord>,
+                       store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto board =
+        std::ranges::find_if(active->boards(), [&](const BoardEntry &entry) {
+          return entry.record.board_id == board_id;
+        });
+    if (board == active->boards().end() ||
+        !active_content(*active, store::ContentKind::board, board_id) ||
+        (!reader.may_read_registered &&
+         board->record.visibility == store::BoardVisibility::registered_only)) {
+      return std::vector<store::ThreadRecord>{};
+    }
+    std::vector<store::ThreadRecord> result;
+    for (auto thread : active->threads()) {
+      if (thread.board_id != board_id ||
+          !active_content(*active, store::ContentKind::thread,
+                          thread.thread_id)) {
+        continue;
+      }
+      thread.message_count = 0;
+      thread.unread_messages = 0;
+      const auto board_marker =
+          reader.handle
+              ? read_through(*active, *reader.handle, board_id, std::nullopt)
+              : 0;
+      const auto thread_marker = reader.handle
+                                     ? read_through(*active, *reader.handle,
+                                                    board_id, thread.thread_id)
+                                     : 0;
+      for (const auto &message : active->messages()) {
+        if (message.thread_id == thread.thread_id &&
+            active_content(*active, store::ContentKind::message,
+                           message.message_id)) {
+          ++thread.message_count;
+          if (reader.handle &&
+              message.local_sequence > std::max(board_marker, thread_marker)) {
+            ++thread.unread_messages;
+          }
+        }
+      }
+      result.push_back(std::move(thread));
+    }
+    std::ranges::sort(result, [](const auto &left, const auto &right) {
+      return left.updated_at != right.updated_at
+                 ? left.updated_at > right.updated_at
+                 : left.thread_id < right.thread_id;
+    });
+    return result;
+  }
+
+  [[nodiscard]] auto list_messages_for_thread_impl(
+      store::Transaction &transaction, std::string_view board_id,
+      std::string_view thread_id, const store::BoardReader &reader)
+      -> std::expected<std::vector<store::MessageRecord>,
+                       store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    auto visible_threads = list_threads_impl(transaction, board_id, reader);
+    if (!visible_threads ||
+        std::ranges::find(*visible_threads, thread_id,
+                          &store::ThreadRecord::thread_id) ==
+            visible_threads->end()) {
+      return std::vector<store::MessageRecord>{};
+    }
+    std::vector<store::MessageRecord> result;
+    for (const auto &message : active->messages()) {
+      if (message.board_id == board_id && message.thread_id == thread_id &&
+          active_content(*active, store::ContentKind::message,
+                         message.message_id)) {
+        result.push_back(message);
+      }
+    }
+    std::ranges::sort(result, {}, &store::MessageRecord::local_sequence);
+    return result;
+  }
+
+  [[nodiscard]] auto create_thread_impl(store::Transaction &transaction,
+                                        const store::ThreadCreate &thread)
+      -> std::expected<store::MessageRecord, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto user = std::ranges::find(active->users(), thread.author_handle,
+                                        &UserEntry::handle);
+    if (!active_content(*active, store::ContentKind::board, thread.board_id) ||
+        user == active->users().end() ||
+        user->status != store::UserStatus::active) {
+      return std::unexpected(store::Error{store::ErrorCode::not_found,
+                                          "thread target is not active"});
+    }
+    if (std::ranges::find(active->threads(), thread.thread_id,
+                          &store::ThreadRecord::thread_id) !=
+            active->threads().end() ||
+        std::ranges::find(active->messages(), thread.message_id,
+                          &store::MessageRecord::message_id) !=
+            active->messages().end()) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "thread identity already exists"});
+    }
+    const auto sequence = next_sequence(*active);
+    active->threads().push_back({.thread_id = thread.thread_id,
+                                 .board_id = thread.board_id,
+                                 .author_handle = thread.author_handle,
+                                 .subject = thread.subject,
+                                 .created_at = thread.created_at,
+                                 .updated_at = thread.created_at,
+                                 .locked = false,
+                                 .message_count = 1,
+                                 .unread_messages = 0});
+    upsert_content(active->contents(),
+                   {store::ContentKind::thread, thread.thread_id},
+                   store::ContentStatus::active);
+    store::MessageRecord message{.message_id = thread.message_id,
+                                 .board_id = thread.board_id,
+                                 .thread_id = thread.thread_id,
+                                 .parent_message_id = std::nullopt,
+                                 .author_handle = thread.author_handle,
+                                 .author_origin = std::nullopt,
+                                 .body = thread.body,
+                                 .posted_at = thread.created_at,
+                                 .received_at = thread.created_at,
+                                 .local_sequence = sequence,
+                                 .status = store::ContentStatus::active};
+    active->messages().push_back(message);
+    upsert_content(active->contents(),
+                   {store::ContentKind::message, message.message_id},
+                   store::ContentStatus::active);
+    return message;
+  }
+
+  [[nodiscard]] auto create_reply_impl(store::Transaction &transaction,
+                                       const store::ReplyCreate &reply)
+      -> std::expected<store::MessageRecord, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto user = std::ranges::find(active->users(), reply.author_handle,
+                                        &UserEntry::handle);
+    const auto thread = std::ranges::find(active->threads(), reply.thread_id,
+                                          &store::ThreadRecord::thread_id);
+    const auto parent =
+        reply.parent_message_id
+            ? std::ranges::find(active->messages(), *reply.parent_message_id,
+                                &store::MessageRecord::message_id)
+            : active->messages().end();
+    if (user == active->users().end() ||
+        user->status != store::UserStatus::active ||
+        thread == active->threads().end() ||
+        thread->board_id != reply.board_id || thread->locked ||
+        !active_content(*active, store::ContentKind::board, reply.board_id) ||
+        !active_content(*active, store::ContentKind::thread, reply.thread_id) ||
+        (reply.parent_message_id &&
+         (parent == active->messages().end() ||
+          parent->thread_id != reply.thread_id ||
+          !active_content(*active, store::ContentKind::message,
+                          *reply.parent_message_id)))) {
+      return std::unexpected(store::Error{store::ErrorCode::not_found,
+                                          "reply target is not active"});
+    }
+    if (std::ranges::find(active->messages(), reply.message_id,
+                          &store::MessageRecord::message_id) !=
+        active->messages().end()) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "message identity already exists"});
+    }
+    store::MessageRecord message{.message_id = reply.message_id,
+                                 .board_id = reply.board_id,
+                                 .thread_id = reply.thread_id,
+                                 .parent_message_id = reply.parent_message_id,
+                                 .author_handle = reply.author_handle,
+                                 .author_origin = std::nullopt,
+                                 .body = reply.body,
+                                 .posted_at = reply.created_at,
+                                 .received_at = reply.created_at,
+                                 .local_sequence = next_sequence(*active),
+                                 .status = store::ContentStatus::active};
+    active->messages().push_back(message);
+    upsert_content(active->contents(),
+                   {store::ContentKind::message, message.message_id},
+                   store::ContentStatus::active);
+    thread->updated_at = std::max(thread->updated_at, reply.created_at);
+    return message;
+  }
+
+  [[nodiscard]] auto mark_thread_read_impl(store::Transaction &transaction,
+                                           std::string_view user_handle,
+                                           std::string_view board_id,
+                                           std::string_view thread_id)
+      -> std::expected<void, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr ||
+        !active_content(*active, store::ContentKind::board, board_id) ||
+        !active_content(*active, store::ContentKind::thread, thread_id)) {
+      return std::unexpected(store::Error{store::ErrorCode::not_found,
+                                          "thread read target does not exist"});
+    }
+    std::int64_t sequence = 0;
+    for (const auto &message : active->messages()) {
+      if (message.thread_id == thread_id &&
+          active_content(*active, store::ContentKind::message,
+                         message.message_id)) {
+        sequence = std::max(sequence, message.local_sequence);
+      }
+    }
+    auto marker = std::ranges::find_if(active->reads(), [&](const auto &entry) {
+      return entry.user_handle == user_handle && entry.board_id == board_id &&
+             entry.thread_id == thread_id;
+    });
+    if (marker == active->reads().end()) {
+      active->reads().push_back({std::string(user_handle),
+                                 std::string(board_id), std::string(thread_id),
+                                 sequence});
+    } else {
+      marker->sequence = std::max(marker->sequence, sequence);
+    }
+    return {};
+  }
+
+  [[nodiscard]] auto catch_up_board_impl(store::Transaction &transaction,
+                                         std::string_view user_handle,
+                                         std::string_view board_id)
+      -> std::expected<void, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr ||
+        !active_content(*active, store::ContentKind::board, board_id)) {
+      return std::unexpected(store::Error{store::ErrorCode::not_found,
+                                          "catch-up board does not exist"});
+    }
+    std::int64_t sequence = 0;
+    for (const auto &message : active->messages()) {
+      if (message.board_id == board_id &&
+          active_content(*active, store::ContentKind::message,
+                         message.message_id) &&
+          active_content(*active, store::ContentKind::thread,
+                         message.thread_id)) {
+        sequence = std::max(sequence, message.local_sequence);
+      }
+    }
+    auto marker = std::ranges::find_if(active->reads(), [&](const auto &entry) {
+      return entry.user_handle == user_handle && entry.board_id == board_id &&
+             !entry.thread_id;
+    });
+    if (marker == active->reads().end()) {
+      active->reads().push_back({std::string(user_handle),
+                                 std::string(board_id), std::nullopt,
+                                 sequence});
+    } else {
+      marker->sequence = std::max(marker->sequence, sequence);
+    }
+    return {};
+  }
+
+  [[nodiscard]] auto submit_report_impl(store::Transaction &transaction,
+                                        const store::ReportSubmission &report)
+      -> std::expected<void, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    if (std::ranges::find(active->reports(), report.report_id,
+                          &store::ReportSubmission::report_id) !=
+        active->reports().end()) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "report identity already exists"});
+    }
+    const auto &target = std::get<std::string>(report.target.id);
+    bool visible = active_content(*active, report.target.kind, target);
+    std::string target_board;
+    if (report.target.kind == store::ContentKind::thread) {
+      const auto thread = std::ranges::find(active->threads(), target,
+                                            &store::ThreadRecord::thread_id);
+      visible = visible && thread != active->threads().end();
+      if (thread != active->threads().end()) {
+        target_board = thread->board_id;
+      }
+    } else {
+      const auto message = std::ranges::find(active->messages(), target,
+                                             &store::MessageRecord::message_id);
+      visible = visible && message != active->messages().end() &&
+                active_content(*active, store::ContentKind::thread,
+                               message == active->messages().end()
+                                   ? std::string_view{}
+                                   : message->thread_id);
+      if (message != active->messages().end()) {
+        target_board = message->board_id;
+      }
+    }
+    const auto board =
+        std::ranges::find_if(active->boards(), [&](const BoardEntry &entry) {
+          return entry.record.board_id == target_board;
+        });
+    visible =
+        visible && board != active->boards().end() &&
+        active_content(*active, store::ContentKind::board, target_board) &&
+        (report.reporter_handle ||
+         board->record.visibility == store::BoardVisibility::public_read);
+    if (!visible) {
+      return std::unexpected(store::Error{store::ErrorCode::not_found,
+                                          "report target is not visible"});
+    }
+    if (report.reporter_handle &&
+        std::ranges::find(active->users(), *report.reporter_handle,
+                          &UserEntry::handle) == active->users().end()) {
+      return std::unexpected(
+          store::Error{store::ErrorCode::not_found, "reporter does not exist"});
+    }
+    active->reports().push_back(report);
+    upsert_content(active->contents(),
+                   {store::ContentKind::report, report.report_id},
+                   store::ContentStatus::active);
+    return {};
   }
 
   std::shared_ptr<State> state_;
