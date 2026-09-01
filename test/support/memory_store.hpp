@@ -218,6 +218,7 @@ private:
     std::optional<store::Error> next_commit_error;
     std::vector<ContentEntry> contents;
     std::vector<store::MessageRecord> messages;
+    std::vector<store::OnelinerRecord> oneliners;
     std::vector<UserEntry> users;
     std::vector<store::CredentialRecord> credentials;
     std::vector<InviteEntry> invites;
@@ -264,10 +265,11 @@ private:
             store::TransactionMode mode)
         : state_(std::move(state)), index_(index), mode_(mode),
           contents_(state_->contents), messages_(state_->messages),
-          users_(state_->users), credentials_(state_->credentials),
-          invites_(state_->invites), tos_acceptances_(state_->tos_acceptances),
-          boards_(state_->boards), threads_(state_->threads),
-          reads_(state_->reads), reports_(state_->reports) {}
+          oneliners_(state_->oneliners), users_(state_->users),
+          credentials_(state_->credentials), invites_(state_->invites),
+          tos_acceptances_(state_->tos_acceptances), boards_(state_->boards),
+          threads_(state_->threads), reads_(state_->reads),
+          reports_(state_->reports) {}
 
     [[nodiscard]] auto commit() -> std::expected<void, store::Error> override {
       ++state_->observations.at(index_).commit_attempts;
@@ -279,6 +281,7 @@ private:
       if (mode_ == store::TransactionMode::read_write) {
         state_->contents = contents_;
         state_->messages = messages_;
+        state_->oneliners = oneliners_;
         state_->users = users_;
         state_->credentials = credentials_;
         state_->invites = invites_;
@@ -312,6 +315,16 @@ private:
     [[nodiscard]] auto messages() const noexcept
         -> const std::vector<store::MessageRecord> & {
       return messages_;
+    }
+
+    [[nodiscard]] auto oneliners() noexcept
+        -> std::vector<store::OnelinerRecord> & {
+      return oneliners_;
+    }
+
+    [[nodiscard]] auto oneliners() const noexcept
+        -> const std::vector<store::OnelinerRecord> & {
+      return oneliners_;
     }
 
     [[nodiscard]] auto users() noexcept -> std::vector<UserEntry> & {
@@ -370,6 +383,7 @@ private:
     store::TransactionMode mode_;
     std::vector<ContentEntry> contents_;
     std::vector<store::MessageRecord> messages_;
+    std::vector<store::OnelinerRecord> oneliners_;
     std::vector<UserEntry> users_;
     std::vector<store::CredentialRecord> credentials_;
     std::vector<InviteEntry> invites_;
@@ -410,6 +424,13 @@ private:
                                              &store::MessageRecord::message_id);
       if (message != active->messages().end()) {
         message->status = store::ContentStatus::tombstoned;
+      }
+    } else if (content.kind == store::ContentKind::oneliner) {
+      const auto &identifier = std::get<std::string>(content.id);
+      const auto oneliner = std::ranges::find(
+          active->oneliners(), identifier, &store::OnelinerRecord::oneliner_id);
+      if (oneliner != active->oneliners().end()) {
+        oneliner->status = store::ContentStatus::tombstoned;
       }
     }
     return {};
@@ -1174,7 +1195,7 @@ private:
       if (thread != active->threads().end()) {
         target_board = thread->board_id;
       }
-    } else {
+    } else if (report.target.kind == store::ContentKind::message) {
       const auto message = std::ranges::find(active->messages(), target,
                                              &store::MessageRecord::message_id);
       visible = visible && message != active->messages().end() &&
@@ -1185,16 +1206,23 @@ private:
       if (message != active->messages().end()) {
         target_board = message->board_id;
       }
+    } else if (report.target.kind == store::ContentKind::oneliner) {
+      visible =
+          visible && std::ranges::find(active->oneliners(), target,
+                                       &store::OnelinerRecord::oneliner_id) !=
+                         active->oneliners().end();
     }
-    const auto board =
-        std::ranges::find_if(active->boards(), [&](const BoardEntry &entry) {
-          return entry.record.board_id == target_board;
-        });
-    visible =
-        visible && board != active->boards().end() &&
-        active_content(*active, store::ContentKind::board, target_board) &&
-        (report.reporter_handle ||
-         board->record.visibility == store::BoardVisibility::public_read);
+    if (report.target.kind != store::ContentKind::oneliner) {
+      const auto board =
+          std::ranges::find_if(active->boards(), [&](const BoardEntry &entry) {
+            return entry.record.board_id == target_board;
+          });
+      visible =
+          visible && board != active->boards().end() &&
+          active_content(*active, store::ContentKind::board, target_board) &&
+          (report.reporter_handle ||
+           board->record.visibility == store::BoardVisibility::public_read);
+    }
     if (!visible) {
       return std::unexpected(store::Error{store::ErrorCode::not_found,
                                           "report target is not visible"});
@@ -1210,6 +1238,122 @@ private:
                    {store::ContentKind::report, report.report_id},
                    store::ContentStatus::active);
     return {};
+  }
+
+  [[nodiscard]] auto create_oneliner_impl(store::Transaction &transaction,
+                                          const store::OnelinerCreate &oneliner,
+                                          const store::OnelinerPolicy &policy)
+      -> std::expected<store::OnelinerRecord, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto user = std::ranges::find(active->users(), oneliner.author_handle,
+                                        &UserEntry::handle);
+    if (user == active->users().end() ||
+        user->status != store::UserStatus::active) {
+      return std::unexpected(
+          store::Error{store::ErrorCode::not_found,
+                       "one-liner author is not an active local user"});
+    }
+    if (std::ranges::find(active->oneliners(), oneliner.oneliner_id,
+                          &store::OnelinerRecord::oneliner_id) !=
+        active->oneliners().end()) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "one-liner identity already exists"});
+    }
+    const auto cutoff =
+        saturating_subtract(oneliner.received_at, policy.window_seconds);
+    const auto recent = std::ranges::count_if(
+        active->oneliners(), [&](const store::OnelinerRecord &entry) {
+          return entry.author_handle == oneliner.author_handle &&
+                 !entry.author_origin && entry.received_at.value > cutoff;
+        });
+    if (static_cast<std::uint64_t>(recent) >= policy.max_posts) {
+      return std::unexpected(store::Error{store::ErrorCode::conflict,
+                                          "one-liner rate limit reached"});
+    }
+    store::OnelinerRecord record{.oneliner_id = oneliner.oneliner_id,
+                                 .author_handle = oneliner.author_handle,
+                                 .author_origin = std::nullopt,
+                                 .body = oneliner.body,
+                                 .posted_at = oneliner.posted_at,
+                                 .received_at = oneliner.received_at,
+                                 .status = store::ContentStatus::active};
+    active->oneliners().push_back(record);
+    upsert_content(active->contents(),
+                   {store::ContentKind::oneliner, record.oneliner_id},
+                   store::ContentStatus::active);
+    return record;
+  }
+
+  [[nodiscard]] auto list_oneliners_impl(store::Transaction &transaction,
+                                         store::UtcEpochSeconds now,
+                                         const store::OnelinerPolicy &policy,
+                                         std::uint32_t limit)
+      -> std::expected<std::vector<store::OnelinerRecord>,
+                       store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto cutoff = saturating_subtract(now, policy.retention_seconds);
+    std::vector<store::OnelinerRecord> result;
+    for (const auto &entry : active->oneliners()) {
+      if (entry.status == store::ContentStatus::active &&
+          entry.received_at.value > cutoff) {
+        result.push_back(entry);
+      }
+    }
+    std::ranges::sort(result, [](const auto &left, const auto &right) {
+      return left.received_at != right.received_at
+                 ? left.received_at > right.received_at
+                 : left.oneliner_id > right.oneliner_id;
+    });
+    if (result.size() > limit) {
+      result.resize(limit);
+    }
+    return result;
+  }
+
+  [[nodiscard]] auto
+  purge_expired_oneliners_impl(store::Transaction &transaction,
+                               store::UtcEpochSeconds now,
+                               const store::OnelinerPolicy &policy)
+      -> std::expected<std::uint64_t, store::Error> override {
+    auto *active = backend(transaction);
+    if (active == nullptr) {
+      return std::unexpected(store::Error{store::ErrorCode::invalid_state,
+                                          "invalid memory transaction"});
+    }
+    const auto cutoff = saturating_subtract(now, policy.retention_seconds);
+    std::vector<std::string> expired;
+    for (const auto &entry : active->oneliners()) {
+      if (entry.received_at.value <= cutoff) {
+        expired.push_back(entry.oneliner_id);
+      }
+    }
+    std::erase_if(active->oneliners(), [&](const auto &entry) {
+      return entry.received_at.value <= cutoff;
+    });
+    std::erase_if(active->contents(), [&](const ContentEntry &entry) {
+      return entry.content.kind == store::ContentKind::oneliner &&
+             std::ranges::find(expired, std::get<std::string>(
+                                            entry.content.id)) != expired.end();
+    });
+    return static_cast<std::uint64_t>(expired.size());
+  }
+
+  [[nodiscard]] static constexpr auto
+  saturating_subtract(store::UtcEpochSeconds value,
+                      std::uint32_t seconds) noexcept -> std::int64_t {
+    const auto amount = static_cast<std::int64_t>(seconds);
+    if (value.value < std::numeric_limits<std::int64_t>::min() + amount) {
+      return std::numeric_limits<std::int64_t>::min();
+    }
+    return value.value - amount;
   }
 
   std::shared_ptr<State> state_;

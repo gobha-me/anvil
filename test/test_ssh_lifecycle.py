@@ -133,7 +133,9 @@ def main() -> int:
             idle_session.stdin.write(b"awake\n")
             idle_session.stdin.flush()
             read_until(idle_session, b"awake", 2)
-            read_until(idle_session, b"idle session will close in 2 seconds", 3)
+            # A prior one-liner status can let TermForge reuse matching cells,
+            # so subsequent differential frames need not repeat the prefix.
+            read_until(idle_session, b"will close in 2 seconds", 3)
             output, error = wait_for_session_message(
                 idle_session, b"session closed after the idle timeout", 4
             )

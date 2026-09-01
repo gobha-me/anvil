@@ -509,4 +509,11 @@ DROP TABLE reports;
 ALTER TABLE reports_v4 RENAME TO reports;
 )sql";
 
+inline constexpr std::string_view oneliner_indexes_v5 = R"sql(
+CREATE INDEX oneliners_visible_received
+  ON oneliners(status, received_at DESC, oneliner_id DESC);
+CREATE INDEX oneliners_author_received
+  ON oneliners(author_handle, author_origin_key, received_at DESC);
+)sql";
+
 } // namespace anvil::store::detail

@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include <anvil/store.hpp>
+
 #include "session_resources.hpp"
 
 namespace anvil::server {
@@ -71,6 +73,7 @@ struct Config {
   RateLimit connection_rate{10, std::chrono::seconds(10)};
   RateLimit auth_attempt_rate{6, std::chrono::seconds(60)};
   RateLimit guest_report_rate{5, std::chrono::seconds(3600)};
+  store::OnelinerPolicy oneliner_policy{3, 300, 1'209'600};
   std::uint32_t max_auth_attempts_per_session{6};
   std::uint32_t max_tracked_ips{4096};
   std::chrono::seconds idle_timeout{300};

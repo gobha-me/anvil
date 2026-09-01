@@ -253,11 +253,15 @@ def assert_ssh_session(port: int, user: str) -> None:
         f"{user}@127.0.0.1",
     ]
     result = run(
-        command, check=False, input_bytes=b"ACCEPT\ncontainer-smoke\x1b", timeout=15
+        command,
+        check=False,
+        input_bytes=b"ACCEPT\n\x1b",
+        timeout=15,
     )
-    if b"container-smoke" not in result.stdout:
+    if b"Current terms accepted." not in result.stdout:
         raise AssertionError(
-            f"SSH smoke test did not echo input\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
+            "SSH smoke test did not reach an accepted terminal session\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
         )
 
 

@@ -2,6 +2,7 @@
 #include <anvil/sdk.hpp>
 #include <anvil/store.hpp>
 
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <string>
@@ -196,6 +197,33 @@ private:
     return std::unexpected(
         anvil::store::Error{anvil::store::ErrorCode::unavailable,
                             "consumer fixture has no board backend"});
+  }
+
+  [[nodiscard]] auto create_oneliner_impl(anvil::store::Transaction &,
+                                          const anvil::store::OnelinerCreate &,
+                                          const anvil::store::OnelinerPolicy &)
+      -> std::expected<anvil::store::OnelinerRecord,
+                       anvil::store::Error> override {
+    return std::unexpected(
+        anvil::store::Error{anvil::store::ErrorCode::unavailable,
+                            "consumer fixture has no one-liner backend"});
+  }
+
+  [[nodiscard]] auto list_oneliners_impl(anvil::store::Transaction &,
+                                         anvil::store::UtcEpochSeconds,
+                                         const anvil::store::OnelinerPolicy &,
+                                         std::uint32_t)
+      -> std::expected<std::vector<anvil::store::OnelinerRecord>,
+                       anvil::store::Error> override {
+    return std::vector<anvil::store::OnelinerRecord>{};
+  }
+
+  [[nodiscard]] auto
+  purge_expired_oneliners_impl(anvil::store::Transaction &,
+                               anvil::store::UtcEpochSeconds,
+                               const anvil::store::OnelinerPolicy &)
+      -> std::expected<std::uint64_t, anvil::store::Error> override {
+    return 0U;
   }
 };
 

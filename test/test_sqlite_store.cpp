@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -28,6 +29,7 @@ using anvil::store::ContentStatus;
 using anvil::store::CredentialStatus;
 using anvil::store::ErrorCode;
 using anvil::store::LocalCredentialProvision;
+using anvil::store::OnelinerPolicy;
 using anvil::store::ReplyCreate;
 using anvil::store::ReportSubmission;
 using anvil::store::SqliteOptions;
@@ -121,12 +123,17 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
   auto store = SqliteStore::open(database.path());
 
   REQUIRE(store.has_value());
-  CHECK((*store)->schema_version() == 4);
+  CHECK((*store)->schema_version() == 5);
   auto transaction = (*store)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA application_id") ==
         0x414E564C);
-  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") == 4);
+  CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA user_version") == 5);
+  CHECK((*store)->scalar_for_testing(
+            *transaction,
+            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND "
+            "name IN ('oneliners_visible_received',"
+            "'oneliners_author_received')") == 2);
   CHECK((*store)->scalar_for_testing(*transaction, "PRAGMA synchronous") == 2);
   CHECK((*store)->scalar_for_testing(*transaction,
                                      "PRAGMA wal_autocheckpoint") == 1000);
@@ -146,7 +153,7 @@ TEST_CASE("SQLite startup creates exactly the domain schema") {
 
   auto reopened = SqliteStore::open(database.path());
   REQUIRE(reopened.has_value());
-  CHECK((*reopened)->schema_version() == 4);
+  CHECK((*reopened)->schema_version() == 5);
 }
 
 TEST_CASE("SQLite board visibility is enforced inside every board read") {
@@ -874,7 +881,7 @@ TEST_CASE("SQLite version-three migration expires legacy bearer codes") {
 
   auto upgraded = SqliteStore::open(database.path());
   REQUIRE(upgraded.has_value());
-  CHECK((*upgraded)->schema_version() == 4);
+  CHECK((*upgraded)->schema_version() == 5);
   auto claim = (*upgraded)->begin(TransactionMode::read_write);
   REQUIRE(claim.has_value());
   const auto expired =
@@ -926,7 +933,7 @@ TEST_CASE("SQLite version-four migration preserves boards reports and order") {
 
   auto upgraded = SqliteStore::open(database.path());
   REQUIRE(upgraded.has_value());
-  CHECK((*upgraded)->schema_version() == 4);
+  CHECK((*upgraded)->schema_version() == 5);
   auto read = (*upgraded)->begin(TransactionMode::read_only);
   REQUIRE(read.has_value());
   CHECK((*upgraded)->scalar_for_testing(
@@ -955,7 +962,7 @@ TEST_CASE("SQLite upgrades the claimed version-one database") {
   auto upgraded = SqliteStore::open(database.path());
 
   REQUIRE(upgraded.has_value());
-  CHECK((*upgraded)->schema_version() == 4);
+  CHECK((*upgraded)->schema_version() == 5);
   auto transaction = (*upgraded)->begin(TransactionMode::read_only);
   REQUIRE(transaction.has_value());
   CHECK((*upgraded)->scalar_for_testing(
@@ -1282,6 +1289,110 @@ TEST_CASE("SQLite tombstone failures are values and rollback is atomic") {
         1);
 }
 
+TEST_CASE("SQLite one-liners enforce rate, order, reports, and retention") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  {
+    auto seed = (*store)->begin(TransactionMode::read_write);
+    REQUIRE(seed.has_value());
+    REQUIRE((*store)
+                ->execute_for_testing(
+                    *seed, "INSERT INTO users(handle,status,created_at) "
+                           "VALUES('alice','active',1),('bob','active',1)")
+                .has_value());
+    REQUIRE(seed->commit().has_value());
+  }
+  constexpr OnelinerPolicy policy{
+      .max_posts = 3, .window_seconds = 300, .retention_seconds = 1'209'600};
+  const auto post = [&](std::string id, std::string handle, std::int64_t at) {
+    auto write = (*store)->begin(TransactionMode::read_write);
+    REQUIRE(write.has_value());
+    auto created =
+        (*store)->create_oneliner(*write,
+                                  {.oneliner_id = std::move(id),
+                                   .author_handle = std::move(handle),
+                                   .body = "hello wall",
+                                   .posted_at = {at},
+                                   .received_at = {at}},
+                                  policy);
+    if (created) {
+      REQUIRE(write->commit().has_value());
+    }
+    return created;
+  };
+
+  REQUIRE(post("line-a", "alice", 100).has_value());
+  REQUIRE(post("line-b", "alice", 101).has_value());
+  REQUIRE(post("line-c", "alice", 102).has_value());
+  REQUIRE(post("line-z", "bob", 102).has_value());
+  const auto limited = post("line-d", "alice", 103);
+  REQUIRE_FALSE(limited.has_value());
+  CHECK(limited.error().code == ErrorCode::conflict);
+
+  {
+    auto tombstone = (*store)->begin(TransactionMode::read_write);
+    REQUIRE(tombstone.has_value());
+    REQUIRE((*store)
+                ->tombstone(*tombstone,
+                            {ContentKind::oneliner, std::string{"line-a"}})
+                .has_value());
+    REQUIRE(tombstone->commit().has_value());
+  }
+  REQUIRE(post("line-d", "alice", 103).error().code == ErrorCode::conflict);
+  REQUIRE(post("line-e", "alice", 400).has_value());
+
+  {
+    auto read = (*store)->begin(TransactionMode::read_only);
+    REQUIRE(read.has_value());
+    auto visible = (*store)->list_oneliners(*read, {400}, policy, 100);
+    REQUIRE(visible.has_value());
+    REQUIRE(visible->size() == 4);
+    CHECK((*visible)[0].oneliner_id == "line-e");
+    CHECK((*visible)[1].oneliner_id == "line-z");
+    CHECK((*visible)[2].oneliner_id == "line-c");
+    CHECK((*visible)[3].oneliner_id == "line-b");
+    REQUIRE(read->commit().has_value());
+  }
+
+  {
+    auto report = (*store)->begin(TransactionMode::read_write);
+    REQUIRE(report.has_value());
+    REQUIRE((*store)
+                ->submit_report(
+                    *report, ReportSubmission{.report_id = "report-line",
+                                              .reporter_handle = std::nullopt,
+                                              .target = {ContentKind::oneliner,
+                                                         std::string{"line-e"}},
+                                              .reason = "needs review",
+                                              .created_at = {401}})
+                .has_value());
+    REQUIRE(report->commit().has_value());
+  }
+
+  {
+    auto purge = (*store)->begin(TransactionMode::read_write);
+    REQUIRE(purge.has_value());
+    auto purged =
+        (*store)->purge_expired_oneliners(*purge, {1'209'702}, policy);
+    REQUIRE(purged.has_value());
+    CHECK(*purged == 4);
+    REQUIRE(purge->commit().has_value());
+  }
+  auto verify = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(verify.has_value());
+  CHECK((*store)->scalar_for_testing(*verify,
+                                     "SELECT count(*) FROM oneliners") == 1);
+  CHECK((*store)->scalar_for_testing(
+            *verify,
+            "SELECT count(*) FROM reports WHERE target_kind='oneliner' AND "
+            "target_id='line-e'") == 1);
+  const auto minimum_time = (*store)->list_oneliners(
+      *verify, {std::numeric_limits<std::int64_t>::min()}, policy, 100);
+  REQUIRE(minimum_time.has_value());
+  CHECK(minimum_time->size() == 1);
+}
+
 TEST_CASE("SQLite migrations are ordered and atomic") {
   TemporaryDatabase database;
   constexpr std::array migrations{
@@ -1330,7 +1441,7 @@ TEST_CASE("SQLite startup rejects newer and foreign databases") {
     auto transaction = (*store)->begin(TransactionMode::read_write);
     REQUIRE(transaction.has_value());
     REQUIRE((*store)
-                ->execute_for_testing(*transaction, "PRAGMA user_version=5")
+                ->execute_for_testing(*transaction, "PRAGMA user_version=6")
                 .has_value());
     REQUIRE(transaction->commit().has_value());
 
