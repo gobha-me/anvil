@@ -46,12 +46,10 @@ src/main.cpp	cppcoreguidelines-pro-bounds-pointer-arithmetic	e771ad95c8d63189231
 src/remote_bytes.hpp	cppcoreguidelines-pro-bounds-pointer-arithmetic	a5b33e77f33effa868a3	do not use pointer arithmetic
 src/remote_bytes.hpp	cppcoreguidelines-pro-type-reinterpret-cast	e4495948b7c7aff0f4ad	do not use reinterpret_cast
 src/server.cpp	bugprone-implicit-widening-of-multiplication-result	0a712884cbd8a7f0f43b	performing an implicit widening conversion to type 'const std::size_t' (aka 'const unsigned long') of a multiplication performed in type 'unsigned int'
-src/server.cpp	bugprone-implicit-widening-of-multiplication-result	79c00fecf32d747b3ce7	performing an implicit widening conversion to type 'size_type' (aka 'unsigned long') of a multiplication performed in type 'unsigned int'
 src/server.cpp	bugprone-implicit-widening-of-multiplication-result	8ec56a99daf1d8f8f261	performing an implicit widening conversion to type 'const std::size_t' (aka 'const unsigned long') of a multiplication performed in type 'unsigned int'
 src/server.cpp	bugprone-implicit-widening-of-multiplication-result	9475be1029026eef6fc4	performing an implicit widening conversion to type 'const std::size_t' (aka 'const unsigned long') of a multiplication performed in type 'unsigned int'
 src/server.cpp	concurrency-mt-unsafe	0751c57fc13620260979	function is not thread safe
 src/server.cpp	concurrency-mt-unsafe	12d1d35c35690435064b	function is not thread safe
-src/server.cpp	concurrency-mt-unsafe	2da6ded05993f33da136	function is not thread safe
 src/server.cpp	concurrency-mt-unsafe	32baef938f62997a7d98	function is not thread safe
 src/server.cpp	concurrency-mt-unsafe	45e8bd363c5756776e5a	function is not thread safe
 src/server.cpp	concurrency-mt-unsafe	5d9a2dba8676a340ba07	function is not thread safe
@@ -64,9 +62,7 @@ src/server.cpp	concurrency-mt-unsafe	cd5492cc54dd18eeee15	function is not thread
 src/server.cpp	concurrency-mt-unsafe	d0cc91e7b72a20ce996a	function is not thread safe
 src/server.cpp	cppcoreguidelines-avoid-do-while	1c20a00cdeae35d699e5	avoid do-while loops
 src/server.cpp	cppcoreguidelines-avoid-do-while	4eb73ec932013e2347ff	avoid do-while loops
-src/server.cpp	cppcoreguidelines-avoid-do-while	7107b4b286c4606b544c	avoid do-while loops
 src/server.cpp	cppcoreguidelines-avoid-do-while	89c2eb8185e20a596930	avoid do-while loops
-src/server.cpp	cppcoreguidelines-avoid-do-while	8b7b72f02ad5cc56f734	avoid do-while loops
 src/server.cpp	cppcoreguidelines-avoid-do-while	ff27730a26fa33761eab	avoid do-while loops
 src/server.cpp	cppcoreguidelines-pro-bounds-pointer-arithmetic	7d6fffd41ba996c1a0a8	do not use pointer arithmetic
 src/server.cpp	cppcoreguidelines-pro-bounds-pointer-arithmetic	aaef4582e7c9b3c9f258	do not use pointer arithmetic
@@ -91,7 +87,6 @@ src/server.cpp	modernize-use-integer-sign-comparison	a622ce5ca1363ba4fa50	compar
 src/server.cpp	modernize-use-integer-sign-comparison	d071f371ae38531e21cf	comparison between 'signed' and 'unsigned' integers
 src/server.cpp	modernize-use-integer-sign-comparison	ddb8e7a27707af3836ee	comparison between 'signed' and 'unsigned' integers
 src/server.cpp	modernize-use-integer-sign-comparison	e6a22c8e55349d3aa7ce	comparison between 'signed' and 'unsigned' integers
-src/server.cpp	readability-redundant-casting	5cb13c1eb81d028b8a72	redundant explicit casting to the same type 'void' as the sub-expression, remove this casting
 src/server.cpp	readability-simplify-boolean-expr	c1719d2496c3c6f53136	boolean expression can be simplified by DeMorgan's theorem
 src/session_resources.cpp	bugprone-implicit-widening-of-multiplication-result	3bf5c7c3ca26d9a6cb15	performing an implicit widening conversion to type 'const std::size_t' (aka 'const unsigned long') of a multiplication performed in type 'unsigned int'
 src/session_resources.cpp	cppcoreguidelines-avoid-do-while	09195e4dcdbf3af4d4de	avoid do-while loops
