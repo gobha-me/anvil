@@ -217,6 +217,7 @@ void remove_fixed_snapshot(int parent, std::string_view name) noexcept {
   static_cast<void>(::unlinkat(parent, directory_name.c_str(), AT_REMOVEDIR));
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- security-sensitive syscall failures stay adjacent to their cleanup
 [[nodiscard]] auto copy_host_key(const std::filesystem::path &source,
                                  int destination_directory,
                                  std::string_view destination_name)
@@ -464,6 +465,7 @@ auto create_snapshot(store::SqliteStore &database,
   return Snapshot{backup_directory / final_name, now};
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- fail-closed directory walking keeps every retention check explicit
 auto prune_snapshots(const std::filesystem::path &backup_directory,
                      std::chrono::seconds retention,
                      std::chrono::system_clock::time_point now)

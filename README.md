@@ -757,6 +757,16 @@ cmake --build build-clang --parallel
 ctest --test-dir build-clang --output-on-failure
 ```
 
+Run the LLVM 20 static-analysis gate locally with `tools/lint.sh`. It analyzes
+every shipped translation unit with broad clang-tidy check families and treats
+every new or changed diagnostic as an error. `ANVIL_TIDY_JOBS` controls
+parallelism and defaults to two. Prefer fixing findings; an intentional exception must use an
+exact `NOLINT(check)` or `NOLINTNEXTLINE(check)` followed by `--` and a
+meaningful same-line justification. Bare, wildcard, and block-wide
+suppressions are rejected. The initial non-structural legacy findings are
+pinned by exact source context in `tools/clang-tidy-baseline.tsv`; that baseline
+may only shrink, while any new diagnostic must be fixed or justified in source.
+
 Use `cmake/toolchain/hardened.cmake` with `Release` or `RelWithDebInfo` for a
 production ELF. Configuration fails for an unoptimized build so fortification
 cannot silently become a no-op. Use

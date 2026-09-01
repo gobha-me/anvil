@@ -289,6 +289,7 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
   return sqlite3_column_int64(statement, column);
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- column-specific validation must identify the exact corrupt SQLite field
 [[nodiscard]] auto read_message(sqlite3_stmt *statement)
     -> std::expected<MessageRecord, Error> {
   if (sqlite3_column_count(statement) != 11) {
@@ -1053,6 +1054,7 @@ auto SqliteStore::list_messages_for_board_impl(Transaction &transaction,
   return query_messages(backend->database(), sql, board_id, false);
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- nullable columns and status decoding retain precise corrupt-row diagnostics
 auto SqliteStore::find_local_credential_impl(Transaction &transaction,
                                              std::string_view fingerprint)
     -> std::expected<std::optional<CredentialRecord>, Error> {
@@ -1133,6 +1135,7 @@ auto SqliteStore::find_local_credential_impl(Transaction &transaction,
                           .status = status};
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- user and credential conflict handling share one atomic transaction boundary
 auto SqliteStore::provision_local_credential_impl(
     Transaction &transaction, const LocalCredentialProvision &provision)
     -> std::expected<void, Error> {
@@ -1308,6 +1311,7 @@ auto SqliteStore::has_tos_acceptance_impl(Transaction &transaction,
                                       "cannot look up TOS acceptance"));
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- status transition and append-only acceptance remain one atomic operation
 auto SqliteStore::accept_tos_impl(Transaction &transaction,
                                   const TosAcceptance &acceptance)
     -> std::expected<UserStatus, Error> {
@@ -1463,6 +1467,7 @@ auto SqliteStore::claim_invite_impl(Transaction &transaction,
   return {};
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- credit regeneration and code issuance must commit atomically
 auto SqliteStore::issue_invite_impl(Transaction &transaction,
                                     const InviteIssue &issue)
     -> std::expected<InviteIssueResult, Error> {
@@ -1690,6 +1695,7 @@ auto SqliteStore::find_inviter_impl(Transaction &transaction,
                                               .status = *status}};
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- recursive-query rows are validated explicitly before becoming ancestry evidence
 auto SqliteStore::list_invite_subtree_impl(Transaction &transaction,
                                            std::string_view root_handle)
     -> std::expected<std::vector<InviteDescendant>, Error> {
@@ -1786,6 +1792,7 @@ SELECT u.handle,u.origin,u.status,d.depth
   return result;
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- create-or-update provisioning must remain one atomic startup operation
 auto SqliteStore::reconcile_board_impl(Transaction &transaction,
                                        const BoardProvision &board)
     -> std::expected<BoardRecord, Error> {
@@ -2192,6 +2199,7 @@ auto SqliteStore::create_thread_impl(Transaction &transaction,
   return message;
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- thread and parent authority checks share the message insertion transaction
 auto SqliteStore::create_reply_impl(Transaction &transaction,
                                     const ReplyCreate &reply)
     -> std::expected<MessageRecord, Error> {
@@ -2409,6 +2417,7 @@ read_through_sequence=max(board_reads.read_through_sequence,
   return {};
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- target visibility and reporter authority checks remain co-located
 auto SqliteStore::submit_report_impl(Transaction &transaction,
                                      const ReportSubmission &report)
     -> std::expected<void, Error> {
@@ -2775,6 +2784,7 @@ auto SqliteStore::scalar_text_for_testing(Transaction &transaction,
 
 namespace detail {
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- admission, migration, and rollback form one fail-closed database sequence
 auto open_sqlite_store(const std::filesystem::path &path,
                        std::span<const SqliteMigration> migrations,
                        SqliteOptions options)

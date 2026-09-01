@@ -146,6 +146,7 @@ namespace {
   return {};
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- strict allocation-free UTF-8 validation keeps every rejected byte class explicit
 [[nodiscard]] auto valid_tos_version(std::string_view version) -> bool {
   if (!valid_opaque_identifier(version, 128)) {
     return false;

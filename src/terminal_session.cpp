@@ -100,6 +100,7 @@ public:
       : descriptor_(descriptor), resources_(resources),
         stop_requested_(stop_requested) {}
 
+  // NOLINTNEXTLINE(readability-function-cognitive-complexity) -- quota, polling, and write failures form one ordered retry state machine
   [[nodiscard]] auto write(std::span<const char> bytes)
       -> std::expected<void, termforge::ErrorEvent> override {
     for (;;) {
@@ -190,6 +191,7 @@ struct SharedState {
 
 class EchoApp final : public termforge::App {
 public:
+  // NOLINTNEXTLINE(readability-function-cognitive-complexity) -- construction validates each external dependency before callbacks are registered
   EchoApp(int descriptor, std::string terminal_type,
           TerminalDimensions dimensions,
           std::chrono::steady_clock::time_point channel_opened,
@@ -307,6 +309,7 @@ public:
 
   auto on_start() -> void override { driver().set_output(&sink_); }
 
+  // NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- one dispatcher preserves terminal mode authority and event ordering
   auto on_event(const termforge::Event &event) -> void override {
     if (shared_.stop_requested.load(std::memory_order_acquire)) {
       quit();
@@ -973,6 +976,7 @@ private:
     status_ = "Report submitted.";
   }
 
+  // NOLINTNEXTLINE(readability-function-cognitive-complexity) -- branches deliberately mirror the complete set of user-visible screen modes
   void render_board_screen(termforge::Screen &screen, termforge::Rgb foreground,
                            termforge::Rgb accent, termforge::Rgb background) {
     const auto identity_line =

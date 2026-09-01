@@ -555,6 +555,7 @@ class HealthMonitor::Impl {
 
 HealthMonitor::HealthMonitor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- shared-memory and child startup must unwind through one ordered failure path
 auto HealthMonitor::start(const Config &config) -> std::unique_ptr<HealthMonitor> {
   if (config.max_sessions == 0U || config.max_sessions > max_shared_sessions) {
     throw std::runtime_error("health session capacity is invalid");
@@ -665,7 +666,7 @@ auto HealthMonitor::start(const Config &config) -> std::unique_ptr<HealthMonitor
       message += ": ";
       message += reason;
     }
-    throw std::runtime_error(std::move(message));
+    throw std::runtime_error(message);
   }
   return std::unique_ptr<HealthMonitor>(
       new HealthMonitor(std::make_unique<Impl>(shared, child, control[0])));

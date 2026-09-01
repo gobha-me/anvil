@@ -1,0 +1,62 @@
+---
+InheritParentConfig: false
+
+# Enable whole high-signal families so new LLVM 20 checks remain visible.
+# Exclusions are durable Anvil policy decisions, not a passing-check allowlist.
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -clang-analyzer-apiModeling.google.GTest,
+  -clang-analyzer-apiModeling.llvm.*,
+  -clang-analyzer-fuchsia.*,
+  -clang-analyzer-optin.mpi.*,
+  -clang-analyzer-optin.osx.*,
+  -clang-analyzer-osx.*,
+  -cppcoreguidelines-avoid-const-or-ref-data-members,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-special-member-functions,
+  -misc-const-correctness,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-use-designated-initializers,
+  -modernize-use-emplace,
+  -modernize-use-ranges,
+  -modernize-use-trailing-return-type,
+  -modernize-raw-string-literal,
+  -performance-enum-size,
+  -performance-unnecessary-value-param,
+  -readability-avoid-nested-conditional-operator,
+  -readability-braces-around-statements,
+  -readability-convert-member-functions-to-static,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-named-parameter,
+  -readability-qualified-auto,
+  -readability-redundant-member-init
+
+HeaderFilterRegex: '^.*/(include/anvil|src)/'
+ExcludeHeaderFilterRegex: '^.*/(build[^/]*/|_deps)/'
+SystemHeaders: false
+FormatStyle: file
+
+CheckOptions:
+  # Two same-typed arguments are common in small value constructors. Three or
+  # more adjacent parameters still deserve a naming or type review.
+  bugprone-easily-swappable-parameters.MinimumLength: '3'
+  # Complexity is a design boundary. Intentional exceptions require a
+  # justified, check-specific NOLINT on the function.
+  readability-function-cognitive-complexity.Threshold: '20'
+  readability-function-cognitive-complexity.DescribeBasicIncrements: 'true'
+  # Large straight-line functions remain visible even when branching is low.
+  readability-function-size.LineThreshold: '200'
+  readability-function-size.StatementThreshold: '100'

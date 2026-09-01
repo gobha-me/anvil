@@ -68,6 +68,7 @@ auto is_well_formed_utf8(std::string_view input) noexcept -> bool {
   return true;
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- hostile UTF-8 and grapheme limits are enforced together in one bounded pass
 auto prepare_user_text_for_ingest(UserTextField field, RemoteBytes remote_input)
     -> std::expected<std::string, UserTextError> {
   const auto input = remote_input.text();
