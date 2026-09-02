@@ -23,7 +23,6 @@
 #include <string>
 #include <string_view>
 #include <termforge/core/app.hpp>
-#include <termforge/core/byte_sink.hpp>
 #include <termforge/widgets/composer.hpp>
 #include <termforge/widgets/list_widget.hpp>
 #include <termforge/widgets/text_box.hpp>
@@ -34,6 +33,7 @@
 
 #include "authentication.hpp"
 #include "server.hpp"
+#include "session_sink.hpp"
 #include "text_sanitization.hpp"
 
 namespace anvil::server {
@@ -44,7 +44,6 @@ using namespace std::chrono_literals;
 constexpr int max_cell_dimension = 1000;
 constexpr int max_pixel_dimension = 65'535;
 constexpr std::size_t max_echo_size = 4096;
-constexpr auto sink_stall_timeout = 5s;
 
 [[nodiscard]] store::UtcEpochSeconds utc_now() {
   return {std::chrono::duration_cast<std::chrono::seconds>(
@@ -93,86 +92,6 @@ constexpr auto sink_stall_timeout = 5s;
   return {width, height};
 }
 
-class SocketSink final : public termforge::ByteSink {
-public:
-  SocketSink(int descriptor, SessionResources &resources,
-             const std::atomic<bool> &stop_requested) noexcept
-      : descriptor_(descriptor), resources_(resources),
-        stop_requested_(stop_requested) {}
-
-  // NOLINTNEXTLINE(readability-function-cognitive-complexity) -- quota, polling, and write failures form one ordered retry state machine
-  [[nodiscard]] auto write(std::span<const char> bytes)
-      -> std::expected<void, termforge::ErrorEvent> override {
-    for (;;) {
-      const auto delay = resources_.output_delay(
-          bytes.size(), std::chrono::steady_clock::now());
-      if (!delay) {
-        return std::unexpected(termforge::ErrorEvent{
-            termforge::Severity::Error, "resource.output",
-            "session output frame exceeds the configured one-second burst"});
-      }
-      if (*delay <= std::chrono::steady_clock::duration::zero()) {
-        resources_.consume_output(bytes.size());
-        break;
-      }
-      if (stop_requested_.load(std::memory_order_acquire)) {
-        return std::unexpected(termforge::ErrorEvent{
-            termforge::Severity::Error, "ssh", "session output stopped"});
-      }
-      std::this_thread::sleep_for(std::min(
-          *delay,
-          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-              10ms)));
-    }
-
-    const auto deadline = std::chrono::steady_clock::now() + sink_stall_timeout;
-    std::size_t offset = 0;
-    while (offset < bytes.size()) {
-      const auto count = ::send(descriptor_, bytes.data() + offset,
-                                bytes.size() - offset, MSG_NOSIGNAL);
-      if (count > 0) {
-        offset += static_cast<std::size_t>(count);
-        continue;
-      }
-      if (count < 0 && errno == EINTR) {
-        continue;
-      }
-      if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now());
-        if (remaining <= 0ms) {
-          return std::unexpected(termforge::ErrorEvent{
-              termforge::Severity::Error, "ssh",
-              "SSH output stalled before a complete frame could be queued"});
-        }
-        pollfd descriptor{.fd = descriptor_, .events = POLLOUT, .revents = 0};
-        const auto ready =
-            ::poll(&descriptor, 1, static_cast<int>(remaining.count()));
-        if (ready > 0) {
-          continue;
-        }
-        if (ready < 0 && errno == EINTR) {
-          continue;
-        }
-        return std::unexpected(termforge::ErrorEvent{
-            termforge::Severity::Error, "ssh",
-            ready == 0
-                ? "SSH output stalled before a complete frame could be queued"
-                : "SSH output wait failed"});
-      }
-      return std::unexpected(termforge::ErrorEvent{
-          termforge::Severity::Error, "ssh", "SSH output channel closed"});
-    }
-    return {};
-  }
-
-private:
-  int descriptor_;
-  SessionResources &resources_;
-  const std::atomic<bool> &stop_requested_;
-};
-
 struct SharedState {
   SharedState(TerminalDimensions initial_dimensions,
               SessionResourceLimits resource_limits)
@@ -191,7 +110,6 @@ struct SharedState {
 
 class EchoApp final : public termforge::App {
 public:
-  // NOLINTNEXTLINE(readability-function-cognitive-complexity) -- construction validates each external dependency before callbacks are registered
   EchoApp(int descriptor, std::string terminal_type,
           TerminalDimensions dimensions,
           std::chrono::steady_clock::time_point channel_opened,
@@ -213,93 +131,13 @@ public:
         oneliner_published_hook_(oneliner_published_hook),
         worker_report_descriptor_(worker_report_descriptor),
         session_id_(session_id),
-        screen_mode_((identity_.kind == IdentityKind::pending ||
-                      identity_.kind == IdentityKind::tos_required)
-                         ? ScreenMode::tos
-                         : ScreenMode::boards) {
-    const auto io =
-        terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
-    if (!io) {
-      throw std::runtime_error(io.error().message);
-    }
-    const auto env = terminal().set_env(
-        termforge::TerminalEnv{std::move(terminal_type), {}});
-    if (!env) {
-      throw std::runtime_error(env.error().message);
-    }
-    // Capability probing is deliberately deferred to the bounded, cached
-    // negotiation work in #42. An eager probe consumes bytes that may already
-    // contain the user's first keystrokes; M0 starts from the safe baseline.
-    const auto capabilities =
-        terminal().set_capabilities(termforge::Capabilities{});
-    if (!capabilities) {
-      throw std::runtime_error(capabilities.error().message);
-    }
-    const auto size = set_size(
-        termforge::App::Size{dimensions.columns, dimensions.rows,
-                             dimensions.pixel_width, dimensions.pixel_height});
-    if (!size) {
-      throw std::runtime_error(size.error().message);
-    }
-
-    input_.set_focused(true);
-    board_list_.set_focused(true);
-    oneliner_list_.set_focused(false);
-    thread_list_.set_focused(true);
-    message_box_.set_focused(true);
-    composer_.set_focused(true);
-    input_.set_placeholder("Type here");
-    append_tos_text();
-    input_.on_change([this, input_hook_for_testing](const std::string &text) {
-      clear_issued_invite_code();
-      auto sanitized = sanitize_prose_for_render(text);
-      if (text.size() <= max_echo_size && sanitized.size() <= max_echo_size) {
-        accepted_input_ = std::move(sanitized);
-        if (accepted_input_ != text) {
-          input_.set_text(accepted_input_);
-        }
-      } else {
-        input_.set_text(accepted_input_);
-      }
-      if (input_hook_for_testing != nullptr) {
-        input_hook_for_testing(text, shared_.resources);
-      }
-    });
-    composer_.set_enter_mode(termforge::ComposerEnterMode::Submit);
-    composer_.set_max_height(8);
-    if (screen_mode_ == ScreenMode::boards) {
-      load_boards();
-      load_oneliners();
-    }
+        screen_mode_(initial_screen_mode(identity_.kind)) {
+    configure_terminal(descriptor, std::move(terminal_type), dimensions);
+    configure_widgets();
+    install_callbacks(input_hook_for_testing);
+    load_initial_screen();
     set_render_mode(termforge::RenderMode::Demand);
-    set_frame_observer([this](const termforge::FrameObservation &observation) {
-      std::lock_guard lock(shared_.mutex);
-      auto &telemetry = shared_.telemetry;
-      ++telemetry.frames;
-      if (observation.output_accepted) {
-        ++telemetry.accepted_frames;
-        if (telemetry.accepted_frames == 1U) {
-          telemetry.first_frame_latency =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - channel_opened_);
-        }
-      }
-      telemetry.cell_bytes += observation.bytes.cells;
-      telemetry.image_transmit_bytes += observation.bytes.image_transmit;
-      telemetry.image_edit_bytes += observation.bytes.image_edit;
-      telemetry.last_frame_cell_bytes = observation.bytes.cells;
-      telemetry.last_frame_image_transmit_bytes =
-          observation.bytes.image_transmit;
-      telemetry.last_frame_image_edit_bytes = observation.bytes.image_edit;
-      if (observation.output_accepted) {
-        shared_.resources.reconcile_image(
-            driver().residency().source_payload_bytes);
-      }
-      shared_.progress_generation.fetch_add(1U, std::memory_order_release);
-      if (shared_.resources.limit_reason() == ResourceLimitReason::image) {
-        quit();
-      }
-    });
+    install_frame_observer();
   }
 
   ~EchoApp() override {
@@ -309,226 +147,32 @@ public:
 
   auto on_start() -> void override { driver().set_output(&sink_); }
 
-  // NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- one dispatcher preserves terminal mode authority and event ordering
   auto on_event(const termforge::Event &event) -> void override {
     if (shared_.stop_requested.load(std::memory_order_acquire)) {
       quit();
       return;
     }
 
-    if (const auto *key = std::get_if<termforge::KeyEvent>(&event)) {
-      if (key->action == termforge::KeyAction::Press &&
-          key->key == termforge::Key::Escape) {
-        if (screen_mode_ == ScreenMode::oneliner) {
-          screen_mode_ = ScreenMode::boards;
-          status_.clear();
-          return;
-        }
-        if (screen_mode_ == ScreenMode::thread ||
-            screen_mode_ == ScreenMode::subject ||
-            screen_mode_ == ScreenMode::compose ||
-            screen_mode_ == ScreenMode::report) {
-          composer_.clear();
-          input_.set_text({});
-          if (screen_mode_ == ScreenMode::report) {
-            report_target_.reset();
-            screen_mode_ = report_return_mode_;
-            return;
-          }
-          if (screen_mode_ == ScreenMode::thread) {
-            open_selected_board();
-          } else {
-            screen_mode_ = ScreenMode::threads;
-          }
-          return;
-        }
-        if (screen_mode_ == ScreenMode::threads) {
-          load_boards();
-          load_oneliners();
-          screen_mode_ = ScreenMode::boards;
-          return;
-        }
-        quit();
-        return;
-      }
-      if (key->action == termforge::KeyAction::Press &&
-          key->key == termforge::Key::Tab &&
-          screen_mode_ == ScreenMode::boards) {
-        entry_focus_ = entry_focus_ == EntryFocus::boards
-                           ? EntryFocus::oneliners
-                           : EntryFocus::boards;
-        board_list_.set_focused(entry_focus_ == EntryFocus::boards);
-        oneliner_list_.set_focused(entry_focus_ == EntryFocus::oneliners);
-        status_.clear();
-        return;
-      }
-      if (key->action == termforge::KeyAction::Press && key->ctrl &&
-          (key->ch == U'c' || key->ch == U'C')) {
-        quit();
-        return;
-      }
-      // A piped OpenSSH client commonly sends LF as Ctrl+J rather than CR.
-      // It is a submit key, never a printable "j" in the echo field.
-      if (key->action == termforge::KeyAction::Press &&
-          (key->key == termforge::Key::Enter ||
-           (key->ctrl && (key->ch == U'j' || key->ch == U'J' ||
-                          key->ch == U'm' || key->ch == U'M'))) &&
-          !(screen_mode_ == ScreenMode::compose && (key->shift || key->alt))) {
-        if (screen_mode_ == ScreenMode::subject) {
-          begin_new_thread_body();
-        } else if (screen_mode_ == ScreenMode::compose) {
-          submit_composition();
-        } else if (screen_mode_ == ScreenMode::report) {
-          submit_report();
-        } else if (screen_mode_ == ScreenMode::boards &&
-                   input_.text().empty()) {
-          if (entry_focus_ == EntryFocus::oneliners) {
-            open_selected_oneliner();
-          } else {
-            open_selected_board();
-          }
-        } else if (screen_mode_ == ScreenMode::threads &&
-                   input_.text().empty()) {
-          open_selected_thread();
-        } else if (identity_.kind == IdentityKind::registration) {
-          submit_registration();
-        } else if (screen_mode_ == ScreenMode::tos &&
-                   (identity_.kind == IdentityKind::pending ||
-                    identity_.kind == IdentityKind::tos_required)) {
-          submit_tos_command();
-        } else if (identity_.kind == IdentityKind::tos_required) {
-          submit_restricted_command();
-        } else if (identity_.kind == IdentityKind::active) {
-          submit_active_command();
-        }
-        return;
-      }
-      if (key->action == termforge::KeyAction::Press &&
-          screen_mode_ == ScreenMode::boards && !key->ctrl && !key->alt &&
-          key->ch == U'!' && input_.text().empty()) {
-        begin_oneliner_report();
-        return;
-      }
-      if (key->action == termforge::KeyAction::Press &&
-          screen_mode_ == ScreenMode::threads && !key->ctrl && !key->alt) {
-        if ((key->ch == U'n' || key->ch == U'N') && may_post()) {
-          input_.set_text({});
-          screen_mode_ = ScreenMode::subject;
-          status_.clear();
-          return;
-        }
-        if ((key->ch == U'c' || key->ch == U'C') &&
-            identity_.kind != IdentityKind::guest) {
-          catch_up_selected_board();
-          return;
-        }
-      }
-      if (key->action == termforge::KeyAction::Press &&
-          screen_mode_ == ScreenMode::thread && !key->ctrl && !key->alt) {
-        if ((key->ch == U'r' || key->ch == U'R') && may_post()) {
-          begin_reply(false);
-          return;
-        }
-        if ((key->ch == U'q' || key->ch == U'Q') && may_post()) {
-          begin_reply(true);
-          return;
-        }
-        if (key->ch == U'!') {
-          if (messages_.empty()) {
-            status_ = "There is no post to report.";
-            return;
-          }
-          report_target_ = store::ContentRef{store::ContentKind::message,
-                                             messages_.back().message_id};
-          report_return_mode_ = ScreenMode::thread;
-          composer_.clear();
-          screen_mode_ = ScreenMode::report;
-          status_.clear();
-          return;
-        }
-        if (key->ch == U'T' && selected_thread_ < threads_.size()) {
-          report_target_ = store::ContentRef{
-              store::ContentKind::thread, threads_[selected_thread_].thread_id};
-          report_return_mode_ = ScreenMode::thread;
-          composer_.clear();
-          screen_mode_ = ScreenMode::report;
-          status_.clear();
-          return;
-        }
-      }
+    if (const auto *key = std::get_if<termforge::KeyEvent>(&event);
+        key != nullptr && handle_key_event(*key)) {
+      return;
     }
 
     if (std::holds_alternative<termforge::ResizeEvent>(event)) {
-      TerminalDimensions dimensions;
-      {
-        std::lock_guard lock(shared_.mutex);
-        dimensions = shared_.dimensions;
-      }
-      const auto current = current_size();
-      const termforge::App::Size wanted{dimensions.columns, dimensions.rows,
-                                        dimensions.pixel_width,
-                                        dimensions.pixel_height};
-      if (current != wanted) {
-        if (const auto resized = set_size(wanted); !resized) {
-          status_ = resized.error().message;
-        }
-      }
+      handle_resize_event();
       return;
     }
 
     if (const auto *error = std::get_if<termforge::ErrorEvent>(&event)) {
-      if (error->source == "ssh") {
-        std::lock_guard lock(shared_.mutex);
-        notice_ = shared_.notice;
-        return;
-      }
-      if (error->source == "oneliners") {
-        if (screen_mode_ == ScreenMode::boards) {
-          shared_.oneliners_dirty.store(false, std::memory_order_release);
-          load_oneliners();
-        }
-        return;
-      }
-      status_ = error->message;
-      if (error->severity == termforge::Severity::Error) {
-        quit();
-      }
+      handle_error_event(*error);
       return;
     }
 
-    if (screen_mode_ == ScreenMode::tos && tos_box_.on_event(event)) {
+    if (dispatch_to_active_widget(event)) {
       return;
     }
 
-    if (screen_mode_ == ScreenMode::boards) {
-      auto &entry_list =
-          entry_focus_ == EntryFocus::oneliners ? oneliner_list_ : board_list_;
-      if (entry_list.on_event(event)) {
-        return;
-      }
-    }
-    if (screen_mode_ == ScreenMode::threads && thread_list_.on_event(event)) {
-      return;
-    }
-    if (screen_mode_ == ScreenMode::thread && message_box_.on_event(event)) {
-      return;
-    }
-    if (screen_mode_ == ScreenMode::oneliner && oneliner_box_.on_event(event)) {
-      return;
-    }
-    if ((screen_mode_ == ScreenMode::compose ||
-         screen_mode_ == ScreenMode::report) &&
-        composer_.on_event(event)) {
-      return;
-    }
-
-    if (((identity_.kind == IdentityKind::registration &&
-          registration_mode_ != RegistrationMode::closed) ||
-         identity_.kind == IdentityKind::pending ||
-         identity_.kind == IdentityKind::tos_required ||
-         identity_.kind == IdentityKind::active ||
-         screen_mode_ == ScreenMode::subject) &&
-        input_.on_event(event)) {
+    if (text_input_enabled() && input_.on_event(event)) {
       return;
     }
     termforge::App::on_event(event);
@@ -593,6 +237,369 @@ private:
   };
   enum class EntryFocus { boards, oneliners };
   enum class ComposeAction { new_thread, reply };
+
+  [[nodiscard]] static ScreenMode
+  initial_screen_mode(IdentityKind identity_kind) noexcept {
+    return identity_kind == IdentityKind::pending ||
+                   identity_kind == IdentityKind::tos_required
+               ? ScreenMode::tos
+               : ScreenMode::boards;
+  }
+
+  void configure_terminal(int descriptor, std::string terminal_type,
+                          TerminalDimensions dimensions) {
+    const auto io =
+        terminal().set_io(termforge::TerminalIo{descriptor, descriptor});
+    if (!io) {
+      throw std::runtime_error(io.error().message);
+    }
+    const auto env = terminal().set_env(
+        termforge::TerminalEnv{std::move(terminal_type), {}});
+    if (!env) {
+      throw std::runtime_error(env.error().message);
+    }
+    // Capability probing is deliberately deferred to the bounded, cached
+    // negotiation work in #42. An eager probe consumes bytes that may already
+    // contain the user's first keystrokes; M0 starts from the safe baseline.
+    const auto capabilities =
+        terminal().set_capabilities(termforge::Capabilities{});
+    if (!capabilities) {
+      throw std::runtime_error(capabilities.error().message);
+    }
+    const auto size = set_size(
+        termforge::App::Size{dimensions.columns, dimensions.rows,
+                             dimensions.pixel_width, dimensions.pixel_height});
+    if (!size) {
+      throw std::runtime_error(size.error().message);
+    }
+  }
+
+  void configure_widgets() {
+    input_.set_focused(true);
+    board_list_.set_focused(true);
+    oneliner_list_.set_focused(false);
+    thread_list_.set_focused(true);
+    message_box_.set_focused(true);
+    composer_.set_focused(true);
+    input_.set_placeholder("Type here");
+    append_tos_text();
+    composer_.set_enter_mode(termforge::ComposerEnterMode::Submit);
+    composer_.set_max_height(8);
+  }
+
+  void install_callbacks(SessionInputHook input_hook_for_testing) {
+    input_.on_change([this, input_hook_for_testing](const std::string &text) {
+      handle_input_change(text, input_hook_for_testing);
+    });
+  }
+
+  void install_frame_observer() {
+    set_frame_observer([this](const termforge::FrameObservation &observation) {
+      observe_frame(observation);
+    });
+  }
+
+  void load_initial_screen() {
+    if (screen_mode_ == ScreenMode::boards) {
+      load_boards();
+      load_oneliners();
+    }
+  }
+
+  void handle_input_change(const std::string &text,
+                           SessionInputHook input_hook_for_testing) {
+    clear_issued_invite_code();
+    auto sanitized = sanitize_prose_for_render(text);
+    if (text.size() <= max_echo_size && sanitized.size() <= max_echo_size) {
+      accepted_input_ = std::move(sanitized);
+      if (accepted_input_ != text) {
+        input_.set_text(accepted_input_);
+      }
+    } else {
+      input_.set_text(accepted_input_);
+    }
+    if (input_hook_for_testing != nullptr) {
+      input_hook_for_testing(text, shared_.resources);
+    }
+  }
+
+  void observe_frame(const termforge::FrameObservation &observation) {
+    std::lock_guard lock(shared_.mutex);
+    auto &telemetry = shared_.telemetry;
+    ++telemetry.frames;
+    if (observation.output_accepted) {
+      ++telemetry.accepted_frames;
+      if (telemetry.accepted_frames == 1U) {
+        telemetry.first_frame_latency =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - channel_opened_);
+      }
+    }
+    telemetry.cell_bytes += observation.bytes.cells;
+    telemetry.image_transmit_bytes += observation.bytes.image_transmit;
+    telemetry.image_edit_bytes += observation.bytes.image_edit;
+    telemetry.last_frame_cell_bytes = observation.bytes.cells;
+    telemetry.last_frame_image_transmit_bytes =
+        observation.bytes.image_transmit;
+    telemetry.last_frame_image_edit_bytes = observation.bytes.image_edit;
+    if (observation.output_accepted) {
+      shared_.resources.reconcile_image(
+          driver().residency().source_payload_bytes);
+    }
+    shared_.progress_generation.fetch_add(1U, std::memory_order_release);
+    if (shared_.resources.limit_reason() == ResourceLimitReason::image) {
+      quit();
+    }
+  }
+
+  [[nodiscard]] bool handle_key_event(const termforge::KeyEvent &key) {
+    if (key.action != termforge::KeyAction::Press) {
+      return false;
+    }
+    return handle_escape_key(key) || handle_focus_key(key) ||
+           handle_quit_key(key) || handle_submit_key(key) ||
+           handle_boards_key(key) || handle_threads_key(key) ||
+           handle_thread_key(key);
+  }
+
+  [[nodiscard]] bool handle_escape_key(const termforge::KeyEvent &key) {
+    if (key.key != termforge::Key::Escape) {
+      return false;
+    }
+    switch (screen_mode_) {
+    case ScreenMode::oneliner:
+      screen_mode_ = ScreenMode::boards;
+      status_.clear();
+      break;
+    case ScreenMode::thread:
+      clear_composition_inputs();
+      open_selected_board();
+      break;
+    case ScreenMode::subject:
+    case ScreenMode::compose:
+      clear_composition_inputs();
+      screen_mode_ = ScreenMode::threads;
+      break;
+    case ScreenMode::report:
+      clear_composition_inputs();
+      report_target_.reset();
+      screen_mode_ = report_return_mode_;
+      break;
+    case ScreenMode::threads:
+      load_boards();
+      load_oneliners();
+      screen_mode_ = ScreenMode::boards;
+      break;
+    case ScreenMode::boards:
+    case ScreenMode::tos:
+      quit();
+      break;
+    }
+    return true;
+  }
+
+  void clear_composition_inputs() {
+    composer_.clear();
+    input_.set_text({});
+  }
+
+  [[nodiscard]] bool handle_focus_key(const termforge::KeyEvent &key) {
+    if (key.key != termforge::Key::Tab || screen_mode_ != ScreenMode::boards) {
+      return false;
+    }
+    entry_focus_ = entry_focus_ == EntryFocus::boards ? EntryFocus::oneliners
+                                                      : EntryFocus::boards;
+    board_list_.set_focused(entry_focus_ == EntryFocus::boards);
+    oneliner_list_.set_focused(entry_focus_ == EntryFocus::oneliners);
+    status_.clear();
+    return true;
+  }
+
+  [[nodiscard]] bool handle_quit_key(const termforge::KeyEvent &key) {
+    if (!key.ctrl || (key.ch != U'c' && key.ch != U'C')) {
+      return false;
+    }
+    quit();
+    return true;
+  }
+
+  [[nodiscard]] bool is_submit_key(const termforge::KeyEvent &key) const {
+    return key.key == termforge::Key::Enter ||
+           (key.ctrl && (key.ch == U'j' || key.ch == U'J' || key.ch == U'm' ||
+                         key.ch == U'M'));
+  }
+
+  [[nodiscard]] bool handle_submit_key(const termforge::KeyEvent &key) {
+    if (!is_submit_key(key) ||
+        (screen_mode_ == ScreenMode::compose && (key.shift || key.alt))) {
+      return false;
+    }
+    if (screen_mode_ == ScreenMode::subject) {
+      begin_new_thread_body();
+    } else if (screen_mode_ == ScreenMode::compose) {
+      submit_composition();
+    } else if (screen_mode_ == ScreenMode::report) {
+      submit_report();
+    } else if (screen_mode_ == ScreenMode::boards && input_.text().empty()) {
+      open_focused_entry();
+    } else if (screen_mode_ == ScreenMode::threads && input_.text().empty()) {
+      open_selected_thread();
+    } else if (identity_.kind == IdentityKind::registration) {
+      submit_registration();
+    } else if (screen_mode_ == ScreenMode::tos &&
+               (identity_.kind == IdentityKind::pending ||
+                identity_.kind == IdentityKind::tos_required)) {
+      submit_tos_command();
+    } else if (identity_.kind == IdentityKind::tos_required) {
+      submit_restricted_command();
+    } else if (identity_.kind == IdentityKind::active) {
+      submit_active_command();
+    }
+    return true;
+  }
+
+  void open_focused_entry() {
+    if (entry_focus_ == EntryFocus::oneliners) {
+      open_selected_oneliner();
+    } else {
+      open_selected_board();
+    }
+  }
+
+  [[nodiscard]] bool handle_boards_key(const termforge::KeyEvent &key) {
+    if (screen_mode_ != ScreenMode::boards || key.ctrl || key.alt ||
+        key.ch != U'!' || !input_.text().empty()) {
+      return false;
+    }
+    begin_oneliner_report();
+    return true;
+  }
+
+  [[nodiscard]] bool handle_threads_key(const termforge::KeyEvent &key) {
+    if (screen_mode_ != ScreenMode::threads || key.ctrl || key.alt) {
+      return false;
+    }
+    if ((key.ch == U'n' || key.ch == U'N') && may_post()) {
+      input_.set_text({});
+      screen_mode_ = ScreenMode::subject;
+      status_.clear();
+      return true;
+    }
+    if ((key.ch == U'c' || key.ch == U'C') &&
+        identity_.kind != IdentityKind::guest) {
+      catch_up_selected_board();
+      return true;
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool handle_thread_key(const termforge::KeyEvent &key) {
+    if (screen_mode_ != ScreenMode::thread || key.ctrl || key.alt) {
+      return false;
+    }
+    if ((key.ch == U'r' || key.ch == U'R') && may_post()) {
+      begin_reply(false);
+      return true;
+    }
+    if ((key.ch == U'q' || key.ch == U'Q') && may_post()) {
+      begin_reply(true);
+      return true;
+    }
+    if (key.ch == U'!') {
+      begin_latest_message_report();
+      return true;
+    }
+    if (key.ch == U'T' && selected_thread_ < threads_.size()) {
+      begin_report(
+          {store::ContentKind::thread, threads_[selected_thread_].thread_id});
+      return true;
+    }
+    return false;
+  }
+
+  void begin_latest_message_report() {
+    if (messages_.empty()) {
+      status_ = "There is no post to report.";
+      return;
+    }
+    begin_report({store::ContentKind::message, messages_.back().message_id});
+  }
+
+  void begin_report(store::ContentRef target) {
+    report_target_ = std::move(target);
+    report_return_mode_ = ScreenMode::thread;
+    composer_.clear();
+    screen_mode_ = ScreenMode::report;
+    status_.clear();
+  }
+
+  void handle_resize_event() {
+    TerminalDimensions dimensions;
+    {
+      std::lock_guard lock(shared_.mutex);
+      dimensions = shared_.dimensions;
+    }
+    const auto current = current_size();
+    const termforge::App::Size wanted{dimensions.columns, dimensions.rows,
+                                      dimensions.pixel_width,
+                                      dimensions.pixel_height};
+    if (current != wanted) {
+      if (const auto resized = set_size(wanted); !resized) {
+        status_ = resized.error().message;
+      }
+    }
+  }
+
+  void handle_error_event(const termforge::ErrorEvent &error) {
+    if (error.source == "ssh") {
+      std::lock_guard lock(shared_.mutex);
+      notice_ = shared_.notice;
+      return;
+    }
+    if (error.source == "oneliners") {
+      if (screen_mode_ == ScreenMode::boards) {
+        shared_.oneliners_dirty.store(false, std::memory_order_release);
+        load_oneliners();
+      }
+      return;
+    }
+    status_ = error.message;
+    if (error.severity == termforge::Severity::Error) {
+      quit();
+    }
+  }
+
+  [[nodiscard]] bool dispatch_to_active_widget(const termforge::Event &event) {
+    switch (screen_mode_) {
+    case ScreenMode::tos:
+      return tos_box_.on_event(event);
+    case ScreenMode::boards:
+      return entry_focus_ == EntryFocus::oneliners
+                 ? oneliner_list_.on_event(event)
+                 : board_list_.on_event(event);
+    case ScreenMode::threads:
+      return thread_list_.on_event(event);
+    case ScreenMode::thread:
+      return message_box_.on_event(event);
+    case ScreenMode::oneliner:
+      return oneliner_box_.on_event(event);
+    case ScreenMode::compose:
+    case ScreenMode::report:
+      return composer_.on_event(event);
+    case ScreenMode::subject:
+      return false;
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool text_input_enabled() const noexcept {
+    return (identity_.kind == IdentityKind::registration &&
+            registration_mode_ != RegistrationMode::closed) ||
+           identity_.kind == IdentityKind::pending ||
+           identity_.kind == IdentityKind::tos_required ||
+           identity_.kind == IdentityKind::active ||
+           screen_mode_ == ScreenMode::subject;
+  }
 
   void append_tos_text() {
     std::size_t start = 0;
@@ -976,85 +983,125 @@ private:
     status_ = "Report submitted.";
   }
 
-  // NOLINTNEXTLINE(readability-function-cognitive-complexity) -- branches deliberately mirror the complete set of user-visible screen modes
   void render_board_screen(termforge::Screen &screen, termforge::Rgb foreground,
                            termforge::Rgb accent, termforge::Rgb background) {
-    const auto identity_line =
-        identity_.kind == IdentityKind::guest
-            ? std::string{"Guest access: boards and doors are read-only."}
-        : identity_.kind == IdentityKind::tos_required
-            ? std::string{"TOS changed: read-only until accepted (/tos)."}
-            : "Signed in as " + identity_.handle +
-                  ". Type /invite to issue an invite code.";
     static_cast<void>(
-        screen.write_text(0, 2, identity_line, foreground, background));
+        screen.write_text(0, 2, board_identity_line(), foreground, background));
     const auto body_height = std::max(1, screen.rows() - 7);
-    if (screen_mode_ == ScreenMode::boards) {
-      static_cast<void>(screen.write_text(
-          0, 3, "One-liners - Tab focus, arrows move, Enter opens, ! reports",
-          accent, background));
-      oneliner_list_.set_geometry(termforge::Rect{0, 4, screen.cols(), 4});
-      oneliner_list_.draw(screen);
-      static_cast<void>(screen.write_text(
-          0, 8, "Boards - Tab focus, arrows move, Enter opens, Esc exits",
-          accent, background));
-      board_list_.set_geometry(termforge::Rect{
-          0, 9, screen.cols(), std::max(1, screen.rows() - 12)});
-      board_list_.draw(screen);
-      if (identity_.kind != IdentityKind::guest && screen.rows() > 2) {
-        input_.set_geometry(
-            termforge::Rect{0, screen.rows() - 2, screen.cols(), 1});
-        input_.draw(screen);
-      }
-    } else if (screen_mode_ == ScreenMode::oneliner) {
-      static_cast<void>(screen.write_text(0, 3, "One-liner detail - Esc back",
-                                          accent, background));
-      oneliner_box_.set_geometry(
-          termforge::Rect{0, 4, screen.cols(), body_height + 1});
-      oneliner_box_.draw(screen);
-    } else if (screen_mode_ == ScreenMode::threads) {
-      const auto board_title = selected_board_ < boards_.size()
-                                   ? boards_[selected_board_].title
-                                   : std::string{"Board"};
-      const auto help = may_post()
-                            ? " - Enter opens, n new, c catch up, Esc back"
-                        : identity_.kind == IdentityKind::guest
-                            ? " - Enter opens, Esc back"
-                            : " - Enter opens, c catch up, Esc back";
-      static_cast<void>(
-          screen.write_text(0, 3, board_title + help, accent, background));
-      thread_list_.set_geometry(
-          termforge::Rect{0, 4, screen.cols(), body_height + 1});
-      thread_list_.draw(screen);
-    } else if (screen_mode_ == ScreenMode::thread) {
-      const auto subject = selected_thread_ < threads_.size()
-                               ? threads_[selected_thread_].subject
-                               : std::string{"Thread"};
-      const auto help =
-          may_post()
-              ? " - r reply, q quote, ! post report, T thread report, Esc back"
-              : " - ! post report, T thread report, Esc back";
-      static_cast<void>(
-          screen.write_text(0, 3, subject + help, accent, background));
-      message_box_.set_geometry(
-          termforge::Rect{0, 4, screen.cols(), body_height + 1});
-      message_box_.draw(screen);
-    } else if (screen_mode_ == ScreenMode::subject) {
-      static_cast<void>(screen.write_text(
-          0, 3, "New thread subject (Enter continues, Esc cancels)", accent,
-          background));
-      input_.set_geometry(termforge::Rect{0, 5, screen.cols(), 1});
-      input_.draw(screen);
-    } else {
-      const auto prompt =
-          screen_mode_ == ScreenMode::report
-              ? "Report reason (Enter submits, Esc cancels)"
-              : "Post body (Enter submits, Shift+Enter newline)";
-      static_cast<void>(screen.write_text(0, 3, prompt, accent, background));
-      composer_.set_geometry(
-          termforge::Rect{0, 4, screen.cols(), body_height + 1});
-      composer_.draw(screen);
+    switch (screen_mode_) {
+    case ScreenMode::boards:
+      render_entry_screen(screen, accent, background);
+      break;
+    case ScreenMode::oneliner:
+      render_oneliner_screen(screen, accent, background, body_height);
+      break;
+    case ScreenMode::threads:
+      render_threads_screen(screen, accent, background, body_height);
+      break;
+    case ScreenMode::thread:
+      render_thread_screen(screen, accent, background, body_height);
+      break;
+    case ScreenMode::subject:
+      render_subject_screen(screen, accent, background);
+      break;
+    case ScreenMode::compose:
+    case ScreenMode::report:
+    case ScreenMode::tos:
+      render_composer_screen(screen, accent, background, body_height);
+      break;
     }
+  }
+
+  [[nodiscard]] std::string board_identity_line() const {
+    if (identity_.kind == IdentityKind::guest) {
+      return "Guest access: boards and doors are read-only.";
+    }
+    if (identity_.kind == IdentityKind::tos_required) {
+      return "TOS changed: read-only until accepted (/tos).";
+    }
+    return "Signed in as " + identity_.handle +
+           ". Type /invite to issue an invite code.";
+  }
+
+  void render_entry_screen(termforge::Screen &screen, termforge::Rgb accent,
+                           termforge::Rgb background) {
+    static_cast<void>(screen.write_text(
+        0, 3, "One-liners - Tab focus, arrows move, Enter opens, ! reports",
+        accent, background));
+    oneliner_list_.set_geometry(termforge::Rect{0, 4, screen.cols(), 4});
+    oneliner_list_.draw(screen);
+    static_cast<void>(screen.write_text(
+        0, 8, "Boards - Tab focus, arrows move, Enter opens, Esc exits", accent,
+        background));
+    board_list_.set_geometry(
+        termforge::Rect{0, 9, screen.cols(), std::max(1, screen.rows() - 12)});
+    board_list_.draw(screen);
+    if (identity_.kind != IdentityKind::guest && screen.rows() > 2) {
+      input_.set_geometry(
+          termforge::Rect{0, screen.rows() - 2, screen.cols(), 1});
+      input_.draw(screen);
+    }
+  }
+
+  void render_oneliner_screen(termforge::Screen &screen, termforge::Rgb accent,
+                              termforge::Rgb background, int body_height) {
+    static_cast<void>(screen.write_text(0, 3, "One-liner detail - Esc back",
+                                        accent, background));
+    oneliner_box_.set_geometry(
+        termforge::Rect{0, 4, screen.cols(), body_height + 1});
+    oneliner_box_.draw(screen);
+  }
+
+  void render_threads_screen(termforge::Screen &screen, termforge::Rgb accent,
+                             termforge::Rgb background, int body_height) {
+    const auto board_title = selected_board_ < boards_.size()
+                                 ? boards_[selected_board_].title
+                                 : std::string{"Board"};
+    const auto help = may_post() ? " - Enter opens, n new, c catch up, Esc back"
+                      : identity_.kind == IdentityKind::guest
+                          ? " - Enter opens, Esc back"
+                          : " - Enter opens, c catch up, Esc back";
+    static_cast<void>(
+        screen.write_text(0, 3, board_title + help, accent, background));
+    thread_list_.set_geometry(
+        termforge::Rect{0, 4, screen.cols(), body_height + 1});
+    thread_list_.draw(screen);
+  }
+
+  void render_thread_screen(termforge::Screen &screen, termforge::Rgb accent,
+                            termforge::Rgb background, int body_height) {
+    const auto subject = selected_thread_ < threads_.size()
+                             ? threads_[selected_thread_].subject
+                             : std::string{"Thread"};
+    const auto help =
+        may_post()
+            ? " - r reply, q quote, ! post report, T thread report, Esc back"
+            : " - ! post report, T thread report, Esc back";
+    static_cast<void>(
+        screen.write_text(0, 3, subject + help, accent, background));
+    message_box_.set_geometry(
+        termforge::Rect{0, 4, screen.cols(), body_height + 1});
+    message_box_.draw(screen);
+  }
+
+  void render_subject_screen(termforge::Screen &screen, termforge::Rgb accent,
+                             termforge::Rgb background) {
+    static_cast<void>(screen.write_text(
+        0, 3, "New thread subject (Enter continues, Esc cancels)", accent,
+        background));
+    input_.set_geometry(termforge::Rect{0, 5, screen.cols(), 1});
+    input_.draw(screen);
+  }
+
+  void render_composer_screen(termforge::Screen &screen, termforge::Rgb accent,
+                              termforge::Rgb background, int body_height) {
+    const auto prompt = screen_mode_ == ScreenMode::report
+                            ? "Report reason (Enter submits, Esc cancels)"
+                            : "Post body (Enter submits, Shift+Enter newline)";
+    static_cast<void>(screen.write_text(0, 3, prompt, accent, background));
+    composer_.set_geometry(
+        termforge::Rect{0, 4, screen.cols(), body_height + 1});
+    composer_.draw(screen);
   }
 
   void render_tos(termforge::Screen &screen, termforge::Rgb foreground,
@@ -1298,7 +1345,7 @@ private:
     issued_invite_code_.clear();
   }
 
-  SocketSink sink_;
+  detail::SessionSink sink_;
   std::chrono::steady_clock::time_point channel_opened_;
   SharedState &shared_;
   SessionIdentity identity_;
