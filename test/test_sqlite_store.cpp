@@ -598,6 +598,45 @@ TEST_CASE("SQLite records versioned TOS acceptance and activates atomically") {
         10);
 }
 
+TEST_CASE("SQLite TOS activation failure rolls back its acceptance") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto seed = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(seed.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *seed, "INSERT INTO users(handle,status,created_at) "
+                         "VALUES('alice','pending',1)")
+              .has_value());
+  REQUIRE(seed->commit().has_value());
+
+  auto accept = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(accept.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *accept,
+                  "CREATE TRIGGER fail_tos_activation BEFORE UPDATE OF status "
+                  "ON users BEGIN SELECT RAISE(ABORT,"
+                  "'forced TOS activation failure'); END")
+              .has_value());
+  const auto result = (*store)->accept_tos(
+      *accept,
+      {.user_handle = "alice", .tos_version = "v1", .accepted_at = {10}});
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.error().detail.find("cannot activate TOS user") !=
+        std::string::npos);
+  accept->rollback();
+
+  auto verify = (*store)->begin(TransactionMode::read_only);
+  REQUIRE(verify.has_value());
+  CHECK((*store)->scalar_text_for_testing(
+            *verify, "SELECT status FROM users WHERE handle='alice'") ==
+        "pending");
+  CHECK((*store)->scalar_for_testing(
+            *verify, "SELECT count(*) FROM tos_acceptances") == 0);
+}
+
 TEST_CASE("SQLite revoked credentials never become unknown registrations") {
   TemporaryDatabase database;
   auto store = SqliteStore::open(database.path());
@@ -636,6 +675,66 @@ TEST_CASE("SQLite revoked credentials never become unknown registrations") {
       (*store)->provision_local_credential(*attempt, conflicting);
   REQUIRE_FALSE(reprovision.has_value());
   CHECK(reprovision.error().code == ErrorCode::conflict);
+}
+
+TEST_CASE("SQLite row decoders reject corrupt fields with exact diagnostics") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  seed_messages(**store, *write);
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "INSERT INTO user_keys(fingerprint,user_handle,public_key,"
+                  "added_at) VALUES('SHA256:corrupt','alice',"
+                  "'ssh-ed25519 CORRUPT',15);"
+                  "PRAGMA ignore_check_constraints=ON;"
+                  "UPDATE messages SET status='corrupt' "
+                  "WHERE message_id='message-1';"
+                  "UPDATE user_keys SET revoked_at=x'01' "
+                  "WHERE fingerprint='SHA256:corrupt'")
+              .has_value());
+
+  const auto message =
+      (*store)->find_message_including_tombstones(*write, "message-1");
+  REQUIRE_FALSE(message.has_value());
+  CHECK(message.error() ==
+        anvil::store::Error{ErrorCode::invalid_data,
+                            "message has an unknown status"});
+
+  const auto credential =
+      (*store)->find_local_credential(*write, "SHA256:corrupt");
+  REQUIRE_FALSE(credential.has_value());
+  CHECK(
+      credential.error() ==
+      anvil::store::Error{ErrorCode::invalid_data,
+                          "credential revoked_at is not stored as an integer"});
+}
+
+TEST_CASE("SQLite local-only reads reject non-null identity origins") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "INSERT INTO users(handle,origin,status,created_at) "
+                  "VALUES('alice','remote.example','active',1);"
+                  "INSERT INTO user_keys(fingerprint,user_handle,user_origin,"
+                  "public_key,added_at) VALUES('SHA256:remote','alice',"
+                  "'remote.example','ssh-ed25519 REMOTE',1)")
+              .has_value());
+
+  const auto credential =
+      (*store)->find_local_credential(*write, "SHA256:remote");
+  REQUIRE_FALSE(credential.has_value());
+  CHECK(credential.error() ==
+        anvil::store::Error{ErrorCode::invalid_data,
+                            "credential belongs to a non-local identity"});
 }
 
 TEST_CASE("SQLite serializes concurrent redemption of one invite") {
@@ -809,6 +908,70 @@ TEST_CASE("SQLite invite regeneration saturates hostile stored timestamps") {
   CHECK(result->remaining_balance == 1);
   CHECK(result->next_regeneration == anvil::store::UtcEpochSeconds{1});
   REQUIRE(issue->commit().has_value());
+}
+
+TEST_CASE("SQLite invite issuance rejects corrupt balance storage") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write, "INSERT INTO users(handle,status,created_at) "
+                          "VALUES('operator','active',1);"
+                          "PRAGMA ignore_check_constraints=ON;"
+                          "UPDATE users SET invite_balance=x'01' "
+                          "WHERE handle='operator'")
+              .has_value());
+
+  const auto result =
+      (*store)->issue_invite(*write, {.code_hash = std::string(64, 'a'),
+                                      .inviter_handle = "operator",
+                                      .created_at = {10},
+                                      .expires_at = {20},
+                                      .balance_cap = 1,
+                                      .regeneration_seconds = 100});
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.error() ==
+        anvil::store::Error{ErrorCode::invalid_data,
+                            "invite balance is not stored as an integer"});
+  CHECK((*store)->scalar_for_testing(*write, "SELECT count(*) FROM invites") ==
+        0);
+}
+
+TEST_CASE("SQLite invite savepoint rolls back a failed balance update") {
+  TemporaryDatabase database;
+  auto store = SqliteStore::open(database.path());
+  REQUIRE(store.has_value());
+  auto write = (*store)->begin(TransactionMode::read_write);
+  REQUIRE(write.has_value());
+  REQUIRE((*store)
+              ->execute_for_testing(
+                  *write,
+                  "INSERT INTO users(handle,status,created_at,invite_balance) "
+                  "VALUES('operator','active',1,1);"
+                  "CREATE TRIGGER fail_invite_balance BEFORE UPDATE OF "
+                  "invite_balance ON users BEGIN SELECT RAISE(ABORT,"
+                  "'forced invite balance failure'); END")
+              .has_value());
+
+  const auto result =
+      (*store)->issue_invite(*write, {.code_hash = std::string(64, 'a'),
+                                      .inviter_handle = "operator",
+                                      .created_at = {10},
+                                      .expires_at = {20},
+                                      .balance_cap = 1,
+                                      .regeneration_seconds = 100});
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.error().detail.find("cannot update invite balance") !=
+        std::string::npos);
+  CHECK((*store)->scalar_for_testing(*write, "SELECT count(*) FROM invites") ==
+        0);
+  CHECK((*store)->scalar_for_testing(
+            *write,
+            "SELECT invite_balance FROM users WHERE handle='operator'") == 1);
+  REQUIRE(write->commit().has_value());
 }
 
 TEST_CASE("SQLite invite graph includes tombstones and enforces one edge") {
@@ -1431,6 +1594,35 @@ TEST_CASE("a failed SQLite migration rolls back the whole pending chain") {
             ->scalar_for_testing(*transaction, "SELECT count(*) FROM probe") ==
         0);
   CHECK(transaction->commit().has_value());
+}
+
+TEST_CASE("a failed SQLite migration commit rolls back metadata and schema") {
+  TemporaryDatabase database;
+  constexpr std::array broken{
+      SqliteMigration{
+          1, "CREATE TABLE parent(id INTEGER PRIMARY KEY);"
+             "CREATE TABLE child(parent_id INTEGER, FOREIGN KEY(parent_id) "
+             "REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);"
+             "INSERT INTO child(parent_id) VALUES(1)"},
+  };
+
+  const auto failed =
+      anvil::store::detail::open_sqlite_store(database.path(), broken);
+
+  REQUIRE_FALSE(failed.has_value());
+  CHECK(failed.error().detail.find("cannot commit SQLite migrations") !=
+        std::string::npos);
+  auto recovered = open_probe(database.path());
+  REQUIRE(recovered.has_value());
+  auto transaction = (*recovered)->begin(TransactionMode::read_only);
+  REQUIRE(transaction.has_value());
+  CHECK((*recovered)
+            ->scalar_for_testing(
+                *transaction,
+                "SELECT count(*) FROM sqlite_schema WHERE name IN "
+                "('parent','child')") == 0);
+  CHECK((*recovered)->scalar_for_testing(*transaction, "PRAGMA user_version") ==
+        1);
 }
 
 TEST_CASE("SQLite startup rejects newer and foreign databases") {

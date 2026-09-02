@@ -289,7 +289,42 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
   return sqlite3_column_int64(statement, column);
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- column-specific validation must identify the exact corrupt SQLite field
+[[nodiscard]] auto column_optional_integer(sqlite3_stmt *statement, int column,
+                                           std::string_view field)
+    -> std::expected<std::optional<std::int64_t>, Error> {
+  if (sqlite3_column_type(statement, column) == SQLITE_NULL) {
+    return std::nullopt;
+  }
+  auto value = column_integer(statement, column, field);
+  if (!value) {
+    return std::unexpected(value.error());
+  }
+  return std::optional<std::int64_t>{*value};
+}
+
+template <typename First, typename... Rest>
+[[nodiscard]] auto first_column_error(const First &first, const Rest &...rest)
+    -> std::optional<Error> {
+  if (!first) {
+    return first.error();
+  }
+  if constexpr (sizeof...(rest) > 0) {
+    return first_column_error(rest...);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] auto parse_content_status(std::string_view value)
+    -> std::expected<ContentStatus, Error> {
+  if (value == "active") {
+    return ContentStatus::active;
+  }
+  if (value == "tombstoned") {
+    return ContentStatus::tombstoned;
+  }
+  return std::unexpected(invalid_data("message has an unknown status"));
+}
+
 [[nodiscard]] auto read_message(sqlite3_stmt *statement)
     -> std::expected<MessageRecord, Error> {
   if (sqlite3_column_count(statement) != 11) {
@@ -309,49 +344,16 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
   auto received_at = column_integer(statement, 8, "message received_at");
   auto local_sequence = column_integer(statement, 9, "message local sequence");
   auto status = column_text(statement, 10, "message status");
-  if (!message_id || !board_id || !thread_id || !parent_id || !author_handle ||
-      !author_origin || !body || !posted_at || !received_at ||
-      !local_sequence || !status) {
-    if (!message_id) {
-      return std::unexpected(message_id.error());
-    }
-    if (!board_id) {
-      return std::unexpected(board_id.error());
-    }
-    if (!thread_id) {
-      return std::unexpected(thread_id.error());
-    }
-    if (!parent_id) {
-      return std::unexpected(parent_id.error());
-    }
-    if (!author_handle) {
-      return std::unexpected(author_handle.error());
-    }
-    if (!author_origin) {
-      return std::unexpected(author_origin.error());
-    }
-    if (!body) {
-      return std::unexpected(body.error());
-    }
-    if (!posted_at) {
-      return std::unexpected(posted_at.error());
-    }
-    if (!received_at) {
-      return std::unexpected(received_at.error());
-    }
-    if (!local_sequence) {
-      return std::unexpected(local_sequence.error());
-    }
-    return std::unexpected(status.error());
+  if (auto error =
+          first_column_error(message_id, board_id, thread_id, parent_id,
+                             author_handle, author_origin, body, posted_at,
+                             received_at, local_sequence, status)) {
+    return std::unexpected(std::move(*error));
   }
 
-  ContentStatus lifecycle{};
-  if (*status == "active") {
-    lifecycle = ContentStatus::active;
-  } else if (*status == "tombstoned") {
-    lifecycle = ContentStatus::tombstoned;
-  } else {
-    return std::unexpected(invalid_data("message has an unknown status"));
+  auto lifecycle = parse_content_status(*status);
+  if (!lifecycle) {
+    return std::unexpected(lifecycle.error());
   }
 
   return MessageRecord{
@@ -365,7 +367,7 @@ validate_migrations(std::span<const detail::SqliteMigration> migrations)
       .posted_at = UtcEpochSeconds{*posted_at},
       .received_at = UtcEpochSeconds{*received_at},
       .local_sequence = *local_sequence,
-      .status = lifecycle,
+      .status = *lifecycle,
   };
 }
 
@@ -835,6 +837,212 @@ private:
   return {};
 }
 
+[[nodiscard]] auto credential_status(sqlite3_stmt *statement,
+                                     std::string_view user_status)
+    -> std::expected<CredentialStatus, Error> {
+  if (sqlite3_column_type(statement, 4) != SQLITE_NULL) {
+    auto revoked_at = column_integer(statement, 4, "credential revoked_at");
+    if (!revoked_at) {
+      return std::unexpected(revoked_at.error());
+    }
+    return CredentialStatus::revoked;
+  }
+  if (user_status == "pending") {
+    return CredentialStatus::pending;
+  }
+  if (user_status == "active") {
+    return CredentialStatus::active;
+  }
+  if (user_status == "suspended") {
+    return CredentialStatus::suspended;
+  }
+  if (user_status == "tombstoned") {
+    return CredentialStatus::tombstoned;
+  }
+  return std::unexpected(invalid_data("credential user has unknown status"));
+}
+
+[[nodiscard]] auto read_local_credential(sqlite3_stmt *statement)
+    -> std::expected<CredentialRecord, Error> {
+  if (sqlite3_column_count(statement) != 7) {
+    return std::unexpected(
+        invalid_data("credential query returned an unexpected shape"));
+  }
+  auto handle = column_text(statement, 0, "credential handle");
+  auto fingerprint = column_text(statement, 1, "credential fingerprint");
+  auto public_key = column_text(statement, 2, "credential public key");
+  auto user_status = column_text(statement, 3, "credential user status");
+  if (auto error =
+          first_column_error(handle, fingerprint, public_key, user_status)) {
+    return std::unexpected(std::move(*error));
+  }
+  if (sqlite3_column_type(statement, 5) != SQLITE_NULL ||
+      sqlite3_column_type(statement, 6) != SQLITE_NULL) {
+    return std::unexpected(
+        invalid_data("credential belongs to a non-local identity"));
+  }
+  auto status = credential_status(statement, *user_status);
+  if (!status) {
+    return std::unexpected(status.error());
+  }
+  return CredentialRecord{.handle = std::move(*handle),
+                          .fingerprint = std::move(*fingerprint),
+                          .public_key = std::move(*public_key),
+                          .status = *status};
+}
+
+[[nodiscard]] auto lookup_local_credential(sqlite3 *database,
+                                           std::string_view fingerprint)
+    -> std::expected<std::optional<CredentialRecord>, Error> {
+  constexpr std::string_view sql =
+      "SELECT u.handle,k.fingerprint,k.public_key,u.status,k.revoked_at,"
+      "u.origin,k.user_origin FROM user_keys AS k JOIN users AS u ON "
+      "u.handle=k.user_handle AND u.origin_key=k.user_origin_key WHERE "
+      "k.fingerprint=?1";
+  auto statement = prepare(database, sql, "cannot prepare credential lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, fingerprint,
+                             "cannot bind credential lookup");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto result = sqlite3_step(statement->get());
+  if (result == SQLITE_DONE) {
+    return std::nullopt;
+  }
+  if (result != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(database, result, "cannot look up credential"));
+  }
+  auto credential = read_local_credential(statement->get());
+  if (!credential) {
+    return std::unexpected(credential.error());
+  }
+  return std::optional<CredentialRecord>{std::move(*credential)};
+}
+
+[[nodiscard]] auto insert_local_user(sqlite3 *database,
+                                     const LocalCredentialProvision &provision)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "INSERT INTO users(handle,status,created_at) VALUES(?1,?2,?3)";
+  auto statement =
+      prepare(database, sql, "cannot prepare local user provision");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const auto status = provision.user_status == UserStatus::active
+                          ? std::string_view{"active"}
+                          : std::string_view{"pending"};
+  if (auto bound = bind_text(database, statement->get(), 1, provision.handle,
+                             "cannot bind local user handle");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 2, status,
+                             "cannot bind local user status");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_integer(database, statement->get(), 3,
+                                provision.created_at.value,
+                                "cannot bind local user creation time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted == SQLITE_DONE) {
+    return {};
+  }
+  auto error = sqlite_error(database, inserted, "cannot provision local user");
+  if (error.code == ErrorCode::constraint_violation) {
+    error.code = ErrorCode::conflict;
+  }
+  return std::unexpected(std::move(error));
+}
+
+[[nodiscard]] auto ensure_local_user(sqlite3 *database,
+                                     const LocalCredentialProvision &provision)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "SELECT status,origin FROM users WHERE handle=?1 AND origin_key=''";
+  auto statement = prepare(database, sql, "cannot prepare local user lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, provision.handle,
+                             "cannot bind local user lookup");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto result = sqlite3_step(statement->get());
+  if (result == SQLITE_DONE) {
+    return insert_local_user(database, provision);
+  }
+  if (result != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(database, result, "cannot look up local user"));
+  }
+  auto status = column_text(statement->get(), 0, "local user status");
+  if (!status) {
+    return std::unexpected(status.error());
+  }
+  if (sqlite3_column_type(statement->get(), 1) != SQLITE_NULL) {
+    return std::unexpected(invalid_data("local user has a non-null origin"));
+  }
+  if (provision.user_status != UserStatus::active || *status != "active") {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "local handle is already provisioned"});
+  }
+  return {};
+}
+
+[[nodiscard]] auto
+insert_local_credential(sqlite3 *database,
+                        const LocalCredentialProvision &provision)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "INSERT INTO user_keys(fingerprint,user_handle,public_key,added_at) "
+      "VALUES(?1,?2,?3,?4)";
+  auto statement =
+      prepare(database, sql, "cannot prepare credential provision");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array values{std::string_view{provision.fingerprint},
+                          std::string_view{provision.handle},
+                          std::string_view{provision.public_key}};
+  constexpr std::array operations{
+      std::string_view{"cannot bind credential fingerprint"},
+      std::string_view{"cannot bind credential handle"},
+      std::string_view{"cannot bind credential public key"}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 1U),
+                      values[index], operations[index]);
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (auto bound = bind_integer(database, statement->get(), 4,
+                                provision.created_at.value,
+                                "cannot bind credential creation time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted == SQLITE_DONE) {
+    return {};
+  }
+  auto error = sqlite_error(database, inserted, "cannot provision credential");
+  if (error.code == ErrorCode::constraint_violation) {
+    error.code = ErrorCode::conflict;
+  }
+  return std::unexpected(std::move(error));
+}
+
 } // namespace
 
 SqliteStore::SqliteStore(std::filesystem::path path, SqliteOptions options,
@@ -1054,7 +1262,6 @@ auto SqliteStore::list_messages_for_board_impl(Transaction &transaction,
   return query_messages(backend->database(), sql, board_id, false);
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- nullable columns and status decoding retain precise corrupt-row diagnostics
 auto SqliteStore::find_local_credential_impl(Transaction &transaction,
                                              std::string_view fingerprint)
     -> std::expected<std::optional<CredentialRecord>, Error> {
@@ -1064,78 +1271,9 @@ auto SqliteStore::find_local_credential_impl(Transaction &transaction,
     return std::unexpected(
         Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
   }
-  constexpr std::string_view sql =
-      "SELECT u.handle,k.fingerprint,k.public_key,u.status,k.revoked_at,"
-      "u.origin,k.user_origin FROM user_keys AS k JOIN users AS u ON "
-      "u.handle=k.user_handle AND u.origin_key=k.user_origin_key WHERE "
-      "k.fingerprint=?1";
-  auto statement =
-      prepare(backend->database(), sql, "cannot prepare credential lookup");
-  if (!statement) {
-    return std::unexpected(statement.error());
-  }
-  if (auto bound = bind_text(backend->database(), statement->get(), 1,
-                             fingerprint, "cannot bind credential lookup");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto result = sqlite3_step(statement->get());
-  if (result == SQLITE_DONE) {
-    return std::nullopt;
-  }
-  if (result != SQLITE_ROW) {
-    return std::unexpected(
-        sqlite_error(backend->database(), result, "cannot look up credential"));
-  }
-  if (sqlite3_column_count(statement->get()) != 7) {
-    return std::unexpected(
-        invalid_data("credential query returned an unexpected shape"));
-  }
-  auto handle = column_text(statement->get(), 0, "credential handle");
-  auto stored_fingerprint =
-      column_text(statement->get(), 1, "credential fingerprint");
-  auto public_key = column_text(statement->get(), 2, "credential public key");
-  auto user_status = column_text(statement->get(), 3, "credential user status");
-  if (!handle || !stored_fingerprint || !public_key || !user_status) {
-    if (!handle)
-      return std::unexpected(handle.error());
-    if (!stored_fingerprint)
-      return std::unexpected(stored_fingerprint.error());
-    if (!public_key)
-      return std::unexpected(public_key.error());
-    return std::unexpected(user_status.error());
-  }
-  if (sqlite3_column_type(statement->get(), 5) != SQLITE_NULL ||
-      sqlite3_column_type(statement->get(), 6) != SQLITE_NULL) {
-    return std::unexpected(
-        invalid_data("credential belongs to a non-local identity"));
-  }
-
-  CredentialStatus status{};
-  if (sqlite3_column_type(statement->get(), 4) != SQLITE_NULL) {
-    if (sqlite3_column_type(statement->get(), 4) != SQLITE_INTEGER) {
-      return std::unexpected(
-          invalid_data("credential revoked_at is not stored as an integer"));
-    }
-    status = CredentialStatus::revoked;
-  } else if (*user_status == "pending") {
-    status = CredentialStatus::pending;
-  } else if (*user_status == "active") {
-    status = CredentialStatus::active;
-  } else if (*user_status == "suspended") {
-    status = CredentialStatus::suspended;
-  } else if (*user_status == "tombstoned") {
-    status = CredentialStatus::tombstoned;
-  } else {
-    return std::unexpected(invalid_data("credential user has unknown status"));
-  }
-  return CredentialRecord{.handle = std::move(*handle),
-                          .fingerprint = std::move(*stored_fingerprint),
-                          .public_key = std::move(*public_key),
-                          .status = status};
+  return lookup_local_credential(backend->database(), fingerprint);
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- user and credential conflict handling share one atomic transaction boundary
 auto SqliteStore::provision_local_credential_impl(
     Transaction &transaction, const LocalCredentialProvision &provision)
     -> std::expected<void, Error> {
@@ -1162,114 +1300,10 @@ auto SqliteStore::provision_local_credential_impl(
     return std::unexpected(Error{
         ErrorCode::conflict, "credential fingerprint is already provisioned"});
   }
-
-  constexpr std::string_view find_user_sql =
-      "SELECT status,origin FROM users WHERE handle=?1 AND origin_key=''";
-  auto find_user = prepare(backend->database(), find_user_sql,
-                           "cannot prepare local user lookup");
-  if (!find_user) {
-    return std::unexpected(find_user.error());
+  if (auto user = ensure_local_user(backend->database(), provision); !user) {
+    return std::unexpected(user.error());
   }
-  if (auto bound = bind_text(backend->database(), find_user->get(), 1,
-                             provision.handle, "cannot bind local user lookup");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto found_user = sqlite3_step(find_user->get());
-  if (found_user != SQLITE_ROW && found_user != SQLITE_DONE) {
-    return std::unexpected(sqlite_error(backend->database(), found_user,
-                                        "cannot look up local user"));
-  }
-  if (found_user == SQLITE_ROW) {
-    auto status = column_text(find_user->get(), 0, "local user status");
-    if (!status) {
-      return std::unexpected(status.error());
-    }
-    if (sqlite3_column_type(find_user->get(), 1) != SQLITE_NULL) {
-      return std::unexpected(invalid_data("local user has a non-null origin"));
-    }
-    if (provision.user_status != UserStatus::active || *status != "active") {
-      return std::unexpected(
-          Error{ErrorCode::conflict, "local handle is already provisioned"});
-    }
-  } else {
-    constexpr std::string_view insert_user_sql =
-        "INSERT INTO users(handle,status,created_at) VALUES(?1,?2,?3)";
-    auto insert_user = prepare(backend->database(), insert_user_sql,
-                               "cannot prepare local user provision");
-    if (!insert_user)
-      return std::unexpected(insert_user.error());
-    const auto status = provision.user_status == UserStatus::active
-                            ? std::string_view{"active"}
-                            : std::string_view{"pending"};
-    if (auto bound =
-            bind_text(backend->database(), insert_user->get(), 1,
-                      provision.handle, "cannot bind local user handle");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    if (auto bound = bind_text(backend->database(), insert_user->get(), 2,
-                               status, "cannot bind local user status");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    if (auto bound = bind_integer(backend->database(), insert_user->get(), 3,
-                                  provision.created_at.value,
-                                  "cannot bind local user creation time");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    const auto inserted = sqlite3_step(insert_user->get());
-    if (inserted != SQLITE_DONE) {
-      auto error = sqlite_error(backend->database(), inserted,
-                                "cannot provision local user");
-      if (error.code == ErrorCode::constraint_violation) {
-        error.code = ErrorCode::conflict;
-      }
-      return std::unexpected(std::move(error));
-    }
-  }
-
-  constexpr std::string_view insert_key_sql =
-      "INSERT INTO user_keys(fingerprint,user_handle,public_key,added_at) "
-      "VALUES(?1,?2,?3,?4)";
-  auto insert_key = prepare(backend->database(), insert_key_sql,
-                            "cannot prepare credential provision");
-  if (!insert_key)
-    return std::unexpected(insert_key.error());
-  if (auto bound = bind_text(backend->database(), insert_key->get(), 1,
-                             provision.fingerprint,
-                             "cannot bind credential fingerprint");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_text(backend->database(), insert_key->get(), 2,
-                             provision.handle, "cannot bind credential handle");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound =
-          bind_text(backend->database(), insert_key->get(), 3,
-                    provision.public_key, "cannot bind credential public key");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_integer(backend->database(), insert_key->get(), 4,
-                                provision.created_at.value,
-                                "cannot bind credential creation time");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto inserted = sqlite3_step(insert_key->get());
-  if (inserted != SQLITE_DONE) {
-    auto error = sqlite_error(backend->database(), inserted,
-                              "cannot provision credential");
-    if (error.code == ErrorCode::constraint_violation) {
-      error.code = ErrorCode::conflict;
-    }
-    return std::unexpected(std::move(error));
-  }
-  return {};
+  return insert_local_credential(backend->database(), provision);
 }
 
 auto SqliteStore::has_tos_acceptance_impl(Transaction &transaction,
@@ -1311,7 +1345,114 @@ auto SqliteStore::has_tos_acceptance_impl(Transaction &transaction,
                                       "cannot look up TOS acceptance"));
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- status transition and append-only acceptance remain one atomic operation
+namespace {
+
+[[nodiscard]] auto lookup_tos_user(sqlite3 *database,
+                                   std::string_view user_handle)
+    -> std::expected<std::string, Error> {
+  constexpr std::string_view sql =
+      "SELECT status,origin FROM users WHERE handle=?1 AND origin_key=''";
+  auto statement = prepare(database, sql, "cannot prepare TOS user lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, user_handle,
+                             "cannot bind TOS user lookup");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto result = sqlite3_step(statement->get());
+  if (result == SQLITE_DONE) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "TOS user does not exist"});
+  }
+  if (result != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(database, result, "cannot look up TOS user"));
+  }
+  auto status = column_text(statement->get(), 0, "TOS user status");
+  if (!status) {
+    return std::unexpected(status.error());
+  }
+  if (sqlite3_column_type(statement->get(), 1) != SQLITE_NULL) {
+    return std::unexpected(invalid_data("TOS user has a non-null origin"));
+  }
+  if (*status != "pending" && *status != "active") {
+    return std::unexpected(
+        Error{ErrorCode::conflict,
+              "only pending or active accounts may accept the TOS"});
+  }
+  return status;
+}
+
+[[nodiscard]] auto record_tos_acceptance(sqlite3 *database,
+                                         const TosAcceptance &acceptance)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "INSERT INTO tos_acceptances(user_handle,tos_version,accepted_at) "
+      "VALUES(?1,?2,?3) ON CONFLICT(user_handle,user_origin_key,tos_version) "
+      "DO NOTHING";
+  auto statement =
+      prepare(database, sql, "cannot prepare TOS acceptance insert");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array values{std::string_view{acceptance.user_handle},
+                          std::string_view{acceptance.tos_version}};
+  constexpr std::array operations{std::string_view{"cannot bind TOS user"},
+                                  std::string_view{"cannot bind TOS version"}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 1U),
+                      values[index], operations[index]);
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (auto bound = bind_integer(database, statement->get(), 3,
+                                acceptance.accepted_at.value,
+                                "cannot bind TOS acceptance time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(database, inserted, "cannot record TOS acceptance"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto activate_tos_user(sqlite3 *database,
+                                     std::string_view user_handle)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "UPDATE users SET status='active' WHERE handle=?1 AND origin IS NULL "
+      "AND status='pending'";
+  auto statement =
+      prepare(database, sql, "cannot prepare TOS account activation");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, user_handle,
+                             "cannot bind TOS account activation");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto updated = sqlite3_step(statement->get());
+  if (updated != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(database, updated, "cannot activate TOS user"));
+  }
+  if (sqlite3_changes(database) != 1) {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "TOS user status changed concurrently"});
+  }
+  return {};
+}
+
+} // namespace
+
 auto SqliteStore::accept_tos_impl(Transaction &transaction,
                                   const TosAcceptance &acceptance)
     -> std::expected<UserStatus, Error> {
@@ -1322,95 +1463,19 @@ auto SqliteStore::accept_tos_impl(Transaction &transaction,
         Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
   }
 
-  constexpr std::string_view find_user_sql =
-      "SELECT status,origin FROM users WHERE handle=?1 AND origin_key=''";
-  auto find_user = prepare(backend->database(), find_user_sql,
-                           "cannot prepare TOS user lookup");
-  if (!find_user) {
-    return std::unexpected(find_user.error());
-  }
-  if (auto bound =
-          bind_text(backend->database(), find_user->get(), 1,
-                    acceptance.user_handle, "cannot bind TOS user lookup");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto found = sqlite3_step(find_user->get());
-  if (found == SQLITE_DONE) {
-    return std::unexpected(
-        Error{ErrorCode::not_found, "TOS user does not exist"});
-  }
-  if (found != SQLITE_ROW) {
-    return std::unexpected(
-        sqlite_error(backend->database(), found, "cannot look up TOS user"));
-  }
-  auto status = column_text(find_user->get(), 0, "TOS user status");
+  auto status = lookup_tos_user(backend->database(), acceptance.user_handle);
   if (!status) {
     return std::unexpected(status.error());
   }
-  if (sqlite3_column_type(find_user->get(), 1) != SQLITE_NULL) {
-    return std::unexpected(invalid_data("TOS user has a non-null origin"));
+  if (auto recorded = record_tos_acceptance(backend->database(), acceptance);
+      !recorded) {
+    return std::unexpected(recorded.error());
   }
-  if (*status != "pending" && *status != "active") {
-    return std::unexpected(
-        Error{ErrorCode::conflict,
-              "only pending or active accounts may accept the TOS"});
-  }
-
-  constexpr std::string_view insert_sql =
-      "INSERT INTO tos_acceptances(user_handle,tos_version,accepted_at) "
-      "VALUES(?1,?2,?3) ON CONFLICT(user_handle,user_origin_key,tos_version) "
-      "DO NOTHING";
-  auto insert = prepare(backend->database(), insert_sql,
-                        "cannot prepare TOS acceptance insert");
-  if (!insert) {
-    return std::unexpected(insert.error());
-  }
-  if (auto bound = bind_text(backend->database(), insert->get(), 1,
-                             acceptance.user_handle, "cannot bind TOS user");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_text(backend->database(), insert->get(), 2,
-                             acceptance.tos_version, "cannot bind TOS version");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_integer(backend->database(), insert->get(), 3,
-                                acceptance.accepted_at.value,
-                                "cannot bind TOS acceptance time");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto inserted = sqlite3_step(insert->get());
-  if (inserted != SQLITE_DONE) {
-    return std::unexpected(sqlite_error(backend->database(), inserted,
-                                        "cannot record TOS acceptance"));
-  }
-
   if (*status == "pending") {
-    constexpr std::string_view activate_sql =
-        "UPDATE users SET status='active' WHERE handle=?1 AND origin IS NULL "
-        "AND status='pending'";
-    auto activate = prepare(backend->database(), activate_sql,
-                            "cannot prepare TOS account activation");
-    if (!activate) {
-      return std::unexpected(activate.error());
-    }
-    if (auto bound = bind_text(backend->database(), activate->get(), 1,
-                               acceptance.user_handle,
-                               "cannot bind TOS account activation");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    const auto activated = sqlite3_step(activate->get());
-    if (activated != SQLITE_DONE) {
-      return std::unexpected(sqlite_error(backend->database(), activated,
-                                          "cannot activate TOS user"));
-    }
-    if (sqlite3_changes(backend->database()) != 1) {
-      return std::unexpected(
-          Error{ErrorCode::conflict, "TOS user status changed concurrently"});
+    if (auto activated =
+            activate_tos_user(backend->database(), acceptance.user_handle);
+        !activated) {
+      return std::unexpected(activated.error());
     }
   }
   return UserStatus::active;
@@ -1467,7 +1532,196 @@ auto SqliteStore::claim_invite_impl(Transaction &transaction,
   return {};
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- credit regeneration and code issuance must commit atomically
+namespace {
+
+struct InviteBalance {
+  std::int64_t remaining{};
+  std::optional<std::int64_t> next_regeneration;
+};
+
+[[nodiscard]] auto load_invite_balance(sqlite3 *database,
+                                       const InviteIssue &issue)
+    -> std::expected<InviteBalance, Error> {
+  constexpr std::string_view sql =
+      "SELECT status,invite_balance,invite_next_regeneration FROM users "
+      "WHERE handle=?1 AND origin_key=''";
+  auto statement =
+      prepare(database, sql, "cannot prepare invite balance lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1,
+                             issue.inviter_handle, "cannot bind invite issuer");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto result = sqlite3_step(statement->get());
+  if (result == SQLITE_DONE) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "invite issuer does not exist"});
+  }
+  if (result != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(database, result, "cannot look up invite issuer"));
+  }
+  auto status = column_text(statement->get(), 0, "invite issuer status");
+  auto balance = column_integer(statement->get(), 1, "invite balance");
+  auto next =
+      column_optional_integer(statement->get(), 2, "invite next regeneration");
+  if (auto error = first_column_error(status, balance, next)) {
+    return std::unexpected(std::move(*error));
+  }
+  if (*status != "active") {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "only active accounts may issue invites"});
+  }
+  if (*balance < 0) {
+    return std::unexpected(invalid_data("invite balance is negative"));
+  }
+  return InviteBalance{.remaining = *balance, .next_regeneration = *next};
+}
+
+[[nodiscard]] auto spend_invite_credit(InviteBalance stored,
+                                       const InviteIssue &issue)
+    -> std::expected<InviteBalance, Error> {
+  const auto cap = static_cast<std::int64_t>(issue.balance_cap);
+  stored.remaining = std::min(stored.remaining, cap);
+  if (!stored.next_regeneration) {
+    stored.remaining = cap;
+  }
+
+  const auto period = static_cast<std::int64_t>(issue.regeneration_seconds);
+  if (stored.next_regeneration &&
+      issue.created_at.value >= *stored.next_regeneration) {
+    const auto elapsed = static_cast<std::uint64_t>(issue.created_at.value) -
+                         static_cast<std::uint64_t>(*stored.next_regeneration);
+    const auto intervals = elapsed / static_cast<std::uint64_t>(period);
+    const auto needed = static_cast<std::uint64_t>(cap - stored.remaining);
+    if (needed == 0U || intervals >= needed - 1U) {
+      stored.remaining = cap;
+      stored.next_regeneration.reset();
+    } else {
+      const auto earned = 1 + static_cast<std::int64_t>(intervals);
+      stored.remaining += earned;
+      *stored.next_regeneration += earned * period;
+    }
+  }
+  if (stored.remaining == 0) {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "invite balance is exhausted"});
+  }
+  --stored.remaining;
+  if (stored.remaining < cap && !stored.next_regeneration) {
+    stored.next_regeneration = issue.created_at.value + period;
+  }
+  return stored;
+}
+
+[[nodiscard]] auto rollback_invite(sqlite3 *database, Error error)
+    -> std::expected<InviteIssueResult, Error> {
+  if (auto rolled_back =
+          exec(database, "ROLLBACK TO issue_invite; RELEASE issue_invite",
+               "cannot roll back invite issuance");
+      !rolled_back) {
+    error.detail += "; ";
+    error.detail += rolled_back.error().detail;
+  }
+  return std::unexpected(std::move(error));
+}
+
+[[nodiscard]] auto insert_issued_invite(sqlite3 *database,
+                                        const InviteIssue &issue)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "INSERT INTO invites(code_hash,inviter_handle,status,created_at,"
+      "expires_at) VALUES(?1,?2,'active',?3,?4)";
+  auto statement = prepare(database, sql, "cannot prepare invite issuance");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array texts{std::string_view{issue.code_hash},
+                         std::string_view{issue.inviter_handle}};
+  constexpr std::array text_operations{
+      std::string_view{"cannot bind invite code hash"},
+      std::string_view{"cannot bind invite issuer"}};
+  for (std::size_t index = 0; index < texts.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 1U),
+                      texts[index], text_operations[index]);
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  const std::array times{issue.created_at.value, issue.expires_at.value};
+  constexpr std::array time_operations{
+      std::string_view{"cannot bind invite creation time"},
+      std::string_view{"cannot bind invite expiry"}};
+  for (std::size_t index = 0; index < times.size(); ++index) {
+    if (auto bound = bind_integer(database, statement->get(),
+                                  static_cast<int>(index + 3U), times[index],
+                                  time_operations[index]);
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted == SQLITE_DONE) {
+    return {};
+  }
+  auto error = sqlite_error(database, inserted, "cannot issue invite");
+  if (error.code == ErrorCode::constraint_violation) {
+    error.code = ErrorCode::conflict;
+  }
+  return std::unexpected(std::move(error));
+}
+
+[[nodiscard]] auto update_invite_balance(sqlite3 *database,
+                                         const InviteIssue &issue,
+                                         const InviteBalance &balance)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "UPDATE users SET invite_balance=?2,invite_next_regeneration=?3 "
+      "WHERE handle=?1 AND origin_key='' AND status='active'";
+  auto statement =
+      prepare(database, sql, "cannot prepare invite balance update");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound =
+          bind_text(database, statement->get(), 1, issue.inviter_handle,
+                    "cannot bind invite balance owner");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound =
+          bind_integer(database, statement->get(), 2, balance.remaining,
+                       "cannot bind invite balance");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  auto next = balance.next_regeneration
+                  ? bind_integer(database, statement->get(), 3,
+                                 *balance.next_regeneration,
+                                 "cannot bind next regeneration")
+                  : bind_null(database, statement->get(), 3,
+                              "cannot bind next regeneration");
+  if (!next) {
+    return std::unexpected(next.error());
+  }
+  const auto updated = sqlite3_step(statement->get());
+  if (updated != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(database, updated, "cannot update invite balance"));
+  }
+  if (sqlite3_changes64(database) != 1) {
+    return std::unexpected(
+        Error{ErrorCode::conflict, "invite issuer changed during issuance"});
+  }
+  return {};
+}
+
+} // namespace
+
 auto SqliteStore::issue_invite_impl(Transaction &transaction,
                                     const InviteIssue &issue)
     -> std::expected<InviteIssueResult, Error> {
@@ -1478,73 +1732,13 @@ auto SqliteStore::issue_invite_impl(Transaction &transaction,
         Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
   }
 
-  constexpr std::string_view lookup_sql =
-      "SELECT status,invite_balance,invite_next_regeneration FROM users "
-      "WHERE handle=?1 AND origin_key=''";
-  auto lookup = prepare(backend->database(), lookup_sql,
-                        "cannot prepare invite balance lookup");
-  if (!lookup) {
-    return std::unexpected(lookup.error());
+  auto balance = load_invite_balance(backend->database(), issue);
+  if (!balance) {
+    return std::unexpected(balance.error());
   }
-  if (auto bound = bind_text(backend->database(), lookup->get(), 1,
-                             issue.inviter_handle, "cannot bind invite issuer");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto found = sqlite3_step(lookup->get());
-  if (found == SQLITE_DONE) {
-    return std::unexpected(
-        Error{ErrorCode::not_found, "invite issuer does not exist"});
-  }
-  if (found != SQLITE_ROW) {
-    return std::unexpected(sqlite_error(backend->database(), found,
-                                        "cannot look up invite issuer"));
-  }
-  auto status = column_text(lookup->get(), 0, "invite issuer status");
-  if (!status) {
-    return std::unexpected(status.error());
-  }
-  if (*status != "active") {
-    return std::unexpected(
-        Error{ErrorCode::conflict, "only active accounts may issue invites"});
-  }
-  const auto stored_balance =
-      static_cast<std::int64_t>(sqlite3_column_int64(lookup->get(), 1));
-  if (stored_balance < 0) {
-    return std::unexpected(invalid_data("invite balance is negative"));
-  }
-
-  const auto cap = static_cast<std::int64_t>(issue.balance_cap);
-  auto balance = std::min(stored_balance, cap);
-  std::optional<std::int64_t> next_regeneration;
-  if (sqlite3_column_type(lookup->get(), 2) != SQLITE_NULL) {
-    next_regeneration = sqlite3_column_int64(lookup->get(), 2);
-  } else {
-    balance = cap;
-  }
-
-  const auto period = static_cast<std::int64_t>(issue.regeneration_seconds);
-  if (next_regeneration && issue.created_at.value >= *next_regeneration) {
-    const auto elapsed = static_cast<std::uint64_t>(issue.created_at.value) -
-                         static_cast<std::uint64_t>(*next_regeneration);
-    const auto elapsed_intervals = elapsed / static_cast<std::uint64_t>(period);
-    const auto credits_needed = static_cast<std::uint64_t>(cap - balance);
-    if (credits_needed == 0U || elapsed_intervals >= credits_needed - 1U) {
-      balance = cap;
-      next_regeneration.reset();
-    } else {
-      const auto intervals = 1 + static_cast<std::int64_t>(elapsed_intervals);
-      balance += intervals;
-      *next_regeneration += intervals * period;
-    }
-  }
-  if (balance == 0) {
-    return std::unexpected(
-        Error{ErrorCode::conflict, "invite balance is exhausted"});
-  }
-  --balance;
-  if (balance < cap && !next_regeneration) {
-    next_regeneration = issue.created_at.value + period;
+  balance = spend_invite_credit(*balance, issue);
+  if (!balance) {
+    return std::unexpected(balance.error());
   }
 
   if (auto saved = exec(backend->database(), "SAVEPOINT issue_invite",
@@ -1552,98 +1746,25 @@ auto SqliteStore::issue_invite_impl(Transaction &transaction,
       !saved) {
     return std::unexpected(saved.error());
   }
-  const auto rollback =
-      [&](Error error) -> std::expected<InviteIssueResult, Error> {
-    static_cast<void>(exec(backend->database(),
-                           "ROLLBACK TO issue_invite; RELEASE issue_invite",
-                           "cannot roll back invite issuance"));
-    return std::unexpected(std::move(error));
-  };
-
-  constexpr std::string_view insert_sql =
-      "INSERT INTO invites(code_hash,inviter_handle,status,created_at,"
-      "expires_at) VALUES(?1,?2,'active',?3,?4)";
-  auto insert = prepare(backend->database(), insert_sql,
-                        "cannot prepare invite issuance");
-  if (!insert)
-    return rollback(insert.error());
-  if (auto bound = bind_text(backend->database(), insert->get(), 1,
-                             issue.code_hash, "cannot bind invite code hash");
-      !bound) {
-    return rollback(bound.error());
+  if (auto inserted = insert_issued_invite(backend->database(), issue);
+      !inserted) {
+    return rollback_invite(backend->database(), inserted.error());
   }
-  if (auto bound = bind_text(backend->database(), insert->get(), 2,
-                             issue.inviter_handle, "cannot bind invite issuer");
-      !bound) {
-    return rollback(bound.error());
-  }
-  if (auto bound = bind_integer(backend->database(), insert->get(), 3,
-                                issue.created_at.value,
-                                "cannot bind invite creation time");
-      !bound) {
-    return rollback(bound.error());
-  }
-  if (auto bound =
-          bind_integer(backend->database(), insert->get(), 4,
-                       issue.expires_at.value, "cannot bind invite expiry");
-      !bound) {
-    return rollback(bound.error());
-  }
-  const auto inserted = sqlite3_step(insert->get());
-  if (inserted != SQLITE_DONE) {
-    auto error =
-        sqlite_error(backend->database(), inserted, "cannot issue invite");
-    if (error.code == ErrorCode::constraint_violation) {
-      error.code = ErrorCode::conflict;
-    }
-    return rollback(std::move(error));
-  }
-
-  constexpr std::string_view update_sql =
-      "UPDATE users SET invite_balance=?2,invite_next_regeneration=?3 "
-      "WHERE handle=?1 AND origin_key='' AND status='active'";
-  auto update = prepare(backend->database(), update_sql,
-                        "cannot prepare invite balance update");
-  if (!update)
-    return rollback(update.error());
-  if (auto bound =
-          bind_text(backend->database(), update->get(), 1, issue.inviter_handle,
-                    "cannot bind invite balance owner");
-      !bound) {
-    return rollback(bound.error());
-  }
-  if (auto bound = bind_integer(backend->database(), update->get(), 2, balance,
-                                "cannot bind invite balance");
-      !bound) {
-    return rollback(bound.error());
-  }
-  const auto next_result =
-      next_regeneration
-          ? bind_integer(backend->database(), update->get(), 3,
-                         *next_regeneration, "cannot bind next regeneration")
-          : bind_null(backend->database(), update->get(), 3,
-                      "cannot bind next regeneration");
-  if (!next_result) {
-    return rollback(next_result.error());
-  }
-  const auto updated = sqlite3_step(update->get());
-  if (updated != SQLITE_DONE || sqlite3_changes64(backend->database()) != 1) {
-    return rollback(updated == SQLITE_DONE
-                        ? Error{ErrorCode::conflict,
-                                "invite issuer changed during issuance"}
-                        : sqlite_error(backend->database(), updated,
-                                       "cannot update invite balance"));
+  if (auto updated =
+          update_invite_balance(backend->database(), issue, *balance);
+      !updated) {
+    return rollback_invite(backend->database(), updated.error());
   }
   if (auto released = exec(backend->database(), "RELEASE issue_invite",
                            "cannot finish invite issuance");
       !released) {
-    return rollback(released.error());
+    return rollback_invite(backend->database(), released.error());
   }
   return InviteIssueResult{
-      .remaining_balance = static_cast<std::uint32_t>(balance),
+      .remaining_balance = static_cast<std::uint32_t>(balance->remaining),
       .next_regeneration =
-          next_regeneration
-              ? std::optional<UtcEpochSeconds>{{*next_regeneration}}
+          balance->next_regeneration
+              ? std::optional<UtcEpochSeconds>{{*balance->next_regeneration}}
               : std::nullopt,
   };
 }
@@ -1695,7 +1816,34 @@ auto SqliteStore::find_inviter_impl(Transaction &transaction,
                                               .status = *status}};
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- recursive-query rows are validated explicitly before becoming ancestry evidence
+namespace {
+
+[[nodiscard]] auto read_invite_descendant(sqlite3_stmt *statement)
+    -> std::expected<InviteDescendant, Error> {
+  auto handle = column_text(statement, 0, "descendant handle");
+  auto origin = column_optional_text(statement, 1, "descendant origin");
+  auto status_text = column_text(statement, 2, "descendant status");
+  auto depth = column_integer(statement, 3, "invite subtree depth");
+  if (auto error = first_column_error(handle, origin, status_text, depth)) {
+    return std::unexpected(std::move(*error));
+  }
+  if (*depth <= 0 ||
+      std::cmp_greater(*depth, std::numeric_limits<std::uint32_t>::max())) {
+    return std::unexpected(invalid_data("invite subtree depth is invalid"));
+  }
+  const auto status = parse_user_status(*status_text);
+  if (!status) {
+    return std::unexpected(
+        invalid_data("invite descendant has an unknown status"));
+  }
+  return InviteDescendant{.user = {.handle = std::move(*handle),
+                                   .origin = std::move(*origin),
+                                   .status = *status},
+                          .depth = static_cast<std::uint32_t>(*depth)};
+}
+
+} // namespace
+
 auto SqliteStore::list_invite_subtree_impl(Transaction &transaction,
                                            std::string_view root_handle)
     -> std::expected<std::vector<InviteDescendant>, Error> {
@@ -1762,28 +1910,11 @@ SELECT u.handle,u.origin,u.status,d.depth
   std::vector<InviteDescendant> result;
   auto row = sqlite3_step(statement->get());
   for (; row == SQLITE_ROW; row = sqlite3_step(statement->get())) {
-    auto handle = column_text(statement->get(), 0, "descendant handle");
-    auto origin =
-        column_optional_text(statement->get(), 1, "descendant origin");
-    auto status_text = column_text(statement->get(), 2, "descendant status");
-    const auto depth = sqlite3_column_int64(statement->get(), 3);
-    if (!handle || !origin || !status_text || depth <= 0 ||
-        depth > std::numeric_limits<std::uint32_t>::max()) {
-      return std::unexpected(
-          !handle        ? handle.error()
-          : !origin      ? origin.error()
-          : !status_text ? status_text.error()
-                         : invalid_data("invite subtree depth is invalid"));
+    auto descendant = read_invite_descendant(statement->get());
+    if (!descendant) {
+      return std::unexpected(descendant.error());
     }
-    const auto status = parse_user_status(*status_text);
-    if (!status) {
-      return std::unexpected(
-          invalid_data("invite descendant has an unknown status"));
-    }
-    result.push_back({.user = {.handle = std::move(*handle),
-                               .origin = std::move(*origin),
-                               .status = *status},
-                      .depth = static_cast<std::uint32_t>(depth)});
+    result.push_back(std::move(*descendant));
   }
   if (row != SQLITE_DONE) {
     return std::unexpected(
@@ -1792,7 +1923,127 @@ SELECT u.handle,u.origin,u.status,d.depth
   return result;
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- create-or-update provisioning must remain one atomic startup operation
+namespace {
+
+[[nodiscard]] auto find_declared_board(sqlite3 *database, std::string_view name)
+    -> std::expected<std::optional<std::string>, Error> {
+  constexpr std::string_view sql =
+      "SELECT board_id,status FROM boards WHERE name=?1 AND origin_key=''";
+  auto statement =
+      prepare(database, sql, "cannot prepare board declaration lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, name,
+                             "cannot bind board declaration name");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto result = sqlite3_step(statement->get());
+  if (result == SQLITE_DONE) {
+    return std::nullopt;
+  }
+  if (result != SQLITE_ROW) {
+    return std::unexpected(
+        sqlite_error(database, result, "cannot look up declared board"));
+  }
+  auto board_id = column_text(statement->get(), 0, "declared board ID");
+  auto status = column_text(statement->get(), 1, "declared board status");
+  if (auto error = first_column_error(board_id, status)) {
+    return std::unexpected(std::move(*error));
+  }
+  if (*status != "active") {
+    return std::unexpected(Error{
+        ErrorCode::conflict, "board declaration matches a tombstoned board"});
+  }
+  return std::optional<std::string>{std::move(*board_id)};
+}
+
+[[nodiscard]] auto update_declared_board(sqlite3 *database,
+                                         std::string_view board_id,
+                                         const BoardProvision &board)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "UPDATE boards SET title=?1,guest_readable=?2 WHERE board_id=?3 AND "
+      "origin_key='' AND status='active'";
+  auto statement =
+      prepare(database, sql, "cannot prepare board declaration update");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, board.title,
+                             "cannot bind board title");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto guest_readable =
+      board.visibility == BoardVisibility::public_read ? 1 : 0;
+  if (auto bound = bind_integer(database, statement->get(), 2, guest_readable,
+                                "cannot bind board visibility");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 3, board_id,
+                             "cannot bind declared board ID");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto updated = sqlite3_step(statement->get());
+  if (updated != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(database, updated, "cannot update declared board"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto insert_declared_board(sqlite3 *database,
+                                         const BoardProvision &board)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "INSERT INTO boards(board_id,name,title,guest_readable,created_at) "
+      "VALUES(?1,?2,?3,?4,?5)";
+  auto statement =
+      prepare(database, sql, "cannot prepare board declaration insert");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array texts{std::string_view{board.board_id},
+                         std::string_view{board.name},
+                         std::string_view{board.title}};
+  for (std::size_t index = 0; index < texts.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 1U),
+                      texts[index], "cannot bind board declaration");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  const auto guest_readable =
+      board.visibility == BoardVisibility::public_read ? 1 : 0;
+  if (auto bound = bind_integer(database, statement->get(), 4, guest_readable,
+                                "cannot bind board visibility");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound =
+          bind_integer(database, statement->get(), 5, board.created_at.value,
+                       "cannot bind board creation time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted == SQLITE_DONE) {
+    return {};
+  }
+  auto error = sqlite_error(database, inserted, "cannot insert declared board");
+  if (error.code == ErrorCode::constraint_violation) {
+    error.code = ErrorCode::conflict;
+  }
+  return std::unexpected(std::move(error));
+}
+
+} // namespace
+
 auto SqliteStore::reconcile_board_impl(Transaction &transaction,
                                        const BoardProvision &board)
     -> std::expected<BoardRecord, Error> {
@@ -1802,108 +2053,23 @@ auto SqliteStore::reconcile_board_impl(Transaction &transaction,
     return std::unexpected(
         Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
   }
-  constexpr std::string_view find_sql =
-      "SELECT board_id,title,description,status,guest_readable FROM boards "
-      "WHERE name=?1 AND origin_key=''";
-  auto find = prepare(backend->database(), find_sql,
-                      "cannot prepare board declaration lookup");
-  if (!find) {
-    return std::unexpected(find.error());
+  auto existing = find_declared_board(backend->database(), board.name);
+  if (!existing) {
+    return std::unexpected(existing.error());
   }
-  if (auto bound = bind_text(backend->database(), find->get(), 1, board.name,
-                             "cannot bind board declaration name");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto found = sqlite3_step(find->get());
   std::string board_id = board.board_id;
-  if (found == SQLITE_ROW) {
-    auto existing_id = column_text(find->get(), 0, "declared board ID");
-    auto status = column_text(find->get(), 3, "declared board status");
-    if (!existing_id || !status) {
-      return std::unexpected(!existing_id ? existing_id.error()
-                                          : status.error());
-    }
-    if (*status != "active") {
-      return std::unexpected(Error{
-          ErrorCode::conflict, "board declaration matches a tombstoned board"});
-    }
-    board_id = std::move(*existing_id);
-    constexpr std::string_view update_sql =
-        "UPDATE boards SET title=?1,guest_readable=?2 WHERE board_id=?3 AND "
-        "origin_key='' AND status='active'";
-    auto update = prepare(backend->database(), update_sql,
-                          "cannot prepare board declaration update");
-    if (!update) {
-      return std::unexpected(update.error());
-    }
-    if (auto bound = bind_text(backend->database(), update->get(), 1,
-                               board.title, "cannot bind board title");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    if (auto bound = bind_integer(
-            backend->database(), update->get(), 2,
-            board.visibility == BoardVisibility::public_read ? 1 : 0,
-            "cannot bind board visibility");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    if (auto bound = bind_text(backend->database(), update->get(), 3, board_id,
-                               "cannot bind declared board ID");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    if (const auto updated = sqlite3_step(update->get());
-        updated != SQLITE_DONE) {
-      return std::unexpected(sqlite_error(backend->database(), updated,
-                                          "cannot update declared board"));
-    }
-  } else if (found == SQLITE_DONE) {
-    constexpr std::string_view insert_sql =
-        "INSERT INTO boards(board_id,name,title,guest_readable,created_at) "
-        "VALUES(?1,?2,?3,?4,?5)";
-    auto insert = prepare(backend->database(), insert_sql,
-                          "cannot prepare board declaration insert");
-    if (!insert) {
-      return std::unexpected(insert.error());
-    }
-    const std::array texts{std::string_view{board_id},
-                           std::string_view{board.name},
-                           std::string_view{board.title}};
-    for (std::size_t index = 0; index < texts.size(); ++index) {
-      if (auto bound = bind_text(backend->database(), insert->get(),
-                                 static_cast<int>(index + 1U), texts[index],
-                                 "cannot bind board declaration");
-          !bound) {
-        return std::unexpected(bound.error());
-      }
-    }
-    if (auto bound = bind_integer(
-            backend->database(), insert->get(), 4,
-            board.visibility == BoardVisibility::public_read ? 1 : 0,
-            "cannot bind board visibility");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    if (auto bound = bind_integer(backend->database(), insert->get(), 5,
-                                  board.created_at.value,
-                                  "cannot bind board creation time");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-    const auto inserted = sqlite3_step(insert->get());
-    if (inserted != SQLITE_DONE) {
-      auto error = sqlite_error(backend->database(), inserted,
-                                "cannot insert declared board");
-      if (error.code == ErrorCode::constraint_violation) {
-        error.code = ErrorCode::conflict;
-      }
-      return std::unexpected(std::move(error));
+  if (existing->has_value()) {
+    board_id = std::move(**existing);
+    if (auto updated =
+            update_declared_board(backend->database(), board_id, board);
+        !updated) {
+      return std::unexpected(updated.error());
     }
   } else {
-    return std::unexpected(sqlite_error(backend->database(), found,
-                                        "cannot look up declared board"));
+    if (auto inserted = insert_declared_board(backend->database(), board);
+        !inserted) {
+      return std::unexpected(inserted.error());
+    }
   }
   return BoardRecord{.board_id = std::move(board_id),
                      .name = board.name,
@@ -2199,7 +2365,112 @@ auto SqliteStore::create_thread_impl(Transaction &transaction,
   return message;
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- thread and parent authority checks share the message insertion transaction
+namespace {
+
+[[nodiscard]] auto require_reply_thread(sqlite3 *database,
+                                        const ReplyCreate &reply)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "SELECT 1 FROM threads t JOIN boards b ON b.board_id=t.board_id WHERE "
+      "t.thread_id=?1 AND t.board_id=?2 AND t.status='active' AND "
+      "t.locked_at IS NULL AND b.status='active' AND EXISTS(SELECT 1 FROM "
+      "users WHERE handle=?3 AND origin_key='' AND status='active')";
+  auto statement = prepare(database, sql, "cannot prepare reply thread lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array values{std::string_view{reply.thread_id},
+                          std::string_view{reply.board_id},
+                          std::string_view{reply.author_handle}};
+  constexpr std::array operations{std::string_view{"cannot bind reply thread"},
+                                  std::string_view{"cannot bind reply board"},
+                                  std::string_view{"cannot bind reply author"}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 1U),
+                      values[index], operations[index]);
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (sqlite3_step(statement->get()) != SQLITE_ROW) {
+    return std::unexpected(Error{ErrorCode::not_found,
+                                 "reply thread is absent, deleted, or locked"});
+  }
+  return {};
+}
+
+[[nodiscard]] auto require_reply_parent(sqlite3 *database,
+                                        const ReplyCreate &reply)
+    -> std::expected<void, Error> {
+  if (!reply.parent_message_id) {
+    return {};
+  }
+  constexpr std::string_view sql =
+      "SELECT 1 FROM messages WHERE message_id=?1 AND thread_id=?2 AND "
+      "board_id=?3 AND status='active'";
+  auto statement = prepare(database, sql, "cannot prepare quote parent lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  const std::array values{std::string_view{*reply.parent_message_id},
+                          std::string_view{reply.thread_id},
+                          std::string_view{reply.board_id}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 1U),
+                      values[index], "cannot bind quote parent");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (sqlite3_step(statement->get()) != SQLITE_ROW) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "quote parent is not active in thread"});
+  }
+  return {};
+}
+
+[[nodiscard]] auto update_reply_thread(sqlite3 *database,
+                                       const ReplyCreate &reply)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "UPDATE threads SET updated_at=max(updated_at,?1) WHERE thread_id=?2 "
+      "AND board_id=?3";
+  auto statement =
+      prepare(database, sql, "cannot prepare thread activity update");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound =
+          bind_integer(database, statement->get(), 1, reply.created_at.value,
+                       "cannot bind thread activity time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const std::array values{std::string_view{reply.thread_id},
+                          std::string_view{reply.board_id}};
+  constexpr std::array operations{
+      std::string_view{"cannot bind updated thread"},
+      std::string_view{"cannot bind updated board"}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 2U),
+                      values[index], operations[index]);
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  const auto updated = sqlite3_step(statement->get());
+  if (updated != SQLITE_DONE) {
+    return std::unexpected(
+        sqlite_error(database, updated, "cannot update thread activity"));
+  }
+  return {};
+}
+
+} // namespace
+
 auto SqliteStore::create_reply_impl(Transaction &transaction,
                                     const ReplyCreate &reply)
     -> std::expected<MessageRecord, Error> {
@@ -2209,59 +2480,11 @@ auto SqliteStore::create_reply_impl(Transaction &transaction,
     return std::unexpected(
         Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
   }
-  constexpr std::string_view thread_sql =
-      "SELECT 1 FROM threads t JOIN boards b ON b.board_id=t.board_id WHERE "
-      "t.thread_id=?1 AND t.board_id=?2 AND t.status='active' AND "
-      "t.locked_at IS NULL AND b.status='active' AND EXISTS(SELECT 1 FROM "
-      "users WHERE handle=?3 AND origin_key='' AND status='active')";
-  auto thread = prepare(backend->database(), thread_sql,
-                        "cannot prepare reply thread lookup");
-  if (!thread) {
+  if (auto thread = require_reply_thread(backend->database(), reply); !thread) {
     return std::unexpected(thread.error());
   }
-  if (auto bound = bind_text(backend->database(), thread->get(), 1,
-                             reply.thread_id, "cannot bind reply thread");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_text(backend->database(), thread->get(), 2,
-                             reply.board_id, "cannot bind reply board");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_text(backend->database(), thread->get(), 3,
-                             reply.author_handle, "cannot bind reply author");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (const auto found = sqlite3_step(thread->get()); found != SQLITE_ROW) {
-    return std::unexpected(Error{ErrorCode::not_found,
-                                 "reply thread is absent, deleted, or locked"});
-  }
-  if (reply.parent_message_id) {
-    constexpr std::string_view parent_sql =
-        "SELECT 1 FROM messages WHERE message_id=?1 AND thread_id=?2 AND "
-        "board_id=?3 AND status='active'";
-    auto parent = prepare(backend->database(), parent_sql,
-                          "cannot prepare quote parent lookup");
-    if (!parent) {
-      return std::unexpected(parent.error());
-    }
-    const std::array values{std::string_view{*reply.parent_message_id},
-                            std::string_view{reply.thread_id},
-                            std::string_view{reply.board_id}};
-    for (std::size_t index = 0; index < values.size(); ++index) {
-      if (auto bound = bind_text(backend->database(), parent->get(),
-                                 static_cast<int>(index + 1U), values[index],
-                                 "cannot bind quote parent");
-          !bound) {
-        return std::unexpected(bound.error());
-      }
-    }
-    if (const auto found = sqlite3_step(parent->get()); found != SQLITE_ROW) {
-      return std::unexpected(
-          Error{ErrorCode::not_found, "quote parent is not active in thread"});
-    }
+  if (auto parent = require_reply_parent(backend->database(), reply); !parent) {
+    return std::unexpected(parent.error());
   }
   auto sequence = next_message_sequence(backend->database());
   if (!sequence) {
@@ -2281,34 +2504,9 @@ auto SqliteStore::create_reply_impl(Transaction &transaction,
   if (auto stored = insert_message(backend->database(), message); !stored) {
     return std::unexpected(stored.error());
   }
-  constexpr std::string_view update_sql =
-      "UPDATE threads SET updated_at=max(updated_at,?1) WHERE thread_id=?2 "
-      "AND board_id=?3";
-  auto update = prepare(backend->database(), update_sql,
-                        "cannot prepare thread activity update");
-  if (!update) {
-    return std::unexpected(update.error());
-  }
-  if (auto bound = bind_integer(backend->database(), update->get(), 1,
-                                reply.created_at.value,
-                                "cannot bind thread activity time");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_text(backend->database(), update->get(), 2,
-                             reply.thread_id, "cannot bind updated thread");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_text(backend->database(), update->get(), 3,
-                             reply.board_id, "cannot bind updated board");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (const auto updated = sqlite3_step(update->get());
-      updated != SQLITE_DONE) {
-    return std::unexpected(sqlite_error(backend->database(), updated,
-                                        "cannot update thread activity"));
+  if (auto updated = update_reply_thread(backend->database(), reply);
+      !updated) {
+    return std::unexpected(updated.error());
   }
   return message;
 }
@@ -2417,7 +2615,129 @@ read_through_sequence=max(board_reads.read_through_sequence,
   return {};
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- target visibility and reporter authority checks remain co-located
+namespace {
+
+struct ReportTargetQuery {
+  std::string_view kind;
+  std::string_view sql;
+};
+
+[[nodiscard]] auto report_target_query(ContentKind kind) -> ReportTargetQuery {
+  if (kind == ContentKind::thread) {
+    return {"thread", "SELECT 1 FROM threads t JOIN boards b ON "
+                      "b.board_id=t.board_id WHERE t.thread_id=?1 "
+                      "AND t.status='active' AND b.status='active' "
+                      "AND (b.guest_readable=1 OR EXISTS(SELECT 1 "
+                      "FROM users u WHERE u.handle=?2 AND "
+                      "u.origin_key='' AND u.status='active'))"};
+  }
+  if (kind == ContentKind::message) {
+    return {"message", "SELECT 1 FROM messages m JOIN threads t ON "
+                       "t.thread_id=m.thread_id AND t.board_id=m.board_id "
+                       "JOIN boards b ON b.board_id=m.board_id WHERE "
+                       "m.message_id=?1 AND m.status='active' AND "
+                       "t.status='active' AND b.status='active' AND "
+                       "(b.guest_readable=1 OR EXISTS(SELECT 1 FROM users u "
+                       "WHERE u.handle=?2 AND u.origin_key='' AND "
+                       "u.status='active'))"};
+  }
+  return {"oneliner", "SELECT 1 FROM oneliners o WHERE o.oneliner_id=?1 AND "
+                      "o.status='active' AND (?2 IS NULL OR EXISTS(SELECT 1 "
+                      "FROM users u WHERE u.handle=?2 AND u.origin_key='' AND "
+                      "u.status='active'))"};
+}
+
+[[nodiscard]] auto require_report_target(sqlite3 *database,
+                                         const ReportSubmission &report,
+                                         std::string_view target_id,
+                                         const ReportTargetQuery &query)
+    -> std::expected<void, Error> {
+  auto statement =
+      prepare(database, query.sql, "cannot prepare report target lookup");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, target_id,
+                             "cannot bind report target");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  auto reporter =
+      report.reporter_handle
+          ? bind_text(database, statement->get(), 2, *report.reporter_handle,
+                      "cannot bind report visibility scope")
+          : bind_null(database, statement->get(), 2,
+                      "cannot bind guest report visibility scope");
+  if (!reporter) {
+    return std::unexpected(reporter.error());
+  }
+  if (sqlite3_step(statement->get()) != SQLITE_ROW) {
+    return std::unexpected(
+        Error{ErrorCode::not_found, "report target is not visible"});
+  }
+  return {};
+}
+
+[[nodiscard]] auto
+insert_report(sqlite3 *database, const ReportSubmission &report,
+              std::string_view target_id, std::string_view target_kind)
+    -> std::expected<void, Error> {
+  constexpr std::string_view sql =
+      "INSERT INTO reports(report_id,reporter_kind,reporter_handle,target_kind,"
+      "target_id,evidence,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)";
+  auto statement = prepare(database, sql, "cannot prepare report insert");
+  if (!statement) {
+    return std::unexpected(statement.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 1, report.report_id,
+                             "cannot bind report ID");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  if (auto bound = bind_text(database, statement->get(), 2,
+                             report.reporter_handle ? "registered" : "guest",
+                             "cannot bind reporter kind");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  auto reporter =
+      report.reporter_handle
+          ? bind_text(database, statement->get(), 3, *report.reporter_handle,
+                      "cannot bind reporter handle")
+          : bind_null(database, statement->get(), 3,
+                      "cannot bind anonymous reporter");
+  if (!reporter) {
+    return std::unexpected(reporter.error());
+  }
+  const std::array values{target_kind, target_id,
+                          std::string_view{report.reason}};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (auto bound =
+            bind_text(database, statement->get(), static_cast<int>(index + 4U),
+                      values[index], "cannot bind report content");
+        !bound) {
+      return std::unexpected(bound.error());
+    }
+  }
+  if (auto bound =
+          bind_integer(database, statement->get(), 7, report.created_at.value,
+                       "cannot bind report creation time");
+      !bound) {
+    return std::unexpected(bound.error());
+  }
+  const auto inserted = sqlite3_step(statement->get());
+  if (inserted == SQLITE_DONE) {
+    return {};
+  }
+  auto error = sqlite_error(database, inserted, "cannot submit report");
+  if (error.code == ErrorCode::constraint_violation) {
+    error.code = ErrorCode::conflict;
+  }
+  return std::unexpected(std::move(error));
+}
+
+} // namespace
+
 auto SqliteStore::submit_report_impl(Transaction &transaction,
                                      const ReportSubmission &report)
     -> std::expected<void, Error> {
@@ -2428,111 +2748,13 @@ auto SqliteStore::submit_report_impl(Transaction &transaction,
         Error{ErrorCode::invalid_state, "invalid SQLite transaction"});
   }
   const auto &target_id = std::get<std::string>(report.target.id);
-  std::string_view target_kind;
-  std::string_view target_sql;
-  if (report.target.kind == ContentKind::thread) {
-    target_kind = "thread";
-    target_sql = "SELECT 1 FROM threads t JOIN boards b ON "
-                 "b.board_id=t.board_id WHERE t.thread_id=?1 "
-                 "AND t.status='active' AND b.status='active' "
-                 "AND (b.guest_readable=1 OR EXISTS(SELECT 1 "
-                 "FROM users u WHERE u.handle=?2 AND "
-                 "u.origin_key='' AND u.status='active'))";
-  } else if (report.target.kind == ContentKind::message) {
-    target_kind = "message";
-    target_sql = "SELECT 1 FROM messages m JOIN threads t ON "
-                 "t.thread_id=m.thread_id AND t.board_id=m.board_id "
-                 "JOIN boards b ON b.board_id=m.board_id WHERE "
-                 "m.message_id=?1 AND m.status='active' AND "
-                 "t.status='active' AND b.status='active' AND "
-                 "(b.guest_readable=1 OR EXISTS(SELECT 1 FROM users u "
-                 "WHERE u.handle=?2 AND u.origin_key='' AND "
-                 "u.status='active'))";
-  } else {
-    target_kind = "oneliner";
-    target_sql = "SELECT 1 FROM oneliners o WHERE o.oneliner_id=?1 AND "
-                 "o.status='active' AND (?2 IS NULL OR EXISTS(SELECT 1 "
-                 "FROM users u WHERE u.handle=?2 AND u.origin_key='' AND "
-                 "u.status='active'))";
-  }
-  auto target = prepare(backend->database(), target_sql,
-                        "cannot prepare report target lookup");
-  if (!target) {
+  const auto query = report_target_query(report.target.kind);
+  if (auto target =
+          require_report_target(backend->database(), report, target_id, query);
+      !target) {
     return std::unexpected(target.error());
   }
-  if (auto bound = bind_text(backend->database(), target->get(), 1, target_id,
-                             "cannot bind report target");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  auto reporter_scope =
-      report.reporter_handle
-          ? bind_text(backend->database(), target->get(), 2,
-                      *report.reporter_handle,
-                      "cannot bind report visibility scope")
-          : bind_null(backend->database(), target->get(), 2,
-                      "cannot bind guest report visibility scope");
-  if (!reporter_scope) {
-    return std::unexpected(reporter_scope.error());
-  }
-  if (const auto found = sqlite3_step(target->get()); found != SQLITE_ROW) {
-    return std::unexpected(
-        Error{ErrorCode::not_found, "report target is not visible"});
-  }
-  constexpr std::string_view insert_sql =
-      "INSERT INTO reports(report_id,reporter_kind,reporter_handle,target_kind,"
-      "target_id,evidence,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)";
-  auto insert =
-      prepare(backend->database(), insert_sql, "cannot prepare report insert");
-  if (!insert) {
-    return std::unexpected(insert.error());
-  }
-  if (auto bound = bind_text(backend->database(), insert->get(), 1,
-                             report.report_id, "cannot bind report ID");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  if (auto bound = bind_text(backend->database(), insert->get(), 2,
-                             report.reporter_handle ? "registered" : "guest",
-                             "cannot bind reporter kind");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  auto reporter =
-      report.reporter_handle
-          ? bind_text(backend->database(), insert->get(), 3,
-                      *report.reporter_handle, "cannot bind reporter handle")
-          : bind_null(backend->database(), insert->get(), 3,
-                      "cannot bind anonymous reporter");
-  if (!reporter) {
-    return std::unexpected(reporter.error());
-  }
-  const std::array values{target_kind, std::string_view{target_id},
-                          std::string_view{report.reason}};
-  for (std::size_t index = 0; index < values.size(); ++index) {
-    if (auto bound = bind_text(backend->database(), insert->get(),
-                               static_cast<int>(index + 4U), values[index],
-                               "cannot bind report content");
-        !bound) {
-      return std::unexpected(bound.error());
-    }
-  }
-  if (auto bound = bind_integer(backend->database(), insert->get(), 7,
-                                report.created_at.value,
-                                "cannot bind report creation time");
-      !bound) {
-    return std::unexpected(bound.error());
-  }
-  const auto inserted = sqlite3_step(insert->get());
-  if (inserted != SQLITE_DONE) {
-    auto error =
-        sqlite_error(backend->database(), inserted, "cannot submit report");
-    if (error.code == ErrorCode::constraint_violation) {
-      error.code = ErrorCode::conflict;
-    }
-    return std::unexpected(std::move(error));
-  }
-  return {};
+  return insert_report(backend->database(), report, target_id, query.kind);
 }
 
 auto SqliteStore::create_oneliner_impl(Transaction &transaction,
@@ -2784,7 +3006,128 @@ auto SqliteStore::scalar_text_for_testing(Transaction &transaction,
 
 namespace detail {
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- admission, migration, and rollback form one fail-closed database sequence
+namespace {
+
+struct DatabaseMetadata {
+  std::int64_t application_id{};
+  std::int64_t version{};
+  std::int64_t object_count{};
+};
+
+[[nodiscard]] auto read_database_metadata(sqlite3 *database)
+    -> std::expected<DatabaseMetadata, Error> {
+  auto application_id = scalar_integer(database, "PRAGMA application_id",
+                                       "cannot read SQLite application ID");
+  if (!application_id) {
+    return std::unexpected(application_id.error());
+  }
+  auto version = scalar_integer(database, "PRAGMA user_version",
+                                "cannot read SQLite schema version");
+  if (!version) {
+    return std::unexpected(version.error());
+  }
+  auto object_count = scalar_integer(
+      database,
+      "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+      "cannot inspect SQLite schema");
+  if (!object_count) {
+    return std::unexpected(object_count.error());
+  }
+  return DatabaseMetadata{.application_id = *application_id,
+                          .version = *version,
+                          .object_count = *object_count};
+}
+
+[[nodiscard]] auto validate_database_metadata(const DatabaseMetadata &metadata,
+                                              std::uint32_t current_version)
+    -> std::expected<void, Error> {
+  if (metadata.application_id == 0) {
+    if (metadata.version != 0 || metadata.object_count != 0) {
+      return std::unexpected(invalid_data(
+          "refusing to claim a non-empty SQLite database without Anvil's "
+          "application ID"));
+    }
+  } else if (metadata.application_id != anvil_application_id) {
+    return std::unexpected(
+        invalid_data("SQLite application ID does not belong to Anvil"));
+  }
+  if (metadata.version < 0 ||
+      std::cmp_greater(metadata.version, current_version)) {
+    return std::unexpected(
+        invalid_data("SQLite schema version is newer than this Anvil binary"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto claim_database(sqlite3 *database,
+                                  const DatabaseMetadata &metadata,
+                                  bool has_migrations)
+    -> std::expected<void, Error> {
+  if (metadata.application_id != 0 || !has_migrations) {
+    return {};
+  }
+  return exec(database, "PRAGMA application_id=1095652940",
+              "cannot assign Anvil's SQLite application ID");
+}
+
+[[nodiscard]] auto apply_migrations(sqlite3 *database,
+                                    std::span<const SqliteMigration> migrations,
+                                    std::int64_t previous_version)
+    -> std::expected<void, Error> {
+  for (const auto &migration : migrations) {
+    if (std::cmp_less_equal(migration.version, previous_version)) {
+      continue;
+    }
+    if (!migration.sql.empty()) {
+      if (auto applied =
+              exec(database, migration.sql,
+                   "SQLite migration " + std::to_string(migration.version) +
+                       " failed");
+          !applied) {
+        return std::unexpected(applied.error());
+      }
+    }
+    if (auto recorded =
+            exec(database,
+                 "PRAGMA user_version=" + std::to_string(migration.version),
+                 "cannot record SQLite schema version");
+        !recorded) {
+      return std::unexpected(recorded.error());
+    }
+  }
+  return {};
+}
+
+[[nodiscard]] auto verify_database_metadata(sqlite3 *database,
+                                            std::uint32_t expected_version)
+    -> std::expected<void, Error> {
+  auto application_id = scalar_integer(database, "PRAGMA application_id",
+                                       "cannot verify SQLite application ID");
+  if (!application_id) {
+    return std::unexpected(application_id.error());
+  }
+  auto version = scalar_integer(database, "PRAGMA user_version",
+                                "cannot verify SQLite schema version");
+  if (!version) {
+    return std::unexpected(version.error());
+  }
+  if (*application_id != anvil_application_id ||
+      std::cmp_not_equal(*version, expected_version)) {
+    return std::unexpected(
+        invalid_data("SQLite migration metadata verification failed"));
+  }
+  return {};
+}
+
+[[nodiscard]] auto rollback_open(sqlite3 *database, Error error)
+    -> std::expected<std::unique_ptr<SqliteStore>, Error> {
+  static_cast<void>(
+      sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr));
+  return std::unexpected(std::move(error));
+}
+
+} // namespace
+
 auto open_sqlite_store(const std::filesystem::path &path,
                        std::span<const SqliteMigration> migrations,
                        SqliteOptions options)
@@ -2808,92 +3151,35 @@ auto open_sqlite_store(const std::filesystem::path &path,
     return std::unexpected(begun.error());
   }
 
-  const auto fail =
-      [&](Error error) -> std::expected<std::unique_ptr<SqliteStore>, Error> {
-    static_cast<void>(
-        sqlite3_exec(database->get(), "ROLLBACK", nullptr, nullptr, nullptr));
-    return std::unexpected(std::move(error));
-  };
-
-  auto application_id = scalar_integer(database->get(), "PRAGMA application_id",
-                                       "cannot read SQLite application ID");
-  if (!application_id) {
-    return fail(application_id.error());
+  auto metadata = read_database_metadata(database->get());
+  if (!metadata) {
+    return rollback_open(database->get(), metadata.error());
   }
-  auto version = scalar_integer(database->get(), "PRAGMA user_version",
-                                "cannot read SQLite schema version");
-  if (!version) {
-    return fail(version.error());
-  }
-  auto object_count = scalar_integer(
-      database->get(),
-      "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-      "cannot inspect SQLite schema");
-  if (!object_count) {
-    return fail(object_count.error());
-  }
-
-  if (*application_id == 0) {
-    if (*version != 0 || *object_count != 0) {
-      return fail(invalid_data(
-          "refusing to claim a non-empty SQLite database without Anvil's "
-          "application ID"));
-    }
-  } else if (*application_id != anvil_application_id) {
-    return fail(invalid_data("SQLite application ID does not belong to Anvil"));
-  }
-
   const auto current_version =
       migrations.empty() ? 0U : migrations.back().version;
-  if (*version < 0 || static_cast<std::uint64_t>(*version) > current_version) {
-    return fail(
-        invalid_data("SQLite schema version is newer than this Anvil binary"));
+  if (auto valid = validate_database_metadata(*metadata, current_version);
+      !valid) {
+    return rollback_open(database->get(), valid.error());
   }
-
-  if (*application_id == 0 && !migrations.empty()) {
-    if (auto claimed = exec(database->get(), "PRAGMA application_id=1095652940",
-                            "cannot assign Anvil's SQLite application ID");
-        !claimed) {
-      return fail(claimed.error());
-    }
+  if (auto claimed =
+          claim_database(database->get(), *metadata, !migrations.empty());
+      !claimed) {
+    return rollback_open(database->get(), claimed.error());
   }
-
-  for (const auto &migration : migrations) {
-    if (migration.version <= static_cast<std::uint64_t>(*version)) {
-      continue;
-    }
-    if (!migration.sql.empty()) {
-      if (auto applied =
-              exec(database->get(), migration.sql,
-                   "SQLite migration " + std::to_string(migration.version) +
-                       " failed");
-          !applied) {
-        return fail(applied.error());
-      }
-    }
-    if (auto recorded =
-            exec(database->get(),
-                 "PRAGMA user_version=" + std::to_string(migration.version),
-                 "cannot record SQLite schema version");
-        !recorded) {
-      return fail(recorded.error());
-    }
+  if (auto applied =
+          apply_migrations(database->get(), migrations, metadata->version);
+      !applied) {
+    return rollback_open(database->get(), applied.error());
   }
-
-  application_id = scalar_integer(database->get(), "PRAGMA application_id",
-                                  "cannot verify SQLite application ID");
-  version = scalar_integer(database->get(), "PRAGMA user_version",
-                           "cannot verify SQLite schema version");
-  if (!application_id || !version) {
-    return fail(!application_id ? application_id.error() : version.error());
-  }
-  if (*application_id != anvil_application_id || *version != current_version) {
-    return fail(invalid_data("SQLite migration metadata verification failed"));
+  if (auto verified =
+          verify_database_metadata(database->get(), current_version);
+      !verified) {
+    return rollback_open(database->get(), verified.error());
   }
   if (auto committed =
           exec(database->get(), "COMMIT", "cannot commit SQLite migrations");
       !committed) {
-    return fail(committed.error());
+    return rollback_open(database->get(), committed.error());
   }
 
   return std::unique_ptr<SqliteStore>(

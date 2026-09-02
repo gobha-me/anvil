@@ -76,7 +76,6 @@ src/session_resources.cpp	bugprone-implicit-widening-of-multiplication-result	3b
 src/session_resources.cpp	cppcoreguidelines-avoid-do-while	09195e4dcdbf3af4d4de	avoid do-while loops
 src/session_resources.cpp	cppcoreguidelines-pro-type-vararg	611b3102eadc49a1e71f	do not call c-style vararg functions
 src/session_resources.cpp	readability-math-missing-parentheses	2270f1e9fd96e007280e	'*' has higher precedence than '+'; add parentheses to explicitly specify the order of operations
-src/sqlite_store.cpp	bugprone-unused-return-value	93e622acb3fb3c039446	the value returned by this function should not be disregarded; neglecting it may lead to errors
 src/sqlite_store.cpp	cppcoreguidelines-avoid-do-while	bc7987a4cb15af6f6847	avoid do-while loops
 src/sqlite_store.cpp	cppcoreguidelines-pro-type-reinterpret-cast	626b5168dd2147a7a0fd	do not use reinterpret_cast
 src/sqlite_store.cpp	cppcoreguidelines-pro-type-reinterpret-cast	65a361594e02102c4df3	do not use reinterpret_cast
@@ -86,11 +85,7 @@ src/sqlite_store.cpp	cppcoreguidelines-pro-type-vararg	0e8c8919684ef186d104	do n
 src/sqlite_store.cpp	cppcoreguidelines-pro-type-vararg	3bec627bcce00babb329	do not call c-style vararg functions
 src/sqlite_store.cpp	cppcoreguidelines-pro-type-vararg	bbcff1cb4f78252debd3	do not call c-style vararg functions
 src/sqlite_store.cpp	modernize-make-unique	ca7b44da0239dc08a2e6	use std::make_unique instead
-src/sqlite_store.cpp	modernize-use-integer-sign-comparison	2cd84457e0295152be8a	comparison between 'signed' and 'unsigned' integers
 src/sqlite_store.cpp	modernize-use-integer-sign-comparison	50e6b06a7ff51910a284	comparison between 'signed' and 'unsigned' integers
-src/sqlite_store.cpp	modernize-use-integer-sign-comparison	5d860c68cd6326d0839a	comparison between 'signed' and 'unsigned' integers
-src/sqlite_store.cpp	modernize-use-integer-sign-comparison	b5f53a586e4072fe35a1	comparison between 'signed' and 'unsigned' integers
-src/sqlite_store.cpp	modernize-use-integer-sign-comparison	ded6d37eca32b6287253	comparison between 'signed' and 'unsigned' integers
 src/sqlite_store.cpp	modernize-use-integer-sign-comparison	e12bfa6b585a812b1e8f	comparison between 'signed' and 'unsigned' integers
 src/store.cpp	readability-simplify-boolean-expr	031f7da63a401fe97d0e	boolean expression can be simplified by DeMorgan's theorem
 src/store.cpp	readability-simplify-boolean-expr	4af1c0ad0f2d89f731e8	boolean expression can be simplified by DeMorgan's theorem
