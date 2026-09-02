@@ -2132,6 +2132,520 @@ await_children(ChildMap &children, int signal_descriptor,
                           .registered_only = registered_only};
 }
 
+struct ExplicitOptions {
+  bool database{};
+  bool host_key{};
+  bool backup_interval{};
+  bool backup_retention{};
+  bool backup_directory{};
+  bool registration_mode{};
+  bool invite_policy{};
+  bool tos{};
+  bool board_policy{};
+};
+
+struct ArgumentParseState {
+  ParseResult result;
+  ExplicitOptions explicit_options;
+};
+
+enum class OptionId : std::uint8_t {
+  help,
+  bind_address,
+  port,
+  health_bind_address,
+  health_port,
+  database,
+  registration_mode,
+  invites_per_user,
+  invite_regeneration,
+  invite_expiration,
+  notify_inviters,
+  tos_version,
+  tos_file,
+  board,
+  member_board,
+  backup_directory,
+  backup_interval,
+  backup_retention,
+  backup_now,
+  restore_backup,
+  max_sessions,
+  max_sessions_per_ip,
+  connection_rate_limit,
+  auth_attempt_rate_limit,
+  guest_report_rate_limit,
+  oneliner_rate_limit,
+  oneliner_retention,
+  max_auth_attempts,
+  max_tracked_ips,
+  idle_timeout,
+  idle_warning,
+  session_cap,
+  session_memory,
+  session_cpu_burst,
+  session_output_rate,
+  session_image_quota,
+  host_key,
+  authorized_key,
+};
+
+using OptionApplier = void (*)(ArgumentParseState &, OptionId,
+                               std::string_view);
+
+struct OptionSpec {
+  std::string_view name;
+  OptionId id;
+  bool takes_value;
+  OptionApplier apply;
+};
+
+[[nodiscard]] RegistrationMode parse_registration_mode(std::string_view value) {
+  if (value == "open") {
+    return RegistrationMode::open;
+  }
+  if (value == "invite") {
+    return RegistrationMode::invite;
+  }
+  if (value == "closed") {
+    return RegistrationMode::closed;
+  }
+  throw std::runtime_error("registration mode must be open, invite, or closed");
+}
+
+[[nodiscard]] bool parse_notify_inviters(std::string_view value) {
+  if (value == "on") {
+    return true;
+  }
+  if (value == "off") {
+    return false;
+  }
+  throw std::runtime_error("notify inviters on moderation must be on or off");
+}
+
+void append_authorized_key(Config &config, std::string_view value) {
+  const auto separator = value.find('=');
+  if (separator == std::string_view::npos || separator == 0U ||
+      separator + 1U >= value.size()) {
+    throw std::runtime_error("authorized key must have the form USER=PATH");
+  }
+  config.authorized_keys.push_back({std::string(value.substr(0, separator)),
+                                    std::string(value.substr(separator + 1U))});
+}
+
+void append_board(Config &config, std::string_view value,
+                  bool registered_only) {
+  auto declaration = parse_board_declaration(value, registered_only);
+  if (std::ranges::any_of(config.boards, [&](const BoardDeclaration &existing) {
+        return existing.name == declaration.name;
+      })) {
+    throw std::runtime_error("duplicate board declaration: " +
+                             declaration.name);
+  }
+  config.boards.push_back(std::move(declaration));
+}
+
+void select_maintenance_operation(Config &config, Operation operation,
+                                  std::string_view value) {
+  if (config.operation != Operation::serve) {
+    throw std::runtime_error("backup and restore modes are mutually exclusive");
+  }
+  config.operation = operation;
+  if (operation == Operation::backup_once) {
+    config.backup_directory = value;
+    return;
+  }
+  config.restore_snapshot = value;
+}
+
+void apply_help_option(ArgumentParseState &state, OptionId, std::string_view) {
+  state.result.show_help = true;
+}
+
+void apply_server_option(ArgumentParseState &state, OptionId option,
+                         std::string_view value) {
+  auto &config = state.result.config;
+  switch (option) {
+  case OptionId::bind_address:
+    config.bind_address = value;
+    return;
+  case OptionId::port:
+    config.port = parse_port(value);
+    return;
+  case OptionId::health_bind_address:
+    config.health_bind_address = value;
+    return;
+  case OptionId::health_port:
+    config.health_port = parse_port(value);
+    return;
+  case OptionId::database:
+    config.database_path = value;
+    state.explicit_options.database = true;
+    return;
+  case OptionId::registration_mode:
+    config.registration_mode = parse_registration_mode(value);
+    state.explicit_options.registration_mode = true;
+    return;
+  default:
+    std::unreachable();
+  }
+}
+
+void apply_identity_option(ArgumentParseState &state, OptionId option,
+                           std::string_view value) {
+  auto &config = state.result.config;
+  switch (option) {
+  case OptionId::invites_per_user:
+    config.invite_policy.per_user = parse_invite_count(value);
+    state.explicit_options.invite_policy = true;
+    return;
+  case OptionId::invite_regeneration:
+    config.invite_policy.regeneration =
+        parse_duration(value, "invite regeneration period");
+    state.explicit_options.invite_policy = true;
+    return;
+  case OptionId::invite_expiration:
+    config.invite_policy.expiration =
+        parse_duration(value, "invite expiration");
+    state.explicit_options.invite_policy = true;
+    return;
+  case OptionId::notify_inviters:
+    config.invite_policy.notify_inviters_on_moderation =
+        parse_notify_inviters(value);
+    state.explicit_options.invite_policy = true;
+    return;
+  case OptionId::tos_version:
+    if (!valid_tos_version(value)) {
+      throw std::runtime_error("TOS version must contain 1 to 128 bytes of "
+                               "valid UTF-8 and no controls");
+    }
+    config.tos_version = value;
+    state.explicit_options.tos = true;
+    return;
+  case OptionId::tos_file:
+    config.tos_file = value;
+    state.explicit_options.tos = true;
+    return;
+  case OptionId::host_key:
+    config.host_key_path = value;
+    state.explicit_options.host_key = true;
+    return;
+  case OptionId::authorized_key:
+    append_authorized_key(config, value);
+    return;
+  default:
+    std::unreachable();
+  }
+}
+
+void apply_board_option(ArgumentParseState &state, OptionId option,
+                        std::string_view value) {
+  auto &config = state.result.config;
+  switch (option) {
+  case OptionId::board:
+  case OptionId::member_board:
+    append_board(config, value, option == OptionId::member_board);
+    state.explicit_options.board_policy = true;
+    return;
+  case OptionId::guest_report_rate_limit:
+    config.guest_report_rate =
+        parse_rate_limit(value, "guest report rate limit");
+    state.explicit_options.board_policy = true;
+    return;
+  case OptionId::oneliner_rate_limit: {
+    const auto limit = parse_rate_limit(value, "one-liner rate limit");
+    config.oneliner_policy.max_posts = limit.count;
+    config.oneliner_policy.window_seconds =
+        static_cast<std::uint32_t>(limit.period.count());
+    state.explicit_options.board_policy = true;
+    return;
+  }
+  case OptionId::oneliner_retention:
+    config.oneliner_policy.retention_seconds = static_cast<std::uint32_t>(
+        parse_duration(value, "one-liner retention").count());
+    state.explicit_options.board_policy = true;
+    return;
+  default:
+    std::unreachable();
+  }
+}
+
+void apply_backup_option(ArgumentParseState &state, OptionId option,
+                         std::string_view value) {
+  auto &config = state.result.config;
+  switch (option) {
+  case OptionId::backup_directory:
+    config.backup_directory = value;
+    state.explicit_options.backup_directory = true;
+    return;
+  case OptionId::backup_interval:
+    config.backup_interval = parse_duration(value, "backup interval");
+    state.explicit_options.backup_interval = true;
+    return;
+  case OptionId::backup_retention:
+    config.backup_retention = parse_duration(value, "backup retention");
+    state.explicit_options.backup_retention = true;
+    return;
+  case OptionId::backup_now:
+    select_maintenance_operation(config, Operation::backup_once, value);
+    return;
+  case OptionId::restore_backup:
+    select_maintenance_operation(config, Operation::restore, value);
+    return;
+  default:
+    std::unreachable();
+  }
+}
+
+void apply_session_option(ArgumentParseState &state, OptionId option,
+                          std::string_view value) {
+  auto &config = state.result.config;
+  switch (option) {
+  case OptionId::max_sessions:
+    config.max_sessions = parse_session_limit(value);
+    return;
+  case OptionId::max_sessions_per_ip:
+    config.max_sessions_per_ip = parse_session_limit(value);
+    return;
+  case OptionId::connection_rate_limit:
+    config.connection_rate = parse_rate_limit(value, "connection rate limit");
+    return;
+  case OptionId::auth_attempt_rate_limit:
+    config.auth_attempt_rate =
+        parse_rate_limit(value, "auth attempt rate limit");
+    return;
+  case OptionId::max_auth_attempts:
+    config.max_auth_attempts_per_session =
+        parse_bounded_count(value, "auth attempts per session", 4096);
+    return;
+  case OptionId::max_tracked_ips:
+    config.max_tracked_ips =
+        parse_bounded_count(value, "tracked IP limit", 65'536);
+    return;
+  case OptionId::idle_timeout:
+    config.idle_timeout = parse_duration(value, "idle timeout");
+    return;
+  case OptionId::idle_warning:
+    config.idle_warning = parse_duration(value, "idle warning");
+    return;
+  case OptionId::session_cap:
+    config.session_cap = parse_duration(value, "session cap");
+    return;
+  default:
+    std::unreachable();
+  }
+}
+
+void apply_resource_option(ArgumentParseState &state, OptionId option,
+                           std::string_view value) {
+  auto &resources = state.result.config.session_resources;
+  switch (option) {
+  case OptionId::session_memory:
+    resources.memory_bytes =
+        parse_bounded_bytes(value, "session memory limit", 1ULL << 40U);
+    return;
+  case OptionId::session_cpu_burst:
+    resources.cpu_burst = std::chrono::milliseconds(
+        parse_bounded_count(value, "session CPU burst", 60'000U));
+    return;
+  case OptionId::session_output_rate:
+    resources.output_bytes_per_second =
+        parse_bounded_bytes(value, "session output rate", 1'000'000'000U);
+    return;
+  case OptionId::session_image_quota:
+    resources.image_bytes =
+        parse_bounded_bytes(value, "session image quota", 1ULL << 40U);
+    return;
+  default:
+    std::unreachable();
+  }
+}
+
+constexpr std::array option_specs{
+    OptionSpec{"--help", OptionId::help, false, apply_help_option},
+    OptionSpec{"--bind-address", OptionId::bind_address, true,
+               apply_server_option},
+    OptionSpec{"--port", OptionId::port, true, apply_server_option},
+    OptionSpec{"--health-bind-address", OptionId::health_bind_address, true,
+               apply_server_option},
+    OptionSpec{"--health-port", OptionId::health_port, true,
+               apply_server_option},
+    OptionSpec{"--database", OptionId::database, true, apply_server_option},
+    OptionSpec{"--registration-mode", OptionId::registration_mode, true,
+               apply_server_option},
+    OptionSpec{"--invites-per-user", OptionId::invites_per_user, true,
+               apply_identity_option},
+    OptionSpec{"--invite-regeneration-seconds", OptionId::invite_regeneration,
+               true, apply_identity_option},
+    OptionSpec{"--invite-expiration-seconds", OptionId::invite_expiration, true,
+               apply_identity_option},
+    OptionSpec{"--notify-inviters-on-moderation", OptionId::notify_inviters,
+               true, apply_identity_option},
+    OptionSpec{"--tos-version", OptionId::tos_version, true,
+               apply_identity_option},
+    OptionSpec{"--tos-file", OptionId::tos_file, true, apply_identity_option},
+    OptionSpec{"--board", OptionId::board, true, apply_board_option},
+    OptionSpec{"--member-board", OptionId::member_board, true,
+               apply_board_option},
+    OptionSpec{"--backup-directory", OptionId::backup_directory, true,
+               apply_backup_option},
+    OptionSpec{"--backup-interval-seconds", OptionId::backup_interval, true,
+               apply_backup_option},
+    OptionSpec{"--backup-retention-seconds", OptionId::backup_retention, true,
+               apply_backup_option},
+    OptionSpec{"--backup-now", OptionId::backup_now, true, apply_backup_option},
+    OptionSpec{"--restore-backup", OptionId::restore_backup, true,
+               apply_backup_option},
+    OptionSpec{"--max-sessions", OptionId::max_sessions, true,
+               apply_session_option},
+    OptionSpec{"--max-sessions-per-ip", OptionId::max_sessions_per_ip, true,
+               apply_session_option},
+    OptionSpec{"--connection-rate-limit", OptionId::connection_rate_limit, true,
+               apply_session_option},
+    OptionSpec{"--auth-attempt-rate-limit", OptionId::auth_attempt_rate_limit,
+               true, apply_session_option},
+    OptionSpec{"--guest-report-rate-limit", OptionId::guest_report_rate_limit,
+               true, apply_board_option},
+    OptionSpec{"--oneliner-rate-limit", OptionId::oneliner_rate_limit, true,
+               apply_board_option},
+    OptionSpec{"--oneliner-retention-seconds", OptionId::oneliner_retention,
+               true, apply_board_option},
+    OptionSpec{"--max-auth-attempts-per-session", OptionId::max_auth_attempts,
+               true, apply_session_option},
+    OptionSpec{"--max-tracked-ips", OptionId::max_tracked_ips, true,
+               apply_session_option},
+    OptionSpec{"--idle-timeout-seconds", OptionId::idle_timeout, true,
+               apply_session_option},
+    OptionSpec{"--idle-warning-seconds", OptionId::idle_warning, true,
+               apply_session_option},
+    OptionSpec{"--session-cap-seconds", OptionId::session_cap, true,
+               apply_session_option},
+    OptionSpec{"--session-memory-bytes", OptionId::session_memory, true,
+               apply_resource_option},
+    OptionSpec{"--session-cpu-burst-ms", OptionId::session_cpu_burst, true,
+               apply_resource_option},
+    OptionSpec{"--session-output-bytes-per-second",
+               OptionId::session_output_rate, true, apply_resource_option},
+    OptionSpec{"--session-image-bytes", OptionId::session_image_quota, true,
+               apply_resource_option},
+    OptionSpec{"--host-key", OptionId::host_key, true, apply_identity_option},
+    OptionSpec{"--authorized-key", OptionId::authorized_key, true,
+               apply_identity_option},
+};
+
+[[nodiscard]] const OptionSpec *find_option(std::string_view name) noexcept {
+  const auto found = std::ranges::find(option_specs, name, &OptionSpec::name);
+  return found == option_specs.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] std::string_view
+consume_option_value(std::span<const std::string_view> arguments,
+                     std::size_t &index, std::string_view option) {
+  if (++index >= arguments.size()) {
+    throw std::runtime_error("missing value for " + std::string(option));
+  }
+  const auto value = arguments[index];
+  if (value.empty()) {
+    throw std::runtime_error("empty value for " + std::string(option));
+  }
+  return value;
+}
+
+void parse_argument_tokens(ArgumentParseState &state,
+                           std::span<const std::string_view> arguments) {
+  for (std::size_t index = 0; index < arguments.size(); ++index) {
+    const auto argument = arguments[index];
+    const auto *spec = find_option(argument);
+    if (spec == nullptr) {
+      throw std::runtime_error("unknown option: " + std::string(argument));
+    }
+    if (!spec->takes_value) {
+      spec->apply(state, spec->id, {});
+      continue;
+    }
+    spec->apply(state, spec->id,
+                consume_option_value(arguments, index, argument));
+  }
+}
+
+void validate_maintenance_options(const ArgumentParseState &state) {
+  const auto &config = state.result.config;
+  const auto &explicit_options = state.explicit_options;
+  if (!explicit_options.database || !explicit_options.host_key) {
+    throw std::runtime_error("maintenance mode requires explicit "
+                             "--database and --host-key paths");
+  }
+  if (!config.authorized_keys.empty()) {
+    throw std::runtime_error(
+        "--authorized-key is not valid in backup or restore mode");
+  }
+  if (explicit_options.registration_mode) {
+    throw std::runtime_error(
+        "--registration-mode is not valid in backup or restore mode");
+  }
+  if (explicit_options.invite_policy) {
+    throw std::runtime_error(
+        "invite policy options are not valid in backup or restore mode");
+  }
+  if (explicit_options.tos) {
+    throw std::runtime_error(
+        "TOS options are not valid in backup or restore mode");
+  }
+  if (explicit_options.board_policy) {
+    throw std::runtime_error(
+        "board options are not valid in backup or restore mode");
+  }
+  if (explicit_options.backup_directory || explicit_options.backup_interval ||
+      explicit_options.backup_retention) {
+    throw std::runtime_error(
+        "scheduled backup options are not valid in maintenance mode");
+  }
+}
+
+void validate_serve_options(const ArgumentParseState &state) {
+  const auto &config = state.result.config;
+  const auto &explicit_options = state.explicit_options;
+  if ((explicit_options.backup_interval || explicit_options.backup_retention) &&
+      config.backup_directory.empty()) {
+    throw std::runtime_error(
+        "scheduled backup options require --backup-directory");
+  }
+  if (config.max_sessions_per_ip > config.max_sessions) {
+    throw std::runtime_error(
+        "per-IP session limit must not exceed global session limit");
+  }
+  if (config.max_tracked_ips < config.max_sessions) {
+    throw std::runtime_error(
+        "tracked IP limit must be at least the global session limit");
+  }
+  if (config.idle_warning >= config.idle_timeout) {
+    throw std::runtime_error("idle warning must be shorter than idle timeout");
+  }
+  if (config.health_port == config.port) {
+    throw std::runtime_error(
+        "health endpoint must use a separate port from SSH");
+  }
+  if (config.host_key_path.empty()) {
+    throw std::runtime_error("--host-key is required");
+  }
+  if (config.tos_version.empty() || config.tos_file.empty()) {
+    throw std::runtime_error(
+        "--tos-version and --tos-file are required in serve mode");
+  }
+}
+
+[[nodiscard]] ParseResult finish_argument_parsing(ArgumentParseState state) {
+  if (state.result.show_help) {
+    return std::move(state.result);
+  }
+  if (state.result.config.operation == Operation::serve) {
+    validate_serve_options(state);
+  } else {
+    validate_maintenance_options(state);
+  }
+  return std::move(state.result);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity) -- duplicate detection and provisioning keep startup fail-closed
 void reconcile_boards(store::Store &database, const Config &config,
                       store::UtcEpochSeconds now) {
@@ -2265,280 +2779,10 @@ std::string_view usage() noexcept {
          "  --help                  show this help\n";
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- one parser centralizes cross-option validation and authority defaults
 ParseResult parse_arguments(std::span<const std::string_view> arguments) {
-  ParseResult result;
-  bool database_explicit = false;
-  bool host_key_explicit = false;
-  bool backup_interval_explicit = false;
-  bool backup_retention_explicit = false;
-  bool backup_directory_explicit = false;
-  bool registration_mode_explicit = false;
-  bool invite_policy_explicit = false;
-  bool tos_explicit = false;
-  bool board_policy_explicit = false;
-  for (std::size_t index = 0; index < arguments.size(); ++index) {
-    const auto argument = arguments[index];
-    if (argument == "--help") {
-      result.show_help = true;
-      continue;
-    }
-    if (argument != "--bind-address" && argument != "--port" &&
-        argument != "--health-bind-address" && argument != "--health-port" &&
-        argument != "--database" && argument != "--registration-mode" &&
-        argument != "--invites-per-user" &&
-        argument != "--invite-regeneration-seconds" &&
-        argument != "--invite-expiration-seconds" &&
-        argument != "--notify-inviters-on-moderation" &&
-        argument != "--tos-version" && argument != "--tos-file" &&
-        argument != "--board" && argument != "--member-board" &&
-        argument != "--backup-directory" &&
-        argument != "--backup-interval-seconds" &&
-        argument != "--backup-retention-seconds" &&
-        argument != "--backup-now" && argument != "--restore-backup" &&
-        argument != "--max-sessions" && argument != "--max-sessions-per-ip" &&
-        argument != "--connection-rate-limit" &&
-        argument != "--auth-attempt-rate-limit" &&
-        argument != "--guest-report-rate-limit" &&
-        argument != "--oneliner-rate-limit" &&
-        argument != "--oneliner-retention-seconds" &&
-        argument != "--max-auth-attempts-per-session" &&
-        argument != "--max-tracked-ips" &&
-        argument != "--idle-timeout-seconds" &&
-        argument != "--idle-warning-seconds" &&
-        argument != "--session-cap-seconds" &&
-        argument != "--session-memory-bytes" &&
-        argument != "--session-cpu-burst-ms" &&
-        argument != "--session-output-bytes-per-second" &&
-        argument != "--session-image-bytes" && argument != "--host-key" &&
-        argument != "--authorized-key") {
-      throw std::runtime_error("unknown option: " + std::string(argument));
-    }
-    if (++index >= arguments.size()) {
-      throw std::runtime_error("missing value for " + std::string(argument));
-    }
-    const auto value = arguments[index];
-    if (value.empty()) {
-      throw std::runtime_error("empty value for " + std::string(argument));
-    }
-    if (argument == "--bind-address") {
-      result.config.bind_address = value;
-    } else if (argument == "--port") {
-      result.config.port = parse_port(value);
-    } else if (argument == "--health-bind-address") {
-      result.config.health_bind_address = value;
-    } else if (argument == "--health-port") {
-      result.config.health_port = parse_port(value);
-    } else if (argument == "--database") {
-      result.config.database_path = value;
-      database_explicit = true;
-    } else if (argument == "--registration-mode") {
-      if (value == "open") {
-        result.config.registration_mode = RegistrationMode::open;
-      } else if (value == "invite") {
-        result.config.registration_mode = RegistrationMode::invite;
-      } else if (value == "closed") {
-        result.config.registration_mode = RegistrationMode::closed;
-      } else {
-        throw std::runtime_error(
-            "registration mode must be open, invite, or closed");
-      }
-      registration_mode_explicit = true;
-    } else if (argument == "--invites-per-user") {
-      result.config.invite_policy.per_user = parse_invite_count(value);
-      invite_policy_explicit = true;
-    } else if (argument == "--invite-regeneration-seconds") {
-      result.config.invite_policy.regeneration =
-          parse_duration(value, "invite regeneration period");
-      invite_policy_explicit = true;
-    } else if (argument == "--invite-expiration-seconds") {
-      result.config.invite_policy.expiration =
-          parse_duration(value, "invite expiration");
-      invite_policy_explicit = true;
-    } else if (argument == "--notify-inviters-on-moderation") {
-      if (value == "on") {
-        result.config.invite_policy.notify_inviters_on_moderation = true;
-      } else if (value == "off") {
-        result.config.invite_policy.notify_inviters_on_moderation = false;
-      } else {
-        throw std::runtime_error(
-            "notify inviters on moderation must be on or off");
-      }
-      invite_policy_explicit = true;
-    } else if (argument == "--tos-version") {
-      if (!valid_tos_version(value)) {
-        throw std::runtime_error("TOS version must contain 1 to 128 bytes of "
-                                 "valid UTF-8 and no controls");
-      }
-      result.config.tos_version = value;
-      tos_explicit = true;
-    } else if (argument == "--tos-file") {
-      result.config.tos_file = value;
-      tos_explicit = true;
-    } else if (argument == "--board" || argument == "--member-board") {
-      auto declaration =
-          parse_board_declaration(value, argument == "--member-board");
-      if (std::ranges::any_of(result.config.boards,
-                              [&](const BoardDeclaration &existing) {
-                                return existing.name == declaration.name;
-                              })) {
-        throw std::runtime_error("duplicate board declaration: " +
-                                 declaration.name);
-      }
-      result.config.boards.push_back(std::move(declaration));
-      board_policy_explicit = true;
-    } else if (argument == "--backup-directory") {
-      result.config.backup_directory = value;
-      backup_directory_explicit = true;
-    } else if (argument == "--backup-interval-seconds") {
-      result.config.backup_interval = parse_duration(value, "backup interval");
-      backup_interval_explicit = true;
-    } else if (argument == "--backup-retention-seconds") {
-      result.config.backup_retention =
-          parse_duration(value, "backup retention");
-      backup_retention_explicit = true;
-    } else if (argument == "--backup-now") {
-      if (result.config.operation != Operation::serve) {
-        throw std::runtime_error(
-            "backup and restore modes are mutually exclusive");
-      }
-      result.config.operation = Operation::backup_once;
-      result.config.backup_directory = value;
-    } else if (argument == "--restore-backup") {
-      if (result.config.operation != Operation::serve) {
-        throw std::runtime_error(
-            "backup and restore modes are mutually exclusive");
-      }
-      result.config.operation = Operation::restore;
-      result.config.restore_snapshot = value;
-    } else if (argument == "--max-sessions") {
-      result.config.max_sessions = parse_session_limit(value);
-    } else if (argument == "--max-sessions-per-ip") {
-      result.config.max_sessions_per_ip = parse_session_limit(value);
-    } else if (argument == "--connection-rate-limit") {
-      result.config.connection_rate =
-          parse_rate_limit(value, "connection rate limit");
-    } else if (argument == "--auth-attempt-rate-limit") {
-      result.config.auth_attempt_rate =
-          parse_rate_limit(value, "auth attempt rate limit");
-    } else if (argument == "--guest-report-rate-limit") {
-      result.config.guest_report_rate =
-          parse_rate_limit(value, "guest report rate limit");
-      board_policy_explicit = true;
-    } else if (argument == "--oneliner-rate-limit") {
-      const auto limit = parse_rate_limit(value, "one-liner rate limit");
-      result.config.oneliner_policy.max_posts = limit.count;
-      result.config.oneliner_policy.window_seconds =
-          static_cast<std::uint32_t>(limit.period.count());
-      board_policy_explicit = true;
-    } else if (argument == "--oneliner-retention-seconds") {
-      result.config.oneliner_policy.retention_seconds =
-          static_cast<std::uint32_t>(
-              parse_duration(value, "one-liner retention").count());
-      board_policy_explicit = true;
-    } else if (argument == "--max-auth-attempts-per-session") {
-      result.config.max_auth_attempts_per_session =
-          parse_bounded_count(value, "auth attempts per session", 4096);
-    } else if (argument == "--max-tracked-ips") {
-      result.config.max_tracked_ips =
-          parse_bounded_count(value, "tracked IP limit", 65'536);
-    } else if (argument == "--idle-timeout-seconds") {
-      result.config.idle_timeout = parse_duration(value, "idle timeout");
-    } else if (argument == "--idle-warning-seconds") {
-      result.config.idle_warning = parse_duration(value, "idle warning");
-    } else if (argument == "--session-cap-seconds") {
-      result.config.session_cap = parse_duration(value, "session cap");
-    } else if (argument == "--session-memory-bytes") {
-      result.config.session_resources.memory_bytes =
-          parse_bounded_bytes(value, "session memory limit", 1ULL << 40U);
-    } else if (argument == "--session-cpu-burst-ms") {
-      const auto milliseconds =
-          parse_bounded_count(value, "session CPU burst", 60'000U);
-      result.config.session_resources.cpu_burst =
-          std::chrono::milliseconds(milliseconds);
-    } else if (argument == "--session-output-bytes-per-second") {
-      result.config.session_resources.output_bytes_per_second =
-          parse_bounded_bytes(value, "session output rate", 1'000'000'000U);
-    } else if (argument == "--session-image-bytes") {
-      result.config.session_resources.image_bytes =
-          parse_bounded_bytes(value, "session image quota", 1ULL << 40U);
-    } else if (argument == "--host-key") {
-      result.config.host_key_path = value;
-      host_key_explicit = true;
-    } else {
-      const auto separator = value.find('=');
-      if (separator == std::string_view::npos || separator == 0U ||
-          separator + 1U >= value.size()) {
-        throw std::runtime_error("authorized key must have the form USER=PATH");
-      }
-      result.config.authorized_keys.push_back(
-          {std::string(value.substr(0, separator)),
-           std::string(value.substr(separator + 1U))});
-    }
-  }
-  if (!result.show_help) {
-    if (result.config.operation != Operation::serve) {
-      if (!database_explicit || !host_key_explicit) {
-        throw std::runtime_error("maintenance mode requires explicit "
-                                 "--database and --host-key paths");
-      }
-      if (!result.config.authorized_keys.empty()) {
-        throw std::runtime_error(
-            "--authorized-key is not valid in backup or restore mode");
-      }
-      if (registration_mode_explicit) {
-        throw std::runtime_error(
-            "--registration-mode is not valid in backup or restore mode");
-      }
-      if (invite_policy_explicit) {
-        throw std::runtime_error(
-            "invite policy options are not valid in backup or restore mode");
-      }
-      if (tos_explicit) {
-        throw std::runtime_error(
-            "TOS options are not valid in backup or restore mode");
-      }
-      if (board_policy_explicit) {
-        throw std::runtime_error(
-            "board options are not valid in backup or restore mode");
-      }
-      if (backup_directory_explicit || backup_interval_explicit ||
-          backup_retention_explicit) {
-        throw std::runtime_error(
-            "scheduled backup options are not valid in maintenance mode");
-      }
-      return result;
-    }
-    if ((backup_interval_explicit || backup_retention_explicit) &&
-        result.config.backup_directory.empty()) {
-      throw std::runtime_error(
-          "scheduled backup options require --backup-directory");
-    }
-    if (result.config.max_sessions_per_ip > result.config.max_sessions) {
-      throw std::runtime_error(
-          "per-IP session limit must not exceed global session limit");
-    }
-    if (result.config.max_tracked_ips < result.config.max_sessions) {
-      throw std::runtime_error(
-          "tracked IP limit must be at least the global session limit");
-    }
-    if (result.config.idle_warning >= result.config.idle_timeout) {
-      throw std::runtime_error(
-          "idle warning must be shorter than idle timeout");
-    }
-    if (result.config.health_port == result.config.port) {
-      throw std::runtime_error(
-          "health endpoint must use a separate port from SSH");
-    }
-    if (result.config.host_key_path.empty()) {
-      throw std::runtime_error("--host-key is required");
-    }
-    if (result.config.tos_version.empty() || result.config.tos_file.empty()) {
-      throw std::runtime_error(
-          "--tos-version and --tos-file are required in serve mode");
-    }
-  }
-  return result;
+  ArgumentParseState state;
+  parse_argument_tokens(state, arguments);
+  return finish_argument_parsing(std::move(state));
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- the supervisor lifecycle centralizes fork, signal, health, and cleanup ordering

@@ -3,9 +3,24 @@
 #include <chrono>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 #include "server.hpp"
 #include "terminal_session.hpp"
+
+namespace {
+
+void check_parse_error(const std::vector<std::string_view> &arguments,
+                       std::string_view expected) {
+  try {
+    static_cast<void>(anvil::server::parse_arguments(arguments));
+    FAIL("expected CLI parsing to fail");
+  } catch (const std::runtime_error &error) {
+    CHECK(std::string_view(error.what()) == expected);
+  }
+}
+
+} // namespace
 
 TEST_CASE("server CLI requires a host key") {
   const std::array<std::string_view, 0> arguments{};
@@ -35,6 +50,45 @@ TEST_CASE("server CLI permits guest and registration service without bootstrap "
   };
   const auto parsed = anvil::server::parse_arguments(arguments);
   CHECK(parsed.config.authorized_keys.empty());
+}
+
+TEST_CASE("server CLI preserves token diagnostics and validation order") {
+  struct FailureCase {
+    std::vector<std::string_view> arguments;
+    std::string_view diagnostic;
+  };
+  const std::array<FailureCase, 7> failures{
+      FailureCase{{"--unknown"}, "unknown option: --unknown"},
+      FailureCase{{"--port"}, "missing value for --port"},
+      FailureCase{{"--port", ""}, "empty value for --port"},
+      FailureCase{{"--port", "22x"}, "port must be a decimal number"},
+      FailureCase{{"--help", "--port", "22x"}, "port must be a decimal number"},
+      FailureCase{{"--backup-now", "a", "--restore-backup", "b"},
+                  "backup and restore modes are mutually exclusive"},
+      FailureCase{{"--host-key", "host_key", "--tos-version", "v1",
+                   "--tos-file", "tos.txt", "--max-sessions", "2",
+                   "--max-sessions-per-ip", "3", "--max-tracked-ips", "1"},
+                  "per-IP session limit must not exceed global session limit"},
+  };
+
+  for (const auto &failure : failures) {
+    check_parse_error(failure.arguments, failure.diagnostic);
+  }
+}
+
+TEST_CASE("server CLI preserves repeatable and last-value-wins options") {
+  const std::array repeated_scalar{
+      std::string_view{"--help"}, std::string_view{"--port"},
+      std::string_view{"2200"},   std::string_view{"--port"},
+      std::string_view{"2201"},
+  };
+  const auto scalar = anvil::server::parse_arguments(repeated_scalar);
+  CHECK(scalar.show_help);
+  CHECK(scalar.config.port == 2201);
+
+  const std::array repeated_help{std::string_view{"--help"},
+                                 std::string_view{"--help"}};
+  CHECK(anvil::server::parse_arguments(repeated_help).show_help);
 }
 
 TEST_CASE("server CLI parses an explicit endpoint and repeated keys") {
