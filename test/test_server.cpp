@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "server.hpp"
+#include "support/memory_store.hpp"
 #include "terminal_session.hpp"
 
 namespace {
@@ -15,6 +16,16 @@ void check_parse_error(const std::vector<std::string_view> &arguments,
   try {
     static_cast<void>(anvil::server::parse_arguments(arguments));
     FAIL("expected CLI parsing to fail");
+  } catch (const std::runtime_error &error) {
+    CHECK(std::string_view(error.what()) == expected);
+  }
+}
+
+template <typename Action>
+void check_runtime_error(Action action, std::string_view expected) {
+  try {
+    action();
+    FAIL("expected operation to fail");
   } catch (const std::runtime_error &error) {
     CHECK(std::string_view(error.what()) == expected);
   }
@@ -517,6 +528,68 @@ TEST_CASE("server CLI help does not require operational arguments") {
   CHECK(anvil::server::usage().find("--tos-version") != std::string_view::npos);
   CHECK(anvil::server::usage().find("--oneliner-rate-limit") !=
         std::string_view::npos);
+}
+
+TEST_CASE(
+    "server startup provisions one default board only for an empty store") {
+  anvil::testing::MemoryStore database;
+  anvil::server::Config config;
+  const anvil::store::UtcEpochSeconds now{42};
+
+  anvil::server::reconcile_configured_boards(database, config, now);
+  anvil::server::reconcile_configured_boards(database, config, now);
+
+  auto read = database.begin(anvil::store::TransactionMode::read_only);
+  REQUIRE(read);
+  const auto boards = database.list_boards(
+      *read, {.handle = std::nullopt, .may_read_registered = true});
+  REQUIRE(boards);
+  REQUIRE(boards->size() == 1);
+  CHECK(boards->front().name == "general");
+  CHECK(boards->front().title == "General");
+  CHECK(boards->front().visibility ==
+        anvil::store::BoardVisibility::public_read);
+  REQUIRE(read->commit());
+}
+
+TEST_CASE(
+    "server startup rejects duplicate board declarations before writing") {
+  anvil::testing::MemoryStore database;
+  anvil::server::Config config;
+  config.boards = {{.name = "general", .title = "General"},
+                   {.name = "general", .title = "Duplicate"}};
+
+  check_runtime_error(
+      [&] {
+        anvil::server::reconcile_configured_boards(
+            database, config, anvil::store::UtcEpochSeconds{42});
+      },
+      "duplicate board declaration: general");
+  CHECK(database.observations().empty());
+}
+
+TEST_CASE("server board reconciliation rolls back a failed commit") {
+  anvil::testing::MemoryStore database;
+  anvil::server::Config config;
+  config.boards = {
+      {.name = "members", .title = "Members", .registered_only = true}};
+  database.fail_next_commit(
+      {anvil::store::ErrorCode::unavailable, "injected commit failure"});
+
+  check_runtime_error(
+      [&] {
+        anvil::server::reconcile_configured_boards(
+            database, config, anvil::store::UtcEpochSeconds{42});
+      },
+      "cannot commit board reconciliation: injected commit failure");
+
+  auto read = database.begin(anvil::store::TransactionMode::read_only);
+  REQUIRE(read);
+  const auto boards = database.list_boards(
+      *read, {.handle = std::nullopt, .may_read_registered = true});
+  REQUIRE(boards);
+  CHECK(boards->empty());
+  REQUIRE(read->commit());
 }
 
 TEST_CASE("SSH terminal dimensions bound hostile peer claims") {

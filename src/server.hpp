@@ -95,6 +95,8 @@ struct ParseResult {
 [[nodiscard]] ParseResult
 parse_arguments(std::span<const std::string_view> arguments);
 [[nodiscard]] std::string_view usage() noexcept;
+void reconcile_configured_boards(store::Store &database, const Config &config,
+                                 store::UtcEpochSeconds now);
 int run(const Config &config);
 
 } // namespace anvil::server

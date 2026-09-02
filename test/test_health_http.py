@@ -258,9 +258,28 @@ def test_live_server(executable: pathlib.Path) -> None:
             children_path = pathlib.Path(f"/proc/{server.pid}/task/{server.pid}/children")
             children = [int(value) for value in children_path.read_text().split()]
             assert len(children) == 1, children
-            os.kill(children[0], signal.SIGKILL)
+            health_process = children[0]
+
+            session = subprocess.Popen(
+                ssh_command(ssh_port, client_key) + ["-tt"], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            read_until(session, b"Anvil board session")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                children = [int(value) for value in children_path.read_text().split()]
+                if len(children) == 2:
+                    break
+                time.sleep(0.05)
+            assert len(children) == 2, children
+            worker = next(child for child in children if child != health_process)
+
+            os.kill(health_process, signal.SIGKILL)
             server.wait(timeout=5)
             assert server.returncode != 0, server.returncode
+            session.communicate(timeout=5)
+            session = None
+            assert not pathlib.Path(f"/proc/{worker}").exists(), worker
         finally:
             if session is not None:
                 session.kill()

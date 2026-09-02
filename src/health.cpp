@@ -96,8 +96,127 @@ struct StartupStatus {
 
 static_assert(std::is_trivially_copyable_v<StartupStatus>);
 
+class HealthStartupResources {
+public:
+  explicit HealthStartupResources(HealthStartupCleanup *cleanup)
+      : cleanup_(cleanup) {
+    control_.fill(-1);
+    startup_.fill(-1);
+  }
+
+  ~HealthStartupResources() {
+    terminate_child();
+    close_channels();
+    release_shared_state();
+  }
+
+  HealthStartupResources(const HealthStartupResources &) = delete;
+  auto operator=(const HealthStartupResources &)
+      -> HealthStartupResources & = delete;
+
+  void close_descriptor(int &descriptor) noexcept {
+    if (descriptor < 0) {
+      return;
+    }
+    static_cast<void>(::close(descriptor));
+    descriptor = -1;
+    if (cleanup_ != nullptr) {
+      ++cleanup_->descriptors;
+    }
+  }
+
+  void terminate_child() noexcept {
+    if (child_ <= 0) {
+      return;
+    }
+    static_cast<void>(::kill(child_, SIGKILL));
+    while (::waitpid(child_, nullptr, 0) < 0 && errno == EINTR) {
+    }
+    child_ = -1;
+    if (cleanup_ != nullptr) {
+      ++cleanup_->children;
+    }
+  }
+
+  void close_channels() noexcept {
+    for (auto &descriptor : control_) {
+      close_descriptor(descriptor);
+    }
+    for (auto &descriptor : startup_) {
+      close_descriptor(descriptor);
+    }
+  }
+
+  void release_shared_state() noexcept {
+    if (shared_ == nullptr) {
+      return;
+    }
+    if (mutex_initialized_) {
+      static_cast<void>(::pthread_mutex_destroy(&shared_->mutex));
+      mutex_initialized_ = false;
+      if (cleanup_ != nullptr) {
+        ++cleanup_->mutexes;
+      }
+    }
+    static_cast<void>(::munmap(shared_, sizeof(SharedHealth)));
+    shared_ = nullptr;
+    if (cleanup_ != nullptr) {
+      ++cleanup_->mappings;
+    }
+  }
+
+  [[nodiscard]] SharedHealth *release_shared() noexcept {
+    mutex_initialized_ = false;
+    return std::exchange(shared_, nullptr);
+  }
+
+  [[nodiscard]] pid_t release_child() noexcept {
+    return std::exchange(child_, -1);
+  }
+
+  [[nodiscard]] int release_control() noexcept {
+    return std::exchange(control_[0], -1);
+  }
+
+  void adopt_mapping(void *mapping) {
+    shared_ = static_cast<SharedHealth *>(mapping);
+    std::construct_at(shared_);
+  }
+
+  void mark_mutex_initialized() noexcept { mutex_initialized_ = true; }
+  [[nodiscard]] SharedHealth &shared() const noexcept { return *shared_; }
+  [[nodiscard]] auto control() noexcept -> std::array<int, 2> & {
+    return control_;
+  }
+  [[nodiscard]] auto startup() noexcept -> std::array<int, 2> & {
+    return startup_;
+  }
+  [[nodiscard]] pid_t child() const noexcept { return child_; }
+  void set_child(pid_t child) noexcept { child_ = child; }
+
+private:
+  SharedHealth *shared_{};
+  bool mutex_initialized_{};
+  std::array<int, 2> control_{};
+  std::array<int, 2> startup_{};
+  pid_t child_{-1};
+  HealthStartupCleanup *cleanup_{};
+};
+
+[[nodiscard]] bool inject_failure(const HealthMonitor::Config &config,
+                                  HealthStartupFailure failure,
+                                  int error = 0) noexcept {
+  if (config.failure_for_testing != failure) {
+    return false;
+  }
+  errno = error;
+  return true;
+}
+
 [[nodiscard]] std::int64_t to_ns(Clock::time_point value) noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(value.time_since_epoch()).count();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             value.time_since_epoch())
+      .count();
 }
 
 [[nodiscard]] Clock::time_point from_ns(std::int64_t value) noexcept {
@@ -105,7 +224,7 @@ static_assert(std::is_trivially_copyable_v<StartupStatus>);
 }
 
 class SharedLock {
- public:
+public:
   explicit SharedLock(pthread_mutex_t &mutex) : mutex_(&mutex) {
     const auto result = ::pthread_mutex_lock(mutex_);
     if (result == EOWNERDEAD) {
@@ -115,7 +234,8 @@ class SharedLock {
       return;
     }
     if (result != 0) {
-      throw std::system_error(result, std::generic_category(), "cannot lock health state");
+      throw std::system_error(result, std::generic_category(),
+                              "cannot lock health state");
     }
   }
 
@@ -128,12 +248,13 @@ class SharedLock {
   SharedLock(const SharedLock &) = delete;
   auto operator=(const SharedLock &) -> SharedLock & = delete;
 
- private:
+private:
   pthread_mutex_t *mutex_;
 };
 
 template <std::size_t Size>
-void copy_bounded(std::array<char, Size> &destination, std::string_view source) noexcept {
+void copy_bounded(std::array<char, Size> &destination,
+                  std::string_view source) noexcept {
   destination.fill('\0');
   const auto length = std::min(source.size(), Size - 1U);
   std::memcpy(destination.data(), source.data(), length);
@@ -154,15 +275,17 @@ template <std::size_t Size>
   }
   const auto page_size = ::sysconf(_SC_PAGESIZE);
   if (page_size <= 0 || resident > std::numeric_limits<std::uint64_t>::max() /
-                                     static_cast<std::uint64_t>(page_size)) {
+                                       static_cast<std::uint64_t>(page_size)) {
     return 0;
   }
   return resident * static_cast<std::uint64_t>(page_size);
 }
 
-[[nodiscard]] bool live(const HealthSnapshot &snapshot, Clock::time_point now) noexcept {
+[[nodiscard]] bool live(const HealthSnapshot &snapshot,
+                        Clock::time_point now) noexcept {
   return snapshot.accepting && snapshot.heartbeat != Clock::time_point{} &&
-         now >= snapshot.heartbeat && now - snapshot.heartbeat <= heartbeat_timeout;
+         now >= snapshot.heartbeat &&
+         now - snapshot.heartbeat <= heartbeat_timeout;
 }
 
 [[nodiscard]] std::string json_escape(std::string_view value) {
@@ -172,35 +295,35 @@ template <std::size_t Size>
   for (const char character : value) {
     const auto byte = static_cast<unsigned char>(character);
     switch (byte) {
-      case '"':
-        result += "\\\"";
-        break;
-      case '\\':
-        result += "\\\\";
-        break;
-      case '\b':
-        result += "\\b";
-        break;
-      case '\f':
-        result += "\\f";
-        break;
-      case '\n':
-        result += "\\n";
-        break;
-      case '\r':
-        result += "\\r";
-        break;
-      case '\t':
-        result += "\\t";
-        break;
-      default:
-        if (byte < 0x20U || byte >= 0x7FU) {
-          result += "\\u00";
-          result.push_back(hex[byte >> 4U]);
-          result.push_back(hex[byte & 0x0FU]);
-        } else {
-          result.push_back(static_cast<char>(byte));
-        }
+    case '"':
+      result += "\\\"";
+      break;
+    case '\\':
+      result += "\\\\";
+      break;
+    case '\b':
+      result += "\\b";
+      break;
+    case '\f':
+      result += "\\f";
+      break;
+    case '\n':
+      result += "\\n";
+      break;
+    case '\r':
+      result += "\\r";
+      break;
+    case '\t':
+      result += "\\t";
+      break;
+    default:
+      if (byte < 0x20U || byte >= 0x7FU) {
+        result += "\\u00";
+        result.push_back(hex[byte >> 4U]);
+        result.push_back(hex[byte & 0x0FU]);
+      } else {
+        result.push_back(static_cast<char>(byte));
+      }
     }
   }
   return result;
@@ -234,12 +357,12 @@ template <std::size_t Size>
 
 [[nodiscard]] std::string_view state_name(ComponentState state) noexcept {
   switch (state) {
-    case ComponentState::not_configured:
-      return "not_configured";
-    case ComponentState::ready:
-      return "ready";
-    case ComponentState::failed:
-      return "failed";
+  case ComponentState::not_configured:
+    return "not_configured";
+  case ComponentState::ready:
+    return "ready";
+  case ComponentState::failed:
+    return "failed";
   }
   return "failed";
 }
@@ -262,7 +385,8 @@ template <std::size_t Size>
       const auto &session = shared.sessions[index];
       if (session.occupied) {
         snapshot.sessions.push_back(HealthSession{session.id, session.worker,
-                                                  session.resident_bytes, session.telemetry});
+                                                  session.resident_bytes,
+                                                  session.telemetry});
       }
     }
     for (const auto &component : shared.components) {
@@ -284,9 +408,10 @@ void set_response(httplib::Response &response, const HealthResponse &rendered) {
   response.set_header("X-Content-Type-Options", "nosniff");
 }
 
-[[nodiscard]] int run_health_process(SharedHealth &shared, int control_descriptor,
-                                     int startup_descriptor, std::string bind_address,
-                                     std::uint16_t port, pid_t supervisor) noexcept {
+[[nodiscard]] int
+run_health_process(SharedHealth &shared, int control_descriptor,
+                   int startup_descriptor, std::string bind_address,
+                   std::uint16_t port, pid_t supervisor) noexcept {
   static_cast<void>(::prctl(PR_SET_PDEATHSIG, SIGTERM));
   if (::getppid() != supervisor) {
     static_cast<void>(::close(startup_descriptor));
@@ -318,28 +443,35 @@ void set_response(httplib::Response &response, const HealthResponse &rendered) {
         set_response(response, renderer(copy_snapshot(shared), Clock::now()));
       } catch (const std::exception &error) {
         response.status = 503;
-        response.set_content("{\"status\":\"unavailable\",\"reason\":\"health state unavailable\"}\n",
+        response.set_content("{\"status\":\"unavailable\",\"reason\":\"health "
+                             "state unavailable\"}\n",
                              "application/json; charset=utf-8");
         static_cast<void>(error);
       }
     };
-    server.Get("/livez", [&](const httplib::Request &, httplib::Response &response) {
-      render(render_liveness, response);
-    });
-    server.Get("/readyz", [&](const httplib::Request &, httplib::Response &response) {
-      render(render_readiness, response);
-    });
-    server.Get("/metrics", [&](const httplib::Request &, httplib::Response &response) {
-      render(render_metrics, response);
-    });
+    server.Get("/livez",
+               [&](const httplib::Request &, httplib::Response &response) {
+                 render(render_liveness, response);
+               });
+    server.Get("/readyz",
+               [&](const httplib::Request &, httplib::Response &response) {
+                 render(render_readiness, response);
+               });
+    server.Get("/metrics",
+               [&](const httplib::Request &, httplib::Response &response) {
+                 render(render_metrics, response);
+               });
 
     StartupStatus startup{};
-    startup.ready = server.bind_to_port(bind_address, static_cast<int>(port)) ? 1U : 0U;
+    startup.ready =
+        server.bind_to_port(bind_address, static_cast<int>(port)) ? 1U : 0U;
     if (startup.ready == 0U) {
-      copy_bounded(startup.reason, startup_reason.empty() ? "HTTP listener initialization failed"
-                                                          : startup_reason);
+      copy_bounded(startup.reason, startup_reason.empty()
+                                       ? "HTTP listener initialization failed"
+                                       : startup_reason);
     }
-    static_cast<void>(::send(startup_descriptor, &startup, sizeof(startup), MSG_NOSIGNAL));
+    static_cast<void>(
+        ::send(startup_descriptor, &startup, sizeof(startup), MSG_NOSIGNAL));
     static_cast<void>(::close(startup_descriptor));
     startup_descriptor = -1;
     if (startup.ready == 0U) {
@@ -349,7 +481,8 @@ void set_response(httplib::Response &response, const HealthResponse &rendered) {
 
     std::thread control([&server, control_descriptor] {
       std::array<std::byte, 1> byte{};
-      while (::recv(control_descriptor, byte.data(), byte.size(), 0) < 0 && errno == EINTR) {
+      while (::recv(control_descriptor, byte.data(), byte.size(), 0) < 0 &&
+             errno == EINTR) {
       }
       server.stop();
     });
@@ -367,9 +500,11 @@ void set_response(httplib::Response &response, const HealthResponse &rendered) {
     return listened ? 0 : 1;
   } catch (...) {
     StartupStatus startup{};
-    copy_bounded(startup.reason, "health process initialization threw an exception");
+    copy_bounded(startup.reason,
+                 "health process initialization threw an exception");
     if (startup_descriptor >= 0) {
-      static_cast<void>(::send(startup_descriptor, &startup, sizeof(startup), MSG_NOSIGNAL));
+      static_cast<void>(
+          ::send(startup_descriptor, &startup, sizeof(startup), MSG_NOSIGNAL));
       static_cast<void>(::close(startup_descriptor));
     }
     static_cast<void>(::close(control_descriptor));
@@ -377,18 +512,142 @@ void set_response(httplib::Response &response, const HealthResponse &rendered) {
   }
 }
 
-}  // namespace
+void allocate_health_state(HealthStartupResources &resources,
+                           const HealthMonitor::Config &config) {
+  if (inject_failure(config, HealthStartupFailure::mapping, ENOMEM)) {
+    throw std::system_error(errno, std::generic_category(),
+                            "cannot allocate health state");
+  }
+  void *mapping = ::mmap(nullptr, sizeof(SharedHealth), PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    throw std::system_error(errno, std::generic_category(),
+                            "cannot allocate health state");
+  }
+  resources.adopt_mapping(mapping);
+}
 
-HealthResponse render_liveness(const HealthSnapshot &snapshot, Clock::time_point now) {
+void initialize_health_mutex(HealthStartupResources &resources,
+                             const HealthMonitor::Config &config) {
+  pthread_mutexattr_t attributes{};
+  const auto attributes_initialized =
+      ::pthread_mutexattr_init(&attributes) == 0;
+  const auto mutex_initialized =
+      attributes_initialized &&
+      !inject_failure(config, HealthStartupFailure::mutex) &&
+      ::pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) ==
+          0 &&
+      ::pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) == 0 &&
+      ::pthread_mutex_init(&resources.shared().mutex, &attributes) == 0;
+  if (attributes_initialized) {
+    static_cast<void>(::pthread_mutexattr_destroy(&attributes));
+  }
+  if (!mutex_initialized) {
+    throw std::runtime_error("cannot initialize health state lock");
+  }
+  resources.mark_mutex_initialized();
+}
+
+void configure_health_state(SharedHealth &shared,
+                            const HealthMonitor::Config &config) noexcept {
+  shared.magic = shared_magic;
+  shared.version = shared_version;
+  shared.max_sessions = config.max_sessions;
+  shared.started_ns = to_ns(Clock::now());
+  shared.heartbeat_ns = shared.started_ns;
+}
+
+void create_health_channel(std::array<int, 2> &channel, int type,
+                           const HealthMonitor::Config &config,
+                           HealthStartupFailure failure) {
+  if (inject_failure(config, failure, EMFILE) ||
+      ::socketpair(AF_UNIX, type | SOCK_CLOEXEC, 0, channel.data()) != 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "cannot create health control channel");
+  }
+}
+
+[[noreturn]] void run_health_child(HealthStartupResources &resources,
+                                   const HealthMonitor::Config &config,
+                                   pid_t supervisor) {
+  resources.close_descriptor(resources.control()[0]);
+  resources.close_descriptor(resources.startup()[0]);
+  for (const auto descriptor : config.close_in_child) {
+    if (descriptor >= 0 && descriptor != resources.control()[1] &&
+        descriptor != resources.startup()[1]) {
+      static_cast<void>(::close(descriptor));
+    }
+  }
+  if (config.failure_for_testing == HealthStartupFailure::child_startup) {
+    StartupStatus status{};
+    copy_bounded(status.reason, "injected health child startup failure");
+    static_cast<void>(
+        ::send(resources.startup()[1], &status, sizeof(status), MSG_NOSIGNAL));
+    std::_Exit(1);
+  }
+  const auto result = run_health_process(
+      resources.shared(), resources.control()[1], resources.startup()[1],
+      config.bind_address, config.port, supervisor);
+  std::_Exit(result);
+}
+
+[[nodiscard]] StartupStatus
+await_health_startup(HealthStartupResources &resources) noexcept {
+  StartupStatus status{};
+  pollfd startup_poll{
+      .fd = resources.startup()[0], .events = POLLIN, .revents = 0};
+  int polled = -1;
+  for (;;) {
+    polled = ::poll(&startup_poll, 1, 5000);
+    if (polled >= 0 || errno != EINTR) {
+      break;
+    }
+  }
+  if (polled <= 0 || (startup_poll.revents & POLLIN) == 0) {
+    return status;
+  }
+  ssize_t count = -1;
+  for (;;) {
+    count = ::recv(resources.startup()[0], &status, sizeof(status), 0);
+    if (count >= 0 || errno != EINTR) {
+      break;
+    }
+  }
+  if (!std::cmp_equal(count, sizeof(status))) {
+    return {};
+  }
+  return status;
+}
+
+[[nodiscard]] std::string
+health_startup_error(const HealthMonitor::Config &config,
+                     const StartupStatus &status) {
+  auto message = "cannot listen on health endpoint " + config.bind_address +
+                 ':' + std::to_string(config.port);
+  const auto reason = read_bounded(status.reason);
+  if (!reason.empty()) {
+    message += ": ";
+    message += reason;
+  }
+  return message;
+}
+
+} // namespace
+
+HealthResponse render_liveness(const HealthSnapshot &snapshot,
+                               Clock::time_point now) {
   if (live(snapshot, now)) {
     return {200, "application/json; charset=utf-8", "{\"status\":\"live\"}\n"};
   }
-  const auto reason = snapshot.accepting ? "supervisor heartbeat stale" : "SSH not accepting";
+  const auto reason =
+      snapshot.accepting ? "supervisor heartbeat stale" : "SSH not accepting";
   return {503, "application/json; charset=utf-8",
-          "{\"status\":\"unavailable\",\"reason\":\"" + std::string(reason) + "\"}\n"};
+          "{\"status\":\"unavailable\",\"reason\":\"" + std::string(reason) +
+              "\"}\n"};
 }
 
-HealthResponse render_readiness(const HealthSnapshot &snapshot, Clock::time_point now) {
+HealthResponse render_readiness(const HealthSnapshot &snapshot,
+                                Clock::time_point now) {
   std::vector<const ComponentStatus *> failures;
   for (const auto &component : snapshot.components) {
     if (component.state == ComponentState::failed) {
@@ -412,8 +671,8 @@ HealthResponse render_readiness(const HealthSnapshot &snapshot, Clock::time_poin
     }
     first = false;
     body += "{\"kind\":\"" + std::string(kind_name(component->kind)) +
-            "\",\"name\":\"" + json_escape(component->name) + "\",\"reason\":\"" +
-            json_escape(component->reason) + "\"}";
+            "\",\"name\":\"" + json_escape(component->name) +
+            "\",\"reason\":\"" + json_escape(component->reason) + "\"}";
   }
   body += "],\"components\":[";
   first = true;
@@ -428,23 +687,28 @@ HealthResponse render_readiness(const HealthSnapshot &snapshot, Clock::time_poin
             json_escape(component.version) + "\"}";
   }
   body += "]}\n";
-  return {is_live && failures.empty() ? 200 : 503, "application/json; charset=utf-8",
-          std::move(body)};
+  return {is_live && failures.empty() ? 200 : 503,
+          "application/json; charset=utf-8", std::move(body)};
 }
 
-HealthResponse render_metrics(const HealthSnapshot &snapshot, Clock::time_point now) {
+HealthResponse render_metrics(const HealthSnapshot &snapshot,
+                              Clock::time_point now) {
   const auto is_live = live(snapshot, now);
-  const auto is_ready = is_live && std::none_of(snapshot.components.begin(),
-                                                snapshot.components.end(), [](const auto &item) {
-                                                  return item.state == ComponentState::failed;
-                                                });
+  const auto is_ready =
+      is_live && std::none_of(snapshot.components.begin(),
+                              snapshot.components.end(), [](const auto &item) {
+                                return item.state == ComponentState::failed;
+                              });
   const auto uptime = now >= snapshot.started
-                          ? std::chrono::duration_cast<std::chrono::seconds>(now - snapshot.started)
+                          ? std::chrono::duration_cast<std::chrono::seconds>(
+                                now - snapshot.started)
                                 .count()
                           : 0;
   std::string body;
-  body.reserve(2048U + snapshot.sessions.size() * 512U + snapshot.components.size() * 256U);
-  body += "# HELP anvil_up Whether the SSH supervisor is accepting and current.\n";
+  body.reserve(2048U + (snapshot.sessions.size() * 512U) +
+               (snapshot.components.size() * 256U));
+  body +=
+      "# HELP anvil_up Whether the SSH supervisor is accepting and current.\n";
   body += "# TYPE anvil_up gauge\n";
   body += "anvil_up " + std::to_string(is_live ? 1 : 0) + "\n";
   body += "# HELP anvil_ready Whether every configured dependency is ready.\n";
@@ -456,8 +720,9 @@ HealthResponse render_metrics(const HealthSnapshot &snapshot, Clock::time_point 
           std::to_string(snapshot.sessions.size()) + "\n";
   body += "# TYPE anvil_registered_users gauge\nanvil_registered_users " +
           std::to_string(snapshot.registered_users) + "\n";
-  body += "# TYPE anvil_door_sessions_total counter\nanvil_door_sessions_total " +
-          std::to_string(snapshot.door_sessions) + "\n";
+  body +=
+      "# TYPE anvil_door_sessions_total counter\nanvil_door_sessions_total " +
+      std::to_string(snapshot.door_sessions) + "\n";
   body += "# TYPE anvil_resident_memory_bytes gauge\n";
   body += "anvil_resident_memory_bytes{role=\"supervisor\"} " +
           std::to_string(snapshot.supervisor_resident_bytes) + "\n";
@@ -474,7 +739,8 @@ HealthResponse render_metrics(const HealthSnapshot &snapshot, Clock::time_point 
     body += "anvil_session_accepted_frames_total" + label + " " +
             std::to_string(session.telemetry.accepted_frames) + "\n";
     body += "anvil_session_output_bytes_total{session=\"" + id +
-            "\",kind=\"cells\"} " + std::to_string(session.telemetry.cell_bytes) + "\n";
+            "\",kind=\"cells\"} " +
+            std::to_string(session.telemetry.cell_bytes) + "\n";
     body += "anvil_session_output_bytes_total{session=\"" + id +
             "\",kind=\"image_transmit\"} " +
             std::to_string(session.telemetry.image_transmit_bytes) + "\n";
@@ -486,12 +752,15 @@ HealthResponse render_metrics(const HealthSnapshot &snapshot, Clock::time_point 
             std::to_string(session.telemetry.last_frame_cell_bytes) + "\n";
     body += "anvil_session_last_frame_output_bytes{session=\"" + id +
             "\",kind=\"image_transmit\"} " +
-            std::to_string(session.telemetry.last_frame_image_transmit_bytes) + "\n";
+            std::to_string(session.telemetry.last_frame_image_transmit_bytes) +
+            "\n";
     body += "anvil_session_last_frame_output_bytes{session=\"" + id +
             "\",kind=\"image_edit\"} " +
-            std::to_string(session.telemetry.last_frame_image_edit_bytes) + "\n";
+            std::to_string(session.telemetry.last_frame_image_edit_bytes) +
+            "\n";
     body += "anvil_session_first_frame_seconds" + label + " " +
-            std::to_string(static_cast<double>(session.telemetry.first_frame_latency.count()) /
+            std::to_string(static_cast<double>(
+                               session.telemetry.first_frame_latency.count()) /
                            1000.0) +
             "\n";
   }
@@ -502,15 +771,17 @@ HealthResponse render_metrics(const HealthSnapshot &snapshot, Clock::time_point 
     }
     body += "anvil_plugin_ready{plugin=\"" + prometheus_escape(component.name) +
             "\",version=\"" + prometheus_escape(component.version) + "\"} " +
-            std::to_string(component.state == ComponentState::ready ? 1 : 0) + "\n";
+            std::to_string(component.state == ComponentState::ready ? 1 : 0) +
+            "\n";
   }
   return {200, "text/plain; version=0.0.4; charset=utf-8", std::move(body)};
 }
 
 class HealthMonitor::Impl {
- public:
+public:
   Impl(SharedHealth *shared, pid_t process, int control_descriptor)
-      : shared_(shared), process_(process), control_descriptor_(control_descriptor) {}
+      : shared_(shared), process_(process),
+        control_descriptor_(control_descriptor) {}
 
   ~Impl() {
     shutdown();
@@ -523,7 +794,8 @@ class HealthMonitor::Impl {
   void shutdown() noexcept {
     if (control_descriptor_ >= 0) {
       const std::uint8_t stop = 1U;
-      static_cast<void>(::send(control_descriptor_, &stop, sizeof(stop), MSG_NOSIGNAL));
+      static_cast<void>(
+          ::send(control_descriptor_, &stop, sizeof(stop), MSG_NOSIGNAL));
       static_cast<void>(::close(control_descriptor_));
       control_descriptor_ = -1;
     }
@@ -553,123 +825,48 @@ class HealthMonitor::Impl {
   int control_descriptor_{-1};
 };
 
-HealthMonitor::HealthMonitor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+HealthMonitor::HealthMonitor(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- shared-memory and child startup must unwind through one ordered failure path
-auto HealthMonitor::start(const Config &config) -> std::unique_ptr<HealthMonitor> {
+auto HealthMonitor::start(const Config &config)
+    -> std::unique_ptr<HealthMonitor> {
   if (config.max_sessions == 0U || config.max_sessions > max_shared_sessions) {
     throw std::runtime_error("health session capacity is invalid");
   }
-  void *mapping = ::mmap(nullptr, sizeof(SharedHealth), PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-  if (mapping == MAP_FAILED) {
-    throw std::system_error(errno, std::generic_category(), "cannot allocate health state");
-  }
-  auto *shared = new (mapping) SharedHealth{};
-  pthread_mutexattr_t attributes{};
-  const auto attributes_initialized = ::pthread_mutexattr_init(&attributes) == 0;
-  const auto lock_initialized =
-      attributes_initialized &&
-      ::pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) == 0 &&
-      ::pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) == 0 &&
-      ::pthread_mutex_init(&shared->mutex, &attributes) == 0;
-  if (!lock_initialized) {
-    if (attributes_initialized) {
-      static_cast<void>(::pthread_mutexattr_destroy(&attributes));
-    }
-    static_cast<void>(::munmap(mapping, sizeof(SharedHealth)));
-    throw std::runtime_error("cannot initialize health state lock");
-  }
-  static_cast<void>(::pthread_mutexattr_destroy(&attributes));
-  shared->magic = shared_magic;
-  shared->version = shared_version;
-  shared->max_sessions = config.max_sessions;
-  shared->started_ns = to_ns(Clock::now());
-  shared->heartbeat_ns = shared->started_ns;
-
-  std::array<int, 2> control{-1, -1};
-  std::array<int, 2> startup{-1, -1};
-  const auto control_created =
-      ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, control.data()) == 0;
-  const auto startup_created =
-      control_created &&
-      ::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startup.data()) == 0;
-  if (!startup_created) {
-    const auto saved = errno;
-    for (const auto descriptor : control) {
-      if (descriptor >= 0) {
-        static_cast<void>(::close(descriptor));
-      }
-    }
-    for (const auto descriptor : startup) {
-      if (descriptor >= 0) {
-        static_cast<void>(::close(descriptor));
-      }
-    }
-    static_cast<void>(::pthread_mutex_destroy(&shared->mutex));
-    static_cast<void>(::munmap(mapping, sizeof(SharedHealth)));
-    throw std::system_error(saved, std::generic_category(), "cannot create health control channel");
-  }
-
+  HealthStartupResources resources(config.cleanup_for_testing);
+  allocate_health_state(resources, config);
+  initialize_health_mutex(resources, config);
+  configure_health_state(resources.shared(), config);
+  create_health_channel(resources.control(), SOCK_STREAM, config,
+                        HealthStartupFailure::control_channel);
+  create_health_channel(resources.startup(), SOCK_SEQPACKET, config,
+                        HealthStartupFailure::startup_channel);
   const auto supervisor = ::getpid();
-  const auto child = ::fork();
-  if (child < 0) {
-    const auto saved = errno;
-    for (const auto descriptor : control) {
-      static_cast<void>(::close(descriptor));
-    }
-    for (const auto descriptor : startup) {
-      static_cast<void>(::close(descriptor));
-    }
-    static_cast<void>(::pthread_mutex_destroy(&shared->mutex));
-    static_cast<void>(::munmap(mapping, sizeof(SharedHealth)));
-    throw std::system_error(saved, std::generic_category(), "cannot fork health process");
+  resources.set_child(
+      inject_failure(config, HealthStartupFailure::fork_process, EAGAIN)
+          ? -1
+          : ::fork());
+  if (resources.child() < 0) {
+    throw std::system_error(errno, std::generic_category(),
+                            "cannot fork health process");
   }
-  if (child == 0) {
-    static_cast<void>(::close(control[0]));
-    static_cast<void>(::close(startup[0]));
-    for (const auto descriptor : config.close_in_child) {
-      if (descriptor >= 0 && descriptor != control[1] && descriptor != startup[1]) {
-        static_cast<void>(::close(descriptor));
-      }
-    }
-    const auto result = run_health_process(*shared, control[1], startup[1], config.bind_address,
-                                           config.port, supervisor);
-    std::_Exit(result);
+  if (resources.child() == 0) {
+    run_health_child(resources, config, supervisor);
   }
-  static_cast<void>(::close(control[1]));
-  static_cast<void>(::close(startup[1]));
-  StartupStatus startup_status{};
-  ssize_t count = -1;
-  pollfd startup_poll{.fd = startup[0], .events = POLLIN, .revents = 0};
-  int polled = -1;
-  do {
-    polled = ::poll(&startup_poll, 1, 5000);
-  } while (polled < 0 && errno == EINTR);
-  if (polled > 0 && (startup_poll.revents & POLLIN) != 0) {
-    do {
-      count = ::recv(startup[0], &startup_status, sizeof(startup_status), 0);
-    } while (count < 0 && errno == EINTR);
+  if (config.child_for_testing != nullptr) {
+    *config.child_for_testing = resources.child();
   }
-  static_cast<void>(::close(startup[0]));
-  if (count != static_cast<ssize_t>(sizeof(startup_status)) || startup_status.ready != 1U) {
-    static_cast<void>(::close(control[0]));
-    static_cast<void>(::kill(child, SIGKILL));
-    while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
-    }
-    static_cast<void>(::pthread_mutex_destroy(&shared->mutex));
-    static_cast<void>(::munmap(mapping, sizeof(SharedHealth)));
-    auto message = "cannot listen on health endpoint " + config.bind_address + ':' +
-                   std::to_string(config.port);
-    const auto reason = read_bounded(startup_status.reason);
-    if (!reason.empty()) {
-      message += ": ";
-      message += reason;
-    }
-    throw std::runtime_error(message);
+  resources.close_descriptor(resources.control()[1]);
+  resources.close_descriptor(resources.startup()[1]);
+  const auto startup_status = await_health_startup(resources);
+  resources.close_descriptor(resources.startup()[0]);
+  if (startup_status.ready != 1U) {
+    throw std::runtime_error(health_startup_error(config, startup_status));
   }
   return std::unique_ptr<HealthMonitor>(
-      new HealthMonitor(std::make_unique<Impl>(shared, child, control[0])));
+      new HealthMonitor(std::make_unique<Impl>(resources.release_shared(),
+                                               resources.release_child(),
+                                               resources.release_control())));
 }
 
 HealthMonitor::~HealthMonitor() = default;
@@ -781,4 +978,4 @@ void HealthMonitor::detach_in_worker() noexcept {
 
 void HealthMonitor::shutdown() noexcept { impl_->shutdown(); }
 
-}  // namespace anvil::server
+} // namespace anvil::server

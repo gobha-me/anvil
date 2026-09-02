@@ -16,6 +16,23 @@ namespace anvil::server {
 enum class ComponentKind : std::uint8_t { storage, plugin };
 enum class ComponentState : std::uint8_t { not_configured, ready, failed };
 
+enum class HealthStartupFailure : std::uint8_t {
+  none,
+  mapping,
+  mutex,
+  control_channel,
+  startup_channel,
+  fork_process,
+  child_startup,
+};
+
+struct HealthStartupCleanup {
+  std::uint32_t descriptors{};
+  std::uint32_t mutexes{};
+  std::uint32_t mappings{};
+  std::uint32_t children{};
+};
+
 struct ComponentStatus {
   ComponentKind kind{};
   ComponentState state{};
@@ -49,20 +66,26 @@ struct HealthResponse {
   std::string body;
 };
 
-[[nodiscard]] HealthResponse render_liveness(
-    const HealthSnapshot &snapshot, std::chrono::steady_clock::time_point now);
-[[nodiscard]] HealthResponse render_readiness(
-    const HealthSnapshot &snapshot, std::chrono::steady_clock::time_point now);
-[[nodiscard]] HealthResponse render_metrics(
-    const HealthSnapshot &snapshot, std::chrono::steady_clock::time_point now);
+[[nodiscard]] HealthResponse
+render_liveness(const HealthSnapshot &snapshot,
+                std::chrono::steady_clock::time_point now);
+[[nodiscard]] HealthResponse
+render_readiness(const HealthSnapshot &snapshot,
+                 std::chrono::steady_clock::time_point now);
+[[nodiscard]] HealthResponse
+render_metrics(const HealthSnapshot &snapshot,
+               std::chrono::steady_clock::time_point now);
 
 class HealthMonitor {
- public:
+public:
   struct Config {
     std::string bind_address{"127.0.0.1"};
     std::uint16_t port{8080};
     std::uint32_t max_sessions{64};
     std::vector<int> close_in_child;
+    HealthStartupFailure failure_for_testing{};
+    HealthStartupCleanup *cleanup_for_testing{};
+    pid_t *child_for_testing{};
   };
 
   static auto start(const Config &config) -> std::unique_ptr<HealthMonitor>;
@@ -76,17 +99,18 @@ class HealthMonitor {
   void heartbeat(bool accepting);
   void set_component(const ComponentStatus &component);
   void session_started(std::uint64_t id, pid_t worker);
-  void session_updated(std::uint64_t id, pid_t worker, const SessionTelemetry &telemetry);
+  void session_updated(std::uint64_t id, pid_t worker,
+                       const SessionTelemetry &telemetry);
   void session_finished(std::uint64_t id);
   [[nodiscard]] bool alive();
   [[nodiscard]] pid_t pid() const noexcept;
   void detach_in_worker() noexcept;
   void shutdown() noexcept;
 
- private:
+private:
   class Impl;
   explicit HealthMonitor(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace anvil::server
+} // namespace anvil::server
