@@ -1,7 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cerrno>
 #include <chrono>
 #include <string>
+
+#include <sys/wait.h>
 
 #include "health.hpp"
 
@@ -19,7 +23,9 @@ TEST_CASE("health responses fail closed on stale or failed state") {
   CHECK(anvil::server::render_liveness(snapshot, now + 4s).status == 503);
 
   snapshot.components.push_back({anvil::server::ComponentKind::storage,
-                                 anvil::server::ComponentState::failed, "database", {},
+                                 anvil::server::ComponentState::failed,
+                                 "database",
+                                 {},
                                  "cannot open WAL"});
   const auto failed = anvil::server::render_readiness(snapshot, now);
   CHECK(failed.status == 503);
@@ -46,7 +52,8 @@ TEST_CASE("health output escapes hostile plugin metadata") {
   const auto metrics = anvil::server::render_metrics(snapshot, now);
   CHECK(metrics.status == 200);
   CHECK(metrics.content_type.find("version=0.0.4") != std::string::npos);
-  CHECK(metrics.body.find("plugin=\"door\\\"\\\\\\nname\\xff\"") != std::string::npos);
+  CHECK(metrics.body.find("plugin=\"door\\\"\\\\\\nname\\xff\"") !=
+        std::string::npos);
   CHECK(metrics.body.find("version=\"1.0\\\"\"") != std::string::npos);
 }
 
@@ -56,34 +63,79 @@ TEST_CASE("metrics expose opaque per-session accounting") {
   snapshot.started = now - 5s;
   snapshot.heartbeat = now;
   snapshot.accepting = true;
-  snapshot.sessions.push_back(
-      {42, 1234, 8192,
-       {.frames = 3,
-        .accepted_frames = 2,
-        .cell_bytes = 100,
-        .image_transmit_bytes = 20,
-        .image_edit_bytes = 5,
-        .last_frame_cell_bytes = 7,
-        .last_frame_image_transmit_bytes = 3,
-        .last_frame_image_edit_bytes = 1,
-        .first_frame_latency = 25ms}});
+  snapshot.sessions.push_back({42,
+                               1234,
+                               8192,
+                               {.frames = 3,
+                                .accepted_frames = 2,
+                                .cell_bytes = 100,
+                                .image_transmit_bytes = 20,
+                                .image_edit_bytes = 5,
+                                .last_frame_cell_bytes = 7,
+                                .last_frame_image_transmit_bytes = 3,
+                                .last_frame_image_edit_bytes = 1,
+                                .first_frame_latency = 25ms}});
 
   const auto metrics = anvil::server::render_metrics(snapshot, now);
   CHECK(metrics.body.find("anvil_ssh_active_sessions 1") != std::string::npos);
   CHECK(metrics.body.find("session=\"42\"") != std::string::npos);
-  CHECK(metrics.body.find("anvil_session_output_bytes_total{session=\"42\",kind=\"cells\"} 100") !=
+  CHECK(metrics.body.find("anvil_session_output_bytes_total{session=\"42\","
+                          "kind=\"cells\"} 100") != std::string::npos);
+  CHECK(metrics.body.find("anvil_session_last_frame_output_bytes{session="
+                          "\"42\",kind=\"cells\"} 7") != std::string::npos);
+  CHECK(
+      metrics.body.find("# TYPE anvil_session_last_frame_output_bytes gauge") !=
+      std::string::npos);
+  CHECK(metrics.body.find(
+            "anvil_session_last_frame_output_bytes{session=\"42\",kind=\"image_"
+            "transmit\"} 3") != std::string::npos);
+  CHECK(metrics.body.find("anvil_session_last_frame_output_bytes{session="
+                          "\"42\",kind=\"image_edit\"} 1") !=
         std::string::npos);
   CHECK(metrics.body.find(
-            "anvil_session_last_frame_output_bytes{session=\"42\",kind=\"cells\"} 7") !=
-        std::string::npos);
-  CHECK(metrics.body.find("# TYPE anvil_session_last_frame_output_bytes gauge") !=
-        std::string::npos);
-  CHECK(metrics.body.find("anvil_session_last_frame_output_bytes{session=\"42\",kind=\"image_"
-                          "transmit\"} 3") != std::string::npos);
-  CHECK(metrics.body.find(
-            "anvil_session_last_frame_output_bytes{session=\"42\",kind=\"image_edit\"} 1") !=
-        std::string::npos);
-  CHECK(metrics.body.find("anvil_session_first_frame_seconds{session=\"42\"} 0.025000") !=
+            "anvil_session_first_frame_seconds{session=\"42\"} 0.025000") !=
         std::string::npos);
   CHECK(metrics.body.find("1234") == std::string::npos);
+}
+
+TEST_CASE("health startup failures release every acquired parent resource") {
+  using anvil::server::HealthStartupFailure;
+
+  struct FailureCase {
+    HealthStartupFailure failure;
+    std::uint32_t descriptors;
+    std::uint32_t mutexes;
+    std::uint32_t mappings;
+    std::uint32_t children;
+  };
+  constexpr std::array failures{
+      FailureCase{HealthStartupFailure::mapping, 0, 0, 0, 0},
+      FailureCase{HealthStartupFailure::mutex, 0, 0, 1, 0},
+      FailureCase{HealthStartupFailure::control_channel, 0, 1, 1, 0},
+      FailureCase{HealthStartupFailure::startup_channel, 2, 1, 1, 0},
+      FailureCase{HealthStartupFailure::fork_process, 4, 1, 1, 0},
+      FailureCase{HealthStartupFailure::child_startup, 4, 1, 1, 1},
+  };
+
+  for (const auto &failure : failures) {
+    anvil::server::HealthStartupCleanup cleanup;
+    pid_t child = -1;
+    CHECK_THROWS(anvil::server::HealthMonitor::start(
+        {.bind_address = "127.0.0.1",
+         .port = 1,
+         .max_sessions = 4,
+         .close_in_child = {},
+         .failure_for_testing = failure.failure,
+         .cleanup_for_testing = &cleanup,
+         .child_for_testing = &child}));
+    CHECK(cleanup.descriptors == failure.descriptors);
+    CHECK(cleanup.mutexes == failure.mutexes);
+    CHECK(cleanup.mappings == failure.mappings);
+    CHECK(cleanup.children == failure.children);
+    if (child > 0) {
+      errno = 0;
+      CHECK(::waitpid(child, nullptr, WNOHANG) == -1);
+      CHECK(errno == ECHILD);
+    }
+  }
 }

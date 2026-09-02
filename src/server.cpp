@@ -293,33 +293,36 @@ read_key_file(FileDescriptor file, const std::string &path, bool private_key) {
   return read_key_file(FileDescriptor(descriptor), path, private_key);
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- bounded no-follow file admission keeps each rejection next to its read
-[[nodiscard]] TosPolicy load_tos_policy(const Config &config) {
-  if (!valid_tos_version(config.tos_version)) {
-    throw std::runtime_error(
-        "TOS version must contain 1 to 128 bytes of valid UTF-8 and no "
-        "controls");
-  }
-  const auto descriptor = ::open(
-      config.tos_file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+[[nodiscard]] FileDescriptor open_tos_file(const std::string &path) {
+  const auto descriptor =
+      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (descriptor < 0) {
-    throw_system_error("cannot open TOS file '" + config.tos_file + "'");
+    throw_system_error("cannot open TOS file '" + path + "'");
   }
-  FileDescriptor file(descriptor);
+  return FileDescriptor(descriptor);
+}
+
+[[nodiscard]] std::size_t tos_file_size(const FileDescriptor &file,
+                                        const std::string &path) {
   struct stat metadata{};
   if (::fstat(file.get(), &metadata) != 0) {
-    throw_system_error("cannot inspect TOS file '" + config.tos_file + "'");
+    throw_system_error("cannot inspect TOS file '" + path + "'");
   }
   if (!S_ISREG(metadata.st_mode)) {
-    throw std::runtime_error("TOS file is not a regular file: " +
-                             config.tos_file);
+    throw std::runtime_error("TOS file is not a regular file: " + path);
   }
   if (metadata.st_size <= 0 ||
       static_cast<std::uintmax_t>(metadata.st_size) > max_tos_file_size) {
     throw std::runtime_error("TOS file must contain 1 to 262144 bytes: " +
-                             config.tos_file);
+                             path);
   }
-  std::string contents(static_cast<std::size_t>(metadata.st_size), '\0');
+  return static_cast<std::size_t>(metadata.st_size);
+}
+
+[[nodiscard]] std::string read_exact_tos_file(const FileDescriptor &file,
+                                              const std::string &path,
+                                              std::size_t size) {
+  std::string contents(size, '\0');
   std::size_t offset = 0;
   while (offset < contents.size()) {
     const auto count =
@@ -328,33 +331,36 @@ read_key_file(FileDescriptor file, const std::string &path, bool private_key) {
       continue;
     }
     if (count < 0) {
-      throw_system_error("cannot read TOS file '" + config.tos_file + "'");
+      throw_system_error("cannot read TOS file '" + path + "'");
     }
     if (count == 0) {
-      throw std::runtime_error("TOS file changed while being read: " +
-                               config.tos_file);
+      throw std::runtime_error("TOS file changed while being read: " + path);
     }
     offset += static_cast<std::size_t>(count);
   }
+  return contents;
+}
+
+void require_tos_eof(const FileDescriptor &file, const std::string &path) {
   char trailing{};
   ssize_t trailing_count = 0;
   do {
     trailing_count = ::read(file.get(), &trailing, 1);
   } while (trailing_count < 0 && errno == EINTR);
   if (trailing_count < 0) {
-    throw_system_error("cannot finish reading TOS file '" + config.tos_file +
-                       "'");
+    throw_system_error("cannot finish reading TOS file '" + path + "'");
   }
   if (trailing_count != 0) {
-    throw std::runtime_error("TOS file changed while being read: " +
-                             config.tos_file);
+    throw std::runtime_error("TOS file changed while being read: " + path);
   }
+}
+
+void validate_tos_contents(std::string_view contents, const std::string &path) {
   if (contents.find('\0') != std::string::npos) {
-    throw std::runtime_error("TOS file contains a NUL byte: " +
-                             config.tos_file);
+    throw std::runtime_error("TOS file contains a NUL byte: " + path);
   }
   if (!is_well_formed_utf8(contents)) {
-    throw std::runtime_error("TOS file is not valid UTF-8: " + config.tos_file);
+    throw std::runtime_error("TOS file is not valid UTF-8: " + path);
   }
   const auto display = sanitize_prose_for_render(contents);
   const auto visible = std::ranges::any_of(display, [](const char value) {
@@ -362,9 +368,21 @@ read_key_file(FileDescriptor file, const std::string &path, bool private_key) {
     return byte > 0x20U && byte != 0x7fU;
   });
   if (!visible) {
-    throw std::runtime_error("TOS file has no visible text: " +
-                             config.tos_file);
+    throw std::runtime_error("TOS file has no visible text: " + path);
   }
+}
+
+[[nodiscard]] TosPolicy load_tos_policy(const Config &config) {
+  if (!valid_tos_version(config.tos_version)) {
+    throw std::runtime_error(
+        "TOS version must contain 1 to 128 bytes of valid UTF-8 and no "
+        "controls");
+  }
+  const auto file = open_tos_file(config.tos_file);
+  auto contents = read_exact_tos_file(file, config.tos_file,
+                                      tos_file_size(file, config.tos_file));
+  require_tos_eof(file, config.tos_file);
+  validate_tos_contents(contents, config.tos_file);
   return TosPolicy{.version = config.tos_version, .text = std::move(contents)};
 }
 
@@ -1528,35 +1546,47 @@ struct SupervisorState {
   bool health_failed{};
 };
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- the bounded nonblocking protocol deliberately drains each worker explicitly
+[[nodiscard]] bool receive_guest_report_request(int descriptor) noexcept {
+  std::uint8_t request{};
+  ssize_t received = -1;
+  for (;;) {
+    received = ::recv(descriptor, &request, sizeof(request), 0);
+    if (received >= 0 || errno != EINTR) {
+      break;
+    }
+  }
+  return std::cmp_equal(received, sizeof(request)) && request == 1U;
+}
+
+[[nodiscard]] bool send_guest_report_permit(int descriptor,
+                                            bool permitted) noexcept {
+  const std::uint8_t response = permitted ? 1U : 0U;
+  ssize_t sent = -1;
+  for (;;) {
+    sent = ::send(descriptor, &response, sizeof(response), MSG_NOSIGNAL);
+    if (sent >= 0 || errno != EINTR) {
+      break;
+    }
+  }
+  return std::cmp_equal(sent, sizeof(response));
+}
+
+void service_guest_report_permits(ChildState &child,
+                                  AdmissionController &admission) noexcept {
+  while (receive_guest_report_request(child.guest_report_permit.get())) {
+    if (!send_guest_report_permit(
+            child.guest_report_permit.get(),
+            admission.consume_guest_report(child.peer, Clock::now()))) {
+      return;
+    }
+  }
+}
+
 void service_guest_report_permits(ChildMap &children,
                                   AdmissionController &admission) noexcept {
   for (auto &[worker, child] : children) {
     static_cast<void>(worker);
-    for (;;) {
-      std::uint8_t request{};
-      const auto received =
-          ::recv(child.guest_report_permit.get(), &request, sizeof(request), 0);
-      if (received < 0 && errno == EINTR) {
-        continue;
-      }
-      if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        break;
-      }
-      if (received != static_cast<ssize_t>(sizeof(request)) || request != 1U) {
-        break;
-      }
-      const std::uint8_t allowed =
-          admission.consume_guest_report(child.peer, Clock::now()) ? 1U : 0U;
-      ssize_t sent{};
-      do {
-        sent = ::send(child.guest_report_permit.get(), &allowed,
-                      sizeof(allowed), MSG_NOSIGNAL);
-      } while (sent < 0 && errno == EINTR);
-      if (sent != static_cast<ssize_t>(sizeof(allowed))) {
-        break;
-      }
-    }
+    service_guest_report_permits(child, admission);
   }
 }
 
@@ -1880,10 +1910,10 @@ void terminate_children(const ChildMap &children, int signal_number) {
   }
 }
 
-[[gnu::noinline]] void
-await_children(ChildMap &children, int signal_descriptor,
-               int worker_report_descriptor, AdmissionController &admission,
-               HealthMonitor &health) {
+[[gnu::noinline]] void await_children(ChildMap &children, int signal_descriptor,
+                                      int worker_report_descriptor,
+                                      AdmissionController &admission,
+                                      HealthMonitor &health) {
   terminate_children(children, SIGTERM);
   const auto deadline = Clock::now() + shutdown_timeout;
   while (!children.empty() && Clock::now() < deadline) {
@@ -2646,10 +2676,8 @@ void validate_serve_options(const ArgumentParseState &state) {
   return std::move(state.result);
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- duplicate detection and provisioning keep startup fail-closed
-void reconcile_boards(store::Store &database, const Config &config,
-                      store::UtcEpochSeconds now) {
-  std::vector<BoardDeclaration> declarations = config.boards;
+void require_unique_board_declarations(
+    const std::vector<BoardDeclaration> &declarations) {
   for (std::size_t index = 0; index < declarations.size(); ++index) {
     for (std::size_t other = index + 1U; other < declarations.size(); ++other) {
       if (declarations[index].name == declarations[other].name) {
@@ -2658,30 +2686,31 @@ void reconcile_boards(store::Store &database, const Config &config,
       }
     }
   }
-  if (declarations.empty()) {
-    auto read = database.begin(store::TransactionMode::read_only);
-    if (!read) {
-      throw std::runtime_error("cannot inspect configured boards: " +
-                               read.error().detail);
-    }
-    auto existing = database.list_boards(
-        *read, store::BoardReader{.handle = std::nullopt,
-                                  .may_read_registered = true});
-    if (!existing) {
-      throw std::runtime_error("cannot inspect configured boards: " +
-                               existing.error().detail);
-    }
-    if (auto committed = read->commit(); !committed) {
-      throw std::runtime_error("cannot finish board inspection: " +
-                               committed.error().detail);
-    }
-    if (!existing->empty()) {
-      return;
-    }
-    declarations.push_back(
-        BoardDeclaration{.name = "general", .title = "General"});
-  }
+}
 
+[[nodiscard]] bool has_existing_boards(store::Store &database) {
+  auto read = database.begin(store::TransactionMode::read_only);
+  if (!read) {
+    throw std::runtime_error("cannot inspect configured boards: " +
+                             read.error().detail);
+  }
+  auto existing = database.list_boards(
+      *read,
+      store::BoardReader{.handle = std::nullopt, .may_read_registered = true});
+  if (!existing) {
+    throw std::runtime_error("cannot inspect configured boards: " +
+                             existing.error().detail);
+  }
+  if (auto committed = read->commit(); !committed) {
+    throw std::runtime_error("cannot finish board inspection: " +
+                             committed.error().detail);
+  }
+  return !existing->empty();
+}
+
+void write_board_declarations(store::Store &database,
+                              const std::vector<BoardDeclaration> &declarations,
+                              store::UtcEpochSeconds now) {
   auto write = database.begin(store::TransactionMode::read_write);
   if (!write) {
     throw std::runtime_error("cannot begin board reconciliation: " +
@@ -2708,7 +2737,542 @@ void reconcile_boards(store::Store &database, const Config &config,
   }
 }
 
+void reconcile_boards(store::Store &database, const Config &config,
+                      store::UtcEpochSeconds now) {
+  require_unique_board_declarations(config.boards);
+  if (!config.boards.empty()) {
+    write_board_declarations(database, config.boards, now);
+    return;
+  }
+  if (has_existing_boards(database)) {
+    return;
+  }
+  const std::vector declarations{
+      BoardDeclaration{.name = "general", .title = "General"}};
+  write_board_declarations(database, declarations, now);
+}
+
+class SshLibrary {
+public:
+  ~SshLibrary() {
+    if (initialized_) {
+      ssh_finalize();
+    }
+  }
+
+  SshLibrary() = default;
+  SshLibrary(const SshLibrary &) = delete;
+  auto operator=(const SshLibrary &) -> SshLibrary & = delete;
+
+  void initialize() {
+    if (ssh_init() != SSH_OK) {
+      throw std::runtime_error("libssh initialization failed");
+    }
+    initialized_ = true;
+  }
+
+private:
+  bool initialized_{};
+};
+
+[[nodiscard]] std::unique_ptr<store::SqliteStore>
+open_server_database(const Config &config) {
+  auto database = store::SqliteStore::open(config.database_path);
+  if (!database) {
+    throw std::runtime_error("cannot initialize database '" +
+                             config.database_path +
+                             "': " + database.error().detail);
+  }
+  return std::move(*database);
+}
+
+[[nodiscard]] UniqueBind create_ssh_listener(const Config &config,
+                                             std::string host_key) {
+  UniqueBind bind(ssh_bind_new());
+  if (!bind) {
+    throw std::runtime_error("cannot allocate SSH listener");
+  }
+  const auto port = std::to_string(config.port);
+  const bool configured =
+      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDADDR,
+                           config.bind_address.c_str()) == SSH_OK &&
+      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDPORT_STR,
+                           port.c_str()) == SSH_OK &&
+      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_IMPORT_KEY_STR,
+                           host_key.c_str()) == SSH_OK;
+  clear_secret(host_key.data(), host_key.size());
+  if (!configured) {
+    throw std::runtime_error("cannot configure SSH listener: " +
+                             std::string(ssh_get_error(bind.get())));
+  }
+  if (ssh_bind_listen(bind.get()) != SSH_OK) {
+    throw std::runtime_error("cannot listen on " + config.bind_address + ':' +
+                             port + ": " +
+                             std::string(ssh_get_error(bind.get())));
+  }
+  return bind;
+}
+
+[[nodiscard]] std::array<FileDescriptor, 2> create_worker_report_channel() {
+  std::array<int, 2> descriptors{};
+  if (::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                   descriptors.data()) != 0) {
+    throw_system_error("cannot create worker-report channel");
+  }
+  return {FileDescriptor(descriptors[0]), FileDescriptor(descriptors[1])};
+}
+
+[[nodiscard]] store::UtcEpochSeconds current_identity_time() {
+  return store::UtcEpochSeconds{
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count()};
+}
+
+class SupervisorRuntime {
+public:
+  explicit SupervisorRuntime(const Config &config)
+      : config_(config), tos_policy_(load_tos_policy(config)),
+        database_(open_server_database(config)),
+        admission_(config.max_sessions, config.max_sessions_per_ip,
+                   config.connection_rate, config.auth_attempt_rate,
+                   config.max_tracked_ips, config.guest_report_rate) {
+    initialize();
+  }
+
+  ~SupervisorRuntime() { shutdown_noexcept(); }
+
+  SupervisorRuntime(const SupervisorRuntime &) = delete;
+  auto operator=(const SupervisorRuntime &) -> SupervisorRuntime & = delete;
+
+  [[nodiscard]] int execute() {
+    announce();
+    while (!state_.stopping) {
+      run_iteration();
+    }
+    const auto result = state_.health_failed ? 1 : 0;
+    shutdown();
+    return result;
+  }
+
+private:
+  void initialize() {
+    purge_expired_oneliners_at_startup(*database_, config_.oneliner_policy);
+    ssh_.initialize();
+    const auto identity_time = current_identity_time();
+    import_authorized_keys(*database_, config_, identity_time);
+    reconcile_boards(*database_, config_, identity_time);
+    bind_ = create_ssh_listener(config_,
+                                load_or_create_host_key(config_.host_key_path));
+    signal_descriptor_ = configure_supervisor_signals();
+    auto worker_reports = create_worker_report_channel();
+    worker_report_receiver_ = std::move(worker_reports[0]);
+    worker_report_sender_ = std::move(worker_reports[1]);
+    initialize_health();
+    children_.reserve(config_.max_sessions);
+    scheduled_child_descriptors_ = {
+        ssh_bind_get_fd(bind_.get()), signal_descriptor_.get(),
+        worker_report_receiver_.get(), worker_report_sender_.get()};
+  }
+
+  void initialize_health() {
+    health_ = HealthMonitor::start({
+        .bind_address = config_.health_bind_address,
+        .port = config_.health_port,
+        .max_sessions = config_.max_sessions,
+        .close_in_child = {ssh_bind_get_fd(bind_.get()),
+                           signal_descriptor_.get(),
+                           worker_report_receiver_.get(),
+                           worker_report_sender_.get()},
+    });
+    health_->set_component(
+        ComponentStatus{ComponentKind::storage,
+                        ComponentState::ready,
+                        "database",
+                        std::to_string(database_->schema_version()),
+                        {}});
+    health_->set_component(ComponentStatus{
+        ComponentKind::storage, ComponentState::ready, "oneliners", "1", {}});
+    if (!config_.backup_directory.empty()) {
+      health_->set_component(ComponentStatus{ComponentKind::storage,
+                                             ComponentState::not_configured,
+                                             "backup",
+                                             "1",
+                                             {}});
+    }
+    health_->heartbeat(true);
+  }
+
+  void announce() const {
+    std::cout << "anvil: listening on " << config_.bind_address << ':'
+              << config_.port << '\n';
+    std::cout << "anvil: health listening on " << config_.health_bind_address
+              << ':' << config_.health_port << '\n';
+    if (!config_.backup_directory.empty()) {
+      std::cout << "anvil: backups enabled in " << config_.backup_directory
+                << " every " << config_.backup_interval.count()
+                << " seconds with " << config_.backup_retention.count()
+                << " seconds retention; snapshots contain user content and "
+                   "the private host key\n";
+    }
+    std::cout.flush();
+  }
+
+  void run_iteration() {
+    reap_scheduled_children();
+    start_due_children(Clock::now());
+    std::array<pollfd, 3> descriptors{{
+        {.fd = ssh_bind_get_fd(bind_.get()), .events = POLLIN, .revents = 0},
+        {.fd = worker_report_receiver_.get(), .events = POLLIN, .revents = 0},
+        {.fd = signal_descriptor_.get(), .events = POLLIN, .revents = 0},
+    }};
+    if (!poll_supervisor(descriptors)) {
+      return;
+    }
+    service_runtime_events(descriptors);
+    if (!state_.stopping && (descriptors[0].revents & POLLIN) != 0) {
+      accept_session();
+    }
+  }
+
+  [[nodiscard]] bool poll_supervisor(std::span<pollfd> descriptors) const {
+    const auto ready = ::poll(descriptors.data(), descriptors.size(), 1000);
+    if (ready < 0 && errno == EINTR) {
+      return false;
+    }
+    if (ready < 0) {
+      throw_system_error("listener poll failed");
+    }
+    return true;
+  }
+
+  void service_runtime_events(const std::array<pollfd, 3> &descriptors) {
+    service_guest_report_permits(children_, admission_);
+    health_->heartbeat(!state_.stopping);
+    if (!health_->alive()) {
+      std::cerr << "anvil: health process exited unexpectedly\n";
+      state_.health_failed = true;
+      state_.stopping = true;
+    }
+    if ((descriptors[1].revents & POLLIN) != 0) {
+      drain_worker_reports(worker_report_receiver_.get(), children_, admission_,
+                           *health_);
+    }
+    if ((descriptors[2].revents & POLLIN) != 0) {
+      service_signal_events();
+    }
+  }
+
+  void service_signal_events() {
+    if (consume_supervisor_signals(signal_descriptor_.get())) {
+      state_.stopping = true;
+    }
+    drain_worker_reports(worker_report_receiver_.get(), children_, admission_,
+                         *health_);
+    reap_children(children_, admission_, *health_);
+  }
+
+  void reap_scheduled_children() {
+    reap_scheduled_backup(state_.backup_child, *health_);
+    reap_oneliner_retention(state_.oneliner_retention_child, children_,
+                            *health_);
+  }
+
+  void start_due_children(Clock::time_point now) {
+    if (!config_.backup_directory.empty() && state_.backup_child < 0 &&
+        now >= state_.next_backup) {
+      start_backup(now);
+    }
+    if (state_.oneliner_retention_child < 0 &&
+        now >= state_.next_oneliner_retention) {
+      start_retention(now);
+    }
+  }
+
+  void start_backup(Clock::time_point now) {
+    state_.backup_child = start_scheduled_backup(
+        *database_, config_, scheduled_child_descriptors_, *health_);
+    state_.next_backup = now + config_.backup_interval;
+    if (state_.backup_child < 0) {
+      std::cerr << "anvil: cannot start scheduled backup: "
+                << std::error_code(errno, std::generic_category()).message()
+                << '\n';
+      health_->set_component(
+          ComponentStatus{ComponentKind::storage, ComponentState::failed,
+                          "backup", "1", "cannot start scheduled backup"});
+    }
+  }
+
+  void start_retention(Clock::time_point now) {
+    state_.oneliner_retention_child = start_oneliner_retention(
+        config_, scheduled_child_descriptors_, children_, *health_);
+    state_.next_oneliner_retention = now + 60s;
+    if (state_.oneliner_retention_child < 0) {
+      std::cerr << "anvil: cannot start one-liner retention: "
+                << std::error_code(errno, std::generic_category()).message()
+                << '\n';
+      health_->set_component(ComponentStatus{
+          ComponentKind::storage, ComponentState::failed, "oneliners", "1",
+          "cannot start one-liner retention"});
+    }
+  }
+
+  void accept_session() {
+    sockaddr_storage raw_peer{};
+    socklen_t raw_peer_size = sizeof(raw_peer);
+    auto *const raw_address = static_cast<void *>(&raw_peer);
+    FileDescriptor connection(::accept4(ssh_bind_get_fd(bind_.get()),
+                                        static_cast<sockaddr *>(raw_address),
+                                        &raw_peer_size, SOCK_CLOEXEC));
+    if (connection.get() < 0) {
+      report_accept_failure();
+      return;
+    }
+    const auto peer = parse_peer(raw_peer, raw_peer_size);
+    if (!peer ||
+        admission_.admit(*peer, Clock::now()) != AdmissionDecision::allowed) {
+      return;
+    }
+    prepare_session(std::move(connection), *peer);
+  }
+
+  static void report_accept_failure() {
+    if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+      std::cerr << "anvil: accept failed: "
+                << std::error_code(errno, std::generic_category()).message()
+                << '\n';
+    }
+  }
+
+  [[nodiscard]] static std::optional<PeerAddress>
+  parse_peer(const sockaddr_storage &raw_peer, socklen_t raw_peer_size) {
+    const auto raw_peer_bytes = std::as_bytes(std::span{&raw_peer, 1U});
+    if (std::cmp_greater(raw_peer_size, raw_peer_bytes.size())) {
+      return std::nullopt;
+    }
+    return PeerAddress::from_remote_bytes(
+        RemoteBytes::from_span(raw_peer_bytes.first(raw_peer_size)));
+  }
+
+  void prepare_session(FileDescriptor connection, const PeerAddress &peer) {
+    UniqueSession session(ssh_new());
+    if (!session) {
+      std::cerr << "anvil: cannot allocate SSH session\n";
+      admission_.release(peer, Clock::now());
+      return;
+    }
+    if (!accept_connection(std::move(connection), session, peer)) {
+      return;
+    }
+    spawn_session(std::move(session), peer);
+  }
+
+  [[nodiscard]] bool accept_connection(FileDescriptor connection,
+                                       const UniqueSession &session,
+                                       const PeerAddress &peer) {
+    const auto accepted_descriptor = connection.release();
+    if (ssh_bind_accept_fd(bind_.get(), session.get(), accepted_descriptor) ==
+        SSH_OK) {
+      return true;
+    }
+    std::cerr << "anvil: accept failed: " << ssh_get_error(bind_.get()) << '\n';
+    if (ssh_get_fd(session.get()) != accepted_descriptor) {
+      static_cast<void>(::close(accepted_descriptor));
+    }
+    admission_.release(peer, Clock::now());
+    return false;
+  }
+
+  void spawn_session(UniqueSession session, const PeerAddress &peer) {
+    std::array<int, 2> guest_report_descriptors{};
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
+                     guest_report_descriptors.data()) != 0) {
+      reject_session(session, peer,
+                     "cannot create guest-report permit channel");
+      return;
+    }
+    FileDescriptor guest_report_supervisor(guest_report_descriptors[0]);
+    FileDescriptor guest_report_worker(guest_report_descriptors[1]);
+    FileDescriptor oneliner_event(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (oneliner_event.get() < 0) {
+      reject_session(session, peer, "cannot create one-liner event channel");
+      return;
+    }
+    fork_session(std::move(session), peer, std::move(guest_report_supervisor),
+                 std::move(guest_report_worker), std::move(oneliner_event));
+  }
+
+  void reject_session(const UniqueSession &session, const PeerAddress &peer,
+                      std::string_view operation) {
+    std::cerr << "anvil: " << operation << ": "
+              << std::error_code(errno, std::generic_category()).message()
+              << '\n';
+    ssh_disconnect(session.get());
+    admission_.release(peer, Clock::now());
+  }
+
+  void fork_session(UniqueSession session, const PeerAddress &peer,
+                    FileDescriptor guest_report_supervisor,
+                    FileDescriptor guest_report_worker,
+                    FileDescriptor oneliner_event) {
+    const auto session_id = state_.next_session_id;
+    const auto child = ::fork();
+    if (child < 0) {
+      reject_session(session, peer, "fork failed");
+      return;
+    }
+    if (child == 0) {
+      run_session_child(std::move(session), std::move(guest_report_supervisor),
+                        std::move(guest_report_worker),
+                        std::move(oneliner_event), session_id);
+    }
+    register_session_child(std::move(session), peer, child, session_id,
+                           std::move(guest_report_supervisor),
+                           std::move(oneliner_event));
+  }
+
+  [[noreturn]] void run_session_child(UniqueSession session,
+                                      FileDescriptor guest_report_supervisor,
+                                      FileDescriptor guest_report_worker,
+                                      FileDescriptor oneliner_event,
+                                      std::uint64_t session_id) {
+    health_->detach_in_worker();
+    guest_report_supervisor = FileDescriptor();
+    for (auto &[existing_worker, existing] : children_) {
+      static_cast<void>(existing_worker);
+      existing.guest_report_permit = FileDescriptor();
+      existing.oneliner_event = FileDescriptor();
+    }
+    static_cast<void>(::close(signal_descriptor_.get()));
+    static_cast<void>(::close(worker_report_receiver_.get()));
+    bind_.reset();
+    auto worker_signal_descriptor = configure_worker_signals();
+    if (worker_signal_descriptor.get() < 0) {
+      std::_Exit(1);
+    }
+    const auto exit_status = run_session(
+        session.get(), *database_, config_, tos_policy_,
+        worker_signal_descriptor.get(), worker_report_sender_.get(),
+        guest_report_worker.get(), oneliner_event.get(), session_id);
+    ssh_disconnect(session.get());
+    session.reset();
+    std::_Exit(exit_status);
+  }
+
+  void register_session_child(UniqueSession session, const PeerAddress &peer,
+                              pid_t child, std::uint64_t session_id,
+                              FileDescriptor guest_report_supervisor,
+                              FileDescriptor oneliner_event) {
+    children_.emplace(child, ChildState{peer, session_id,
+                                        std::move(guest_report_supervisor),
+                                        std::move(oneliner_event)});
+    health_->session_started(session_id, child);
+    advance_session_id();
+    session.reset();
+  }
+
+  void advance_session_id() noexcept {
+    ++state_.next_session_id;
+    if (state_.next_session_id == 0U) {
+      state_.next_session_id = 1U;
+    }
+  }
+
+  void shutdown() noexcept {
+    if (std::exchange(shutdown_, true)) {
+      return;
+    }
+    try {
+      health_->heartbeat(false);
+    } catch (const std::exception &error) {
+      std::cerr << "anvil: cannot mark health unavailable during shutdown: "
+                << error.what() << '\n';
+    }
+    bind_.reset();
+    stop_scheduled_backup(state_.backup_child);
+    stop_oneliner_retention(state_.oneliner_retention_child);
+    try {
+      await_children(children_, signal_descriptor_.get(),
+                     worker_report_receiver_.get(), admission_, *health_);
+    } catch (const std::exception &error) {
+      std::cerr << "anvil: graceful session cleanup failed: " << error.what()
+                << '\n';
+      terminate_children(children_, SIGKILL);
+      reap_remaining_children();
+    }
+    health_->shutdown();
+  }
+
+  void reap_remaining_children() noexcept {
+    for (const auto &[child, state] : children_) {
+      static_cast<void>(state);
+      while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+      }
+    }
+    children_.clear();
+  }
+
+  void shutdown_noexcept() noexcept {
+    if (health_) {
+      shutdown();
+    }
+  }
+
+  const Config &config_;
+  TosPolicy tos_policy_;
+  std::unique_ptr<store::SqliteStore> database_;
+  SshLibrary ssh_;
+  UniqueBind bind_;
+  FileDescriptor signal_descriptor_;
+  FileDescriptor worker_report_receiver_;
+  FileDescriptor worker_report_sender_;
+  std::unique_ptr<HealthMonitor> health_;
+  AdmissionController admission_;
+  ChildMap children_;
+  SupervisorState state_;
+  std::array<int, 4> scheduled_child_descriptors_{};
+  bool shutdown_{};
+};
+
+[[nodiscard]] int restore_server(const Config &config) {
+  auto restored = backup::restore_snapshot(
+      config.restore_snapshot, config.database_path, config.host_key_path);
+  if (!restored) {
+    throw std::runtime_error("cannot restore backup: " + restored.error());
+  }
+  std::cout << "anvil: restored " << config.restore_snapshot << " to "
+            << config.database_path << " with host key " << config.host_key_path
+            << '\n';
+  return 0;
+}
+
+[[nodiscard]] int create_server_backup(const Config &config) {
+  std::error_code status_error;
+  if (!std::filesystem::is_regular_file(config.database_path, status_error) ||
+      status_error) {
+    throw std::runtime_error("database does not exist as a regular file: " +
+                             config.database_path);
+  }
+  auto database = store::SqliteStore::open(config.database_path);
+  if (!database) {
+    throw std::runtime_error("cannot open database '" + config.database_path +
+                             "': " + database.error().detail);
+  }
+  auto snapshot = backup::create_snapshot(**database, config.host_key_path,
+                                          config.backup_directory);
+  if (!snapshot) {
+    throw std::runtime_error("cannot create backup: " + snapshot.error());
+  }
+  std::cout << "anvil: created backup " << snapshot->path.string() << '\n';
+  return 0;
+}
+
 } // namespace
+
+void reconcile_configured_boards(store::Store &database, const Config &config,
+                                 store::UtcEpochSeconds now) {
+  reconcile_boards(database, config, now);
+}
 
 std::string_view usage() noexcept {
   return "usage: anvil --host-key PATH [options]\n"
@@ -2785,326 +3349,15 @@ ParseResult parse_arguments(std::span<const std::string_view> arguments) {
   return finish_argument_parsing(std::move(state));
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity, readability-function-size) -- the supervisor lifecycle centralizes fork, signal, health, and cleanup ordering
 int run(const Config &config) {
   if (config.operation == Operation::restore) {
-    auto restored = backup::restore_snapshot(
-        config.restore_snapshot, config.database_path, config.host_key_path);
-    if (!restored) {
-      throw std::runtime_error("cannot restore backup: " + restored.error());
-    }
-    std::cout << "anvil: restored " << config.restore_snapshot << " to "
-              << config.database_path << " with host key "
-              << config.host_key_path << '\n';
-    return 0;
+    return restore_server(config);
   }
-
   if (config.operation == Operation::backup_once) {
-    std::error_code status_error;
-    if (!std::filesystem::is_regular_file(config.database_path, status_error) ||
-        status_error) {
-      throw std::runtime_error("database does not exist as a regular file: " +
-                               config.database_path);
-    }
-    auto database = store::SqliteStore::open(config.database_path);
-    if (!database) {
-      throw std::runtime_error("cannot open database '" + config.database_path +
-                               "': " + database.error().detail);
-    }
-    auto snapshot = backup::create_snapshot(**database, config.host_key_path,
-                                            config.backup_directory);
-    if (!snapshot) {
-      throw std::runtime_error("cannot create backup: " + snapshot.error());
-    }
-    std::cout << "anvil: created backup " << snapshot->path.string() << '\n';
-    return 0;
+    return create_server_backup(config);
   }
-
-  const auto tos_policy = load_tos_policy(config);
-
-  auto database = store::SqliteStore::open(config.database_path);
-  if (!database) {
-    throw std::runtime_error("cannot initialize database '" +
-                             config.database_path +
-                             "': " + database.error().detail);
-  }
-  purge_expired_oneliners_at_startup(**database, config.oneliner_policy);
-
-  if (ssh_init() != SSH_OK) {
-    throw std::runtime_error("libssh initialization failed");
-  }
-  struct FinalizeSsh {
-    ~FinalizeSsh() { ssh_finalize(); }
-  } finalize_ssh;
-
-  const auto identity_time = store::UtcEpochSeconds{
-      std::chrono::duration_cast<std::chrono::seconds>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count()};
-  import_authorized_keys(**database, config, identity_time);
-  reconcile_boards(**database, config, identity_time);
-  auto host_key = load_or_create_host_key(config.host_key_path);
-
-  UniqueBind bind(ssh_bind_new());
-  if (!bind) {
-    throw std::runtime_error("cannot allocate SSH listener");
-  }
-  const auto port = std::to_string(config.port);
-  const bool configured =
-      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDADDR,
-                           config.bind_address.c_str()) == SSH_OK &&
-      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_BINDPORT_STR,
-                           port.c_str()) == SSH_OK &&
-      ssh_bind_options_set(bind.get(), SSH_BIND_OPTIONS_IMPORT_KEY_STR,
-                           host_key.c_str()) == SSH_OK;
-  clear_secret(host_key.data(), host_key.size());
-  if (!configured) {
-    throw std::runtime_error("cannot configure SSH listener: " +
-                             std::string(ssh_get_error(bind.get())));
-  }
-  if (ssh_bind_listen(bind.get()) != SSH_OK) {
-    throw std::runtime_error("cannot listen on " + config.bind_address + ':' +
-                             port + ": " +
-                             std::string(ssh_get_error(bind.get())));
-  }
-
-  auto signal_descriptor = configure_supervisor_signals();
-
-  std::array<int, 2> worker_report_descriptors{};
-  if (::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
-                   worker_report_descriptors.data()) != 0) {
-    throw_system_error("cannot create worker-report channel");
-  }
-  FileDescriptor worker_report_receiver(worker_report_descriptors[0]);
-  FileDescriptor worker_report_sender(worker_report_descriptors[1]);
-
-  auto health = HealthMonitor::start(HealthMonitor::Config{
-      config.health_bind_address,
-      config.health_port,
-      config.max_sessions,
-      {ssh_bind_get_fd(bind.get()), signal_descriptor.get(),
-       worker_report_receiver.get(), worker_report_sender.get()},
-  });
-  health->set_component(
-      ComponentStatus{ComponentKind::storage,
-                      ComponentState::ready,
-                      "database",
-                      std::to_string((*database)->schema_version()),
-                      {}});
-  health->set_component(ComponentStatus{
-      ComponentKind::storage, ComponentState::ready, "oneliners", "1", {}});
-  if (!config.backup_directory.empty()) {
-    health->set_component(ComponentStatus{ComponentKind::storage,
-                                          ComponentState::not_configured,
-                                          "backup",
-                                          "1",
-                                          {}});
-  }
-  health->heartbeat(true);
-
-  AdmissionController admission(
-      config.max_sessions, config.max_sessions_per_ip, config.connection_rate,
-      config.auth_attempt_rate, config.max_tracked_ips,
-      config.guest_report_rate);
-  ChildMap children;
-  children.reserve(config.max_sessions);
-  SupervisorState supervisor;
-  const std::array scheduled_child_descriptors{
-      ssh_bind_get_fd(bind.get()), signal_descriptor.get(),
-      worker_report_receiver.get(), worker_report_sender.get()};
-
-  std::cout << "anvil: listening on " << config.bind_address << ':'
-            << config.port << '\n';
-  std::cout << "anvil: health listening on " << config.health_bind_address
-            << ':' << config.health_port << '\n';
-  if (!config.backup_directory.empty()) {
-    std::cout << "anvil: backups enabled in " << config.backup_directory
-              << " every " << config.backup_interval.count() << " seconds with "
-              << config.backup_retention.count()
-              << " seconds retention; snapshots contain user content and the "
-                 "private host key\n";
-  }
-  std::cout.flush();
-
-  while (!supervisor.stopping) {
-    reap_scheduled_backup(supervisor.backup_child, *health);
-    reap_oneliner_retention(supervisor.oneliner_retention_child, children,
-                            *health);
-    const auto now = Clock::now();
-    if (!config.backup_directory.empty() && supervisor.backup_child < 0 &&
-        now >= supervisor.next_backup) {
-      supervisor.backup_child = start_scheduled_backup(
-          **database, config, scheduled_child_descriptors, *health);
-      supervisor.next_backup = now + config.backup_interval;
-      if (supervisor.backup_child < 0) {
-        std::cerr << "anvil: cannot start scheduled backup: "
-                  << std::strerror(errno) << '\n';
-        health->set_component(
-            ComponentStatus{ComponentKind::storage, ComponentState::failed,
-                            "backup", "1", "cannot start scheduled backup"});
-      }
-    }
-    if (supervisor.oneliner_retention_child < 0 &&
-        now >= supervisor.next_oneliner_retention) {
-      supervisor.oneliner_retention_child = start_oneliner_retention(
-          config, scheduled_child_descriptors, children, *health);
-      supervisor.next_oneliner_retention = now + 60s;
-      if (supervisor.oneliner_retention_child < 0) {
-        std::cerr << "anvil: cannot start one-liner retention: "
-                  << std::strerror(errno) << '\n';
-        health->set_component(ComponentStatus{
-            ComponentKind::storage, ComponentState::failed, "oneliners", "1",
-            "cannot start one-liner retention"});
-      }
-    }
-    std::array<pollfd, 3> descriptors{{
-        {.fd = ssh_bind_get_fd(bind.get()), .events = POLLIN, .revents = 0},
-        {.fd = worker_report_receiver.get(), .events = POLLIN, .revents = 0},
-        {.fd = signal_descriptor.get(), .events = POLLIN, .revents = 0},
-    }};
-    const auto ready = ::poll(descriptors.data(), descriptors.size(), 1000);
-    if (ready < 0 && errno == EINTR) {
-      continue;
-    }
-    if (ready < 0) {
-      throw_system_error("listener poll failed");
-    }
-
-    service_guest_report_permits(children, admission);
-    health->heartbeat(!supervisor.stopping);
-    if (!health->alive()) {
-      std::cerr << "anvil: health process exited unexpectedly\n";
-      supervisor.health_failed = true;
-      supervisor.stopping = true;
-    }
-
-    if ((descriptors[1].revents & POLLIN) != 0) {
-      drain_worker_reports(worker_report_receiver.get(), children, admission,
-                           *health);
-    }
-    if ((descriptors[2].revents & POLLIN) != 0) {
-      if (consume_supervisor_signals(signal_descriptor.get())) {
-        supervisor.stopping = true;
-      }
-      drain_worker_reports(worker_report_receiver.get(), children, admission,
-                           *health);
-      reap_children(children, admission, *health);
-    }
-    if (supervisor.stopping || (descriptors[0].revents & POLLIN) == 0) {
-      continue;
-    }
-
-    sockaddr_storage raw_peer{};
-    socklen_t raw_peer_size = sizeof(raw_peer);
-    FileDescriptor connection(::accept4(ssh_bind_get_fd(bind.get()),
-                                        reinterpret_cast<sockaddr *>(&raw_peer),
-                                        &raw_peer_size, SOCK_CLOEXEC));
-    if (connection.get() < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-        continue;
-      }
-      std::cerr << "anvil: accept failed: " << std::strerror(errno) << '\n';
-      continue;
-    }
-    const auto raw_peer_bytes = std::as_bytes(std::span{&raw_peer, 1U});
-    const auto peer =
-        raw_peer_size <= raw_peer_bytes.size()
-            ? PeerAddress::from_remote_bytes(
-                  RemoteBytes::from_span(raw_peer_bytes.first(raw_peer_size)))
-            : std::nullopt;
-    if (!peer ||
-        admission.admit(*peer, Clock::now()) != AdmissionDecision::allowed) {
-      continue;
-    }
-
-    UniqueSession session(ssh_new());
-    if (!session) {
-      std::cerr << "anvil: cannot allocate SSH session\n";
-      admission.release(*peer, Clock::now());
-      continue;
-    }
-    const auto accepted_descriptor = connection.release();
-    if (ssh_bind_accept_fd(bind.get(), session.get(), accepted_descriptor) !=
-        SSH_OK) {
-      std::cerr << "anvil: accept failed: " << ssh_get_error(bind.get())
-                << '\n';
-      if (ssh_get_fd(session.get()) != accepted_descriptor) {
-        static_cast<void>(::close(accepted_descriptor));
-      }
-      admission.release(*peer, Clock::now());
-      continue;
-    }
-
-    const auto session_id = supervisor.next_session_id;
-    std::array<int, 2> guest_report_descriptors{};
-    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0,
-                     guest_report_descriptors.data()) != 0) {
-      std::cerr << "anvil: cannot create guest-report permit channel: "
-                << std::strerror(errno) << '\n';
-      ssh_disconnect(session.get());
-      admission.release(*peer, Clock::now());
-      continue;
-    }
-    FileDescriptor guest_report_supervisor(guest_report_descriptors[0]);
-    FileDescriptor guest_report_worker(guest_report_descriptors[1]);
-    FileDescriptor oneliner_event(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
-    if (oneliner_event.get() < 0) {
-      std::cerr << "anvil: cannot create one-liner event channel: "
-                << std::strerror(errno) << '\n';
-      ssh_disconnect(session.get());
-      admission.release(*peer, Clock::now());
-      continue;
-    }
-    const auto child = ::fork();
-    if (child < 0) {
-      std::cerr << "anvil: fork failed: " << std::strerror(errno) << '\n';
-      ssh_disconnect(session.get());
-      admission.release(*peer, Clock::now());
-      continue;
-    }
-    if (child == 0) {
-      health->detach_in_worker();
-      guest_report_supervisor = FileDescriptor();
-      for (auto &[existing_worker, existing] : children) {
-        static_cast<void>(existing_worker);
-        existing.guest_report_permit = FileDescriptor();
-        existing.oneliner_event = FileDescriptor();
-      }
-      static_cast<void>(::close(signal_descriptor.get()));
-      static_cast<void>(::close(worker_report_receiver.get()));
-      bind.reset();
-      auto worker_signal_descriptor = configure_worker_signals();
-      if (worker_signal_descriptor.get() < 0) {
-        std::_Exit(1);
-      }
-      const auto exit_status = run_session(
-          session.get(), **database, config, tos_policy,
-          worker_signal_descriptor.get(), worker_report_sender.get(),
-          guest_report_worker.get(), oneliner_event.get(), session_id);
-      ssh_disconnect(session.get());
-      session.reset();
-      std::_Exit(exit_status);
-    }
-    guest_report_worker = FileDescriptor();
-    children.emplace(child, ChildState{*peer, session_id,
-                                       std::move(guest_report_supervisor),
-                                       std::move(oneliner_event)});
-    health->session_started(session_id, child);
-    ++supervisor.next_session_id;
-    if (supervisor.next_session_id == 0U) {
-      supervisor.next_session_id = 1U;
-    }
-    session.reset();
-  }
-
-  health->heartbeat(false);
-  bind.reset();
-  stop_scheduled_backup(supervisor.backup_child);
-  stop_oneliner_retention(supervisor.oneliner_retention_child);
-  await_children(children, signal_descriptor.get(),
-                 worker_report_receiver.get(), admission, *health);
-  health->shutdown();
-  return supervisor.health_failed ? 1 : 0;
+  SupervisorRuntime supervisor(config);
+  return supervisor.execute();
 }
 
 } // namespace anvil::server
