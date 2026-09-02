@@ -249,6 +249,7 @@ if(ANVIL_SERVER)
     test_canonical_message.cpp
     test_health.cpp
     test_remote_bytes.cpp
+    test_session_sink.cpp
     test_session_resources.cpp
     test_server.cpp
     test_sqlite_store.cpp
@@ -259,6 +260,7 @@ if(ANVIL_SERVER)
   target_link_libraries(anvil_server_tests
     PRIVATE anvil_server
     PRIVATE anvil::store
+    PRIVATE termforge::lib
     PRIVATE Catch2::Catch2WithMain
   )
   catch_discover_tests(anvil_server_tests)

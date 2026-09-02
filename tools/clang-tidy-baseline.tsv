@@ -121,5 +121,4 @@ src/terminal_session.cpp	modernize-deprecated-headers	8745e490e9f233b715d4	inclu
 src/terminal_session.cpp	modernize-use-integer-sign-comparison	0071638a91c54ad8358e	comparison between 'signed' and 'unsigned' integers
 src/terminal_session.cpp	modernize-use-integer-sign-comparison	d38b00cbbaf875213411	comparison between 'signed' and 'unsigned' integers
 src/terminal_session.cpp	readability-math-missing-parentheses	e7db59d3d6f5a644f0d3	'*' has higher precedence than '+'; add parentheses to explicitly specify the order of operations
-src/terminal_session.cpp	readability-simplify-boolean-expr	0645c54a9fdc1d29814f	boolean expression can be simplified by DeMorgan's theorem
 src/text_sanitization.cpp	cppcoreguidelines-pro-type-reinterpret-cast	48cc523c4243333f2ebe	do not use reinterpret_cast

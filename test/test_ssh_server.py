@@ -194,6 +194,91 @@ def read_until(process: subprocess.Popen[bytes], needle: bytes,
     raise AssertionError(f"did not observe {needle!r}; output={bytes(output)!r}")
 
 
+def read_screen_change(process: subprocess.Popen[bytes], timeout: float = 10) -> bytes:
+    assert process.stdout is not None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([process.stdout], [], [], 0.1)
+        if readable:
+            output = os.read(process.stdout.fileno(), 65536)
+            if output:
+                return output
+        if process.poll() is not None:
+            break
+    raise AssertionError("terminal screen did not change")
+
+
+def send_input(process: subprocess.Popen[bytes], payload: bytes) -> None:
+    assert process.stdin is not None
+    process.stdin.write(payload)
+    process.stdin.flush()
+
+
+def stop_interactive_session(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            send_input(process, b"\x03")
+        except (BrokenPipeError, ValueError):
+            pass
+    process.communicate(timeout=10)
+
+
+def exercise_oneliner_detail(base: list[str]) -> None:
+    process = subprocess.Popen(
+        base + ["-tt"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        read_until(process, b"Signed in as tester")
+        send_input(process, b"\t\n")
+        detail = read_until(process, b" detail")
+        assert b"detail" in detail and b"Esc b" in detail, detail
+        assert b"@tester" in detail, detail
+        send_input(process, b"\x1b")
+        read_until(process, b"Boards - Tab")
+        send_input(process, b"\x1b")
+        process.communicate(timeout=10)
+        assert process.returncode == 0, process.returncode
+    finally:
+        if process.poll() is None:
+            stop_interactive_session(process)
+
+
+def exercise_screen_navigation(base: list[str]) -> None:
+    process = subprocess.Popen(
+        base + ["-tt"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        read_until(process, b"Signed in as tester")
+        send_input(process, b"\n")
+        read_screen_change(process)
+        send_input(process, b"n")
+        read_until(process, b"thread subject")
+        send_input(process, b"\x1b")
+        read_screen_change(process)
+        send_input(process, b"\n")
+        read_until(process, b"reply, q")
+        send_input(process, b"r")
+        read_until(process, b"Post body")
+        send_input(process, b"\x1b")
+        read_screen_change(process)
+        send_input(process, b"\n!")
+        read_until(process, b"t reason")
+        send_input(process, b"\x1b")
+        read_until(process, b"reply, q")
+        send_input(process, b"\x1b")
+        read_screen_change(process)
+        send_input(process, b"\x1b")
+        read_until(process, b"Boards - Tab")
+        send_input(process, b"\x1b")
+        process.communicate(timeout=10)
+        assert process.returncode == 0, process.returncode
+    finally:
+        if process.poll() is None:
+            stop_interactive_session(process)
+
+
 def assert_shell(result: subprocess.CompletedProcess[bytes], own: bytes,
                  foreign: bytes | None = None) -> int:
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
@@ -396,6 +481,7 @@ def main() -> int:
             )
             assert wall_report.returncode == 0, wall_report
             assert b"Report submitted" in wall_report.stdout, wall_report.stdout
+            exercise_oneliner_detail(base)
 
             issued = shell_session(base, b"/invite\n\x1b")
             assert issued.returncode == 0, issued
@@ -438,6 +524,7 @@ def main() -> int:
             reported = shell_session(base, b"\n\n!Needs review\n\x1b\x1b")
             assert reported.returncode == 0, reported
             assert b"Report submitted" in reported.stdout, reported.stdout
+            exercise_screen_navigation(base)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 alpha_future = executor.submit(shell_session, base, b"alpha-only\n")
