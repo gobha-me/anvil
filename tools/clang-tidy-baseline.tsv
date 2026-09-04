@@ -23,10 +23,7 @@ src/backup.cpp	cppcoreguidelines-pro-type-vararg	a840e96ac89518f472f6	do not cal
 src/backup.cpp	cppcoreguidelines-pro-type-vararg	b90034bc79a6ec254f21	do not call c-style vararg functions
 src/backup.cpp	cppcoreguidelines-pro-type-vararg	cb8bd701a110b50b073a	do not call c-style vararg functions
 src/backup.cpp	cppcoreguidelines-pro-type-vararg	eb8171d7999ea724a660	do not call c-style vararg functions
-src/backup.cpp	modernize-use-integer-sign-comparison	2ceaaaf42835c2edd4b5	comparison between 'signed' and 'unsigned' integers
 src/backup.cpp	modernize-use-integer-sign-comparison	430a2adc52d8e55d4008	comparison between 'signed' and 'unsigned' integers
-src/backup.cpp	modernize-use-integer-sign-comparison	4d4a755e137d2d9997aa	comparison between 'signed' and 'unsigned' integers
-src/backup.cpp	modernize-use-integer-sign-comparison	d497caa8b31ea26e62f0	comparison between 'signed' and 'unsigned' integers
 src/health.cpp	bugprone-suspicious-stringview-data-usage	032eb93c2a8c819aa4af	result of a `data()` call may not be null terminated, provide size information to the callee to prevent potential issues
 src/health.cpp	concurrency-mt-unsafe	26902c0c2f68a914fa08	function is not thread safe
 src/health.cpp	cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays	0297c9ab493650c08d42	do not declare C-style arrays, use 'std::array' instead

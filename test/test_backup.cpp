@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 #include <sys/stat.h>
@@ -111,6 +112,16 @@ void seed_board(SqliteStore &store) {
     }
   }
   return count;
+}
+
+[[nodiscard]] auto has_entry_with_prefix(const std::filesystem::path &directory,
+                                         std::string_view prefix) -> bool {
+  for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+    if (entry.path().filename().string().starts_with(prefix)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace
@@ -235,4 +246,99 @@ TEST_CASE("backup paths and restore targets fail closed") {
   REQUIRE(std::filesystem::is_symlink(linked));
   CHECK_FALSE(create_snapshot(**database, host_key, linked,
                               std::chrono::system_clock::time_point{20s}));
+}
+
+TEST_CASE("failed snapshot validation removes its temporary directory") {
+  TemporaryState state;
+  const auto database_path = state.path("live.db");
+  const auto host_key = state.path("invalid_host_key");
+  const auto backups = state.path("backups");
+  {
+    std::ofstream output(host_key);
+    output << "not a private key";
+  }
+  REQUIRE(::chmod(host_key.c_str(), S_IRUSR | S_IWUSR) == 0);
+  auto database = SqliteStore::open(database_path);
+  REQUIRE(database.has_value());
+
+  const auto snapshot =
+      create_snapshot(**database, host_key, backups,
+                      std::chrono::system_clock::time_point{10s});
+  REQUIRE_FALSE(snapshot.has_value());
+  CHECK(snapshot.error() == "backup contains an invalid private host key");
+  CHECK(std::filesystem::is_empty(backups));
+}
+
+TEST_CASE("host-key restore rejects symlinks and removes target temporaries") {
+  TemporaryState state;
+  const auto database_path = state.path("live.db");
+  const auto host_key = state.path("live_host_key");
+  const auto backups = state.path("backups");
+  write_host_key(host_key);
+  auto database = SqliteStore::open(database_path);
+  REQUIRE(database.has_value());
+  auto snapshot = create_snapshot(**database, host_key, backups,
+                                  std::chrono::system_clock::time_point{10s});
+  REQUIRE(snapshot.has_value());
+
+  REQUIRE(std::filesystem::remove(snapshot->path / "host_key"));
+  std::filesystem::create_symlink(host_key, snapshot->path / "host_key");
+  const auto restored_database = state.path("restored.db");
+  const auto restored_key = state.path("restored_key");
+  const auto restored =
+      restore_snapshot(snapshot->path, restored_database, restored_key);
+  REQUIRE_FALSE(restored.has_value());
+  CHECK(restored.error().starts_with("cannot open host key:"));
+  CHECK_FALSE(std::filesystem::exists(restored_database));
+  CHECK_FALSE(std::filesystem::exists(restored_key));
+  CHECK_FALSE(
+      has_entry_with_prefix(state.path("."), ".restored.db.restore-tmp-"));
+  CHECK_FALSE(
+      has_entry_with_prefix(state.path("."), ".restored_key.restore-tmp-"));
+}
+
+TEST_CASE("pruning fails closed when an expired snapshot cannot be emptied") {
+  TemporaryState state;
+  const auto database_path = state.path("live.db");
+  const auto host_key = state.path("live_host_key");
+  const auto backups = state.path("backups");
+  const auto outside = state.path("outside");
+  write_host_key(host_key);
+  auto database = SqliteStore::open(database_path);
+  REQUIRE(database.has_value());
+  auto expired = create_snapshot(**database, host_key, backups,
+                                 std::chrono::system_clock::time_point{10s});
+  REQUIRE(expired.has_value());
+  auto newest = create_snapshot(**database, host_key, backups,
+                                std::chrono::system_clock::time_point{30s});
+  REQUIRE(newest.has_value());
+
+  {
+    std::ofstream extra(expired->path / "operator-owned");
+    extra << "preserve me";
+  }
+  std::filesystem::create_directory(outside);
+  {
+    std::ofstream sentinel(outside / "sentinel");
+    sentinel << "outside";
+  }
+  const auto hostile_link = backups / "anvil-backup-hostile-link";
+  std::filesystem::create_directory_symlink(outside, hostile_link);
+  const auto incomplete = backups / "anvil-backup-incomplete";
+  std::filesystem::create_directory(incomplete);
+
+  const auto pruned = prune_snapshots(
+      backups, 10s, std::chrono::system_clock::time_point{100s});
+  REQUIRE_FALSE(pruned.has_value());
+  CHECK(pruned.error() == "cannot remove expired backup safely: " +
+                              expired->path.filename().string());
+  CHECK(std::filesystem::is_directory(expired->path));
+  CHECK(read_bytes(expired->path / "operator-owned") == "preserve me");
+  CHECK_FALSE(std::filesystem::exists(expired->path / "anvil.db"));
+  CHECK_FALSE(std::filesystem::exists(expired->path / "host_key"));
+  CHECK_FALSE(std::filesystem::exists(expired->path / "manifest"));
+  CHECK(std::filesystem::exists(newest->path));
+  CHECK(std::filesystem::is_symlink(hostile_link));
+  CHECK(read_bytes(outside / "sentinel") == "outside");
+  CHECK(std::filesystem::is_directory(incomplete));
 }
