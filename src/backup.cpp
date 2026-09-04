@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <sys/random.h>
@@ -217,7 +218,68 @@ void remove_fixed_snapshot(int parent, std::string_view name) noexcept {
   static_cast<void>(::unlinkat(parent, directory_name.c_str(), AT_REMOVEDIR));
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- security-sensitive syscall failures stay adjacent to their cleanup
+[[nodiscard]] auto
+validate_host_key_metadata(const std::filesystem::path &source,
+                           const struct stat &metadata)
+    -> std::expected<void, std::string> {
+  if (!S_ISREG(metadata.st_mode) || metadata.st_size <= 0 ||
+      std::cmp_greater(metadata.st_size, max_host_key_size)) {
+    return std::unexpected("host key has an invalid type or size: " +
+                           source.string());
+  }
+  if ((metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    return std::unexpected(
+        "host key must not be accessible by group or others: " +
+        source.string());
+  }
+  return {};
+}
+
+[[nodiscard]] auto write_host_key_chunk(int output,
+                                        std::span<const char> contents)
+    -> std::expected<void, std::string> {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto written = ::write(output, contents.subspan(offset).data(),
+                                 contents.size() - offset);
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written <= 0) {
+      return std::unexpected(system_message("cannot write host-key backup"));
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+  return {};
+}
+
+[[nodiscard]] auto copy_host_key_contents(int input, int output)
+    -> std::expected<std::uintmax_t, std::string> {
+  std::array<char, 4096> buffer{};
+  std::uintmax_t copied = 0;
+  for (;;) {
+    const auto count = ::read(input, buffer.data(), buffer.size());
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      return std::unexpected(system_message("cannot read host key"));
+    }
+    if (count == 0) {
+      return copied;
+    }
+    copied += static_cast<std::uintmax_t>(count);
+    if (copied > max_host_key_size) {
+      return std::unexpected("host key changed while it was backed up");
+    }
+    const auto contents =
+        std::span(buffer).first(static_cast<std::size_t>(count));
+    if (auto written = write_host_key_chunk(output, contents); !written) {
+      return std::unexpected(written.error());
+    }
+  }
+}
+
 [[nodiscard]] auto copy_host_key(const std::filesystem::path &source,
                                  int destination_directory,
                                  std::string_view destination_name)
@@ -231,15 +293,8 @@ void remove_fixed_snapshot(int parent, std::string_view name) noexcept {
   if (::fstat(input.get(), &metadata) != 0) {
     return std::unexpected(system_message("cannot inspect host key"));
   }
-  if (!S_ISREG(metadata.st_mode) || metadata.st_size <= 0 ||
-      static_cast<std::uintmax_t>(metadata.st_size) > max_host_key_size) {
-    return std::unexpected("host key has an invalid type or size: " +
-                           source.string());
-  }
-  if ((metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-    return std::unexpected(
-        "host key must not be accessible by group or others: " +
-        source.string());
+  if (auto valid = validate_host_key_metadata(source, metadata); !valid) {
+    return valid;
   }
 
   const std::string output_name(destination_name);
@@ -249,37 +304,11 @@ void remove_fixed_snapshot(int parent, std::string_view name) noexcept {
   if (output.get() < 0) {
     return std::unexpected(system_message("cannot create host-key backup"));
   }
-  std::array<char, 4096> buffer{};
-  std::uintmax_t copied = 0;
-  for (;;) {
-    const auto count = ::read(input.get(), buffer.data(), buffer.size());
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count < 0) {
-      return std::unexpected(system_message("cannot read host key"));
-    }
-    if (count == 0) {
-      break;
-    }
-    copied += static_cast<std::uintmax_t>(count);
-    if (copied > max_host_key_size) {
-      return std::unexpected("host key changed while it was backed up");
-    }
-    std::size_t offset = 0;
-    while (offset < static_cast<std::size_t>(count)) {
-      const auto written = ::write(output.get(), buffer.data() + offset,
-                                   static_cast<std::size_t>(count) - offset);
-      if (written < 0 && errno == EINTR) {
-        continue;
-      }
-      if (written <= 0) {
-        return std::unexpected(system_message("cannot write host-key backup"));
-      }
-      offset += static_cast<std::size_t>(written);
-    }
+  auto copied = copy_host_key_contents(input.get(), output.get());
+  if (!copied) {
+    return std::unexpected(copied.error());
   }
-  if (copied != static_cast<std::uintmax_t>(metadata.st_size)) {
+  if (std::cmp_not_equal(*copied, metadata.st_size)) {
     return std::unexpected("host key changed while it was backed up");
   }
   if (::fsync(output.get()) != 0) {
@@ -312,6 +341,82 @@ void remove_fixed_snapshot(int parent, std::string_view name) noexcept {
     return std::unexpected("backup manifest has an invalid creation time");
   }
   return timestamp;
+}
+
+using SnapshotRecord = std::pair<std::string, std::int64_t>;
+
+[[nodiscard]] auto open_directory_listing(int directory)
+    -> std::expected<Directory, std::string> {
+  Descriptor duplicate(::dup(directory));
+  if (duplicate.get() < 0) {
+    return std::unexpected(system_message("cannot scan backup directory"));
+  }
+  Directory entries(::fdopendir(duplicate.get()));
+  if (!entries) {
+    return std::unexpected(system_message("cannot scan backup directory"));
+  }
+  static_cast<void>(duplicate.release());
+  return entries;
+}
+
+[[nodiscard]] auto collect_snapshots(const Descriptor *root, Directory &entries)
+    -> std::expected<std::vector<SnapshotRecord>, std::string> {
+  std::vector<SnapshotRecord> snapshots;
+  for (;;) {
+    errno = 0;
+    const auto *entry = ::readdir(entries.get());
+    if (entry == nullptr) {
+      if (errno != 0) {
+        return std::unexpected(system_message("cannot read backup directory"));
+      }
+      return snapshots;
+    }
+    const std::string_view name(entry->d_name);
+    if (!name.starts_with(snapshot_prefix)) {
+      continue;
+    }
+    Descriptor snapshot(
+        ::openat(root->get(), entry->d_name,
+                 O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW));
+    if (snapshot.get() < 0) {
+      continue;
+    }
+    auto created = parse_manifest(snapshot.get());
+    if (created) {
+      snapshots.emplace_back(name, *created);
+    }
+  }
+}
+
+[[nodiscard]] auto remove_expired_snapshot(int root, std::string_view name)
+    -> std::expected<void, std::string> {
+  remove_fixed_snapshot(root, name);
+  struct stat remaining{};
+  const std::string filename(name);
+  if (::fstatat(root, filename.c_str(), &remaining, AT_SYMLINK_NOFOLLOW) == 0 ||
+      errno != ENOENT) {
+    return std::unexpected("cannot remove expired backup safely: " + filename);
+  }
+  return {};
+}
+
+[[nodiscard]] auto
+prune_expired_snapshots(int root, const std::vector<SnapshotRecord> &snapshots,
+                        std::int64_t cutoff)
+    -> std::expected<void, std::string> {
+  const auto newest = std::max_element(snapshots.begin(), snapshots.end(),
+                                       [](const auto &left, const auto &right) {
+                                         return left.second < right.second;
+                                       });
+  for (const auto &[name, created] : snapshots) {
+    if (created >= cutoff || name == newest->first) {
+      continue;
+    }
+    if (auto removed = remove_expired_snapshot(root, name); !removed) {
+      return removed;
+    }
+  }
+  return {};
 }
 
 [[nodiscard]] auto validate_private_regular_file(int directory,
@@ -465,7 +570,6 @@ auto create_snapshot(store::SqliteStore &database,
   return Snapshot{backup_directory / final_name, now};
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- fail-closed directory walking keeps every retention check explicit
 auto prune_snapshots(const std::filesystem::path &backup_directory,
                      std::chrono::seconds retention,
                      std::chrono::system_clock::time_point now)
@@ -477,63 +581,24 @@ auto prune_snapshots(const std::filesystem::path &backup_directory,
   if (!root) {
     return std::unexpected(root.error());
   }
-  const auto duplicate = ::dup(root->get());
-  if (duplicate < 0) {
-    return std::unexpected(system_message("cannot scan backup directory"));
-  }
-  Directory entries(::fdopendir(duplicate));
+  auto entries = open_directory_listing(root->get());
   if (!entries) {
-    static_cast<void>(::close(duplicate));
-    return std::unexpected(system_message("cannot scan backup directory"));
+    return std::unexpected(entries.error());
   }
-
-  std::vector<std::pair<std::string, std::int64_t>> snapshots;
-  for (;;) {
-    errno = 0;
-    const auto *entry = ::readdir(entries.get());
-    if (entry == nullptr) {
-      if (errno != 0) {
-        return std::unexpected(system_message("cannot read backup directory"));
-      }
-      break;
-    }
-    const std::string_view name(entry->d_name);
-    if (!name.starts_with(snapshot_prefix)) {
-      continue;
-    }
-    Descriptor snapshot(
-        ::openat(root->get(), entry->d_name,
-                 O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW));
-    if (snapshot.get() < 0) {
-      continue;
-    }
-    auto created = parse_manifest(snapshot.get());
-    if (created) {
-      snapshots.emplace_back(name, *created);
-    }
+  auto snapshots = collect_snapshots(&*root, *entries);
+  if (!snapshots) {
+    return std::unexpected(snapshots.error());
   }
-  if (snapshots.empty()) {
+  if (snapshots->empty()) {
     return {};
   }
-  const auto newest = std::max_element(snapshots.begin(), snapshots.end(),
-                                       [](const auto &left, const auto &right) {
-                                         return left.second < right.second;
-                                       });
   const auto cutoff =
       std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch())
           .count() -
       retention.count();
-  for (const auto &[name, created] : snapshots) {
-    if (created >= cutoff || name == newest->first) {
-      continue;
-    }
-    remove_fixed_snapshot(root->get(), name);
-    struct stat remaining{};
-    if (::fstatat(root->get(), name.c_str(), &remaining, AT_SYMLINK_NOFOLLOW) ==
-            0 ||
-        errno != ENOENT) {
-      return std::unexpected("cannot remove expired backup safely: " + name);
-    }
+  if (auto pruned = prune_expired_snapshots(root->get(), *snapshots, cutoff);
+      !pruned) {
+    return pruned;
   }
   if (::fsync(root->get()) != 0) {
     return std::unexpected(

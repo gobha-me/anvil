@@ -1,4 +1,5 @@
 #include <anvil/store.hpp>
+#include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <expected>
 #include <optional>
@@ -572,6 +573,66 @@ TEST_CASE("TOS acceptance rejects invalid identities and rolls back failures") {
   failed->rollback();
   CHECK(store.user_status("alice") == UserStatus::pending);
   CHECK_FALSE(store.tos_acceptance_time("alice", "v1").has_value());
+}
+
+TEST_CASE(
+    "TOS versions accept Unicode boundaries and reject every unsafe class") {
+  anvil::testing::MemoryStore store;
+  auto transaction = store.begin(TransactionMode::read_only);
+  REQUIRE(transaction.has_value());
+
+  const std::array valid{
+      std::string{"v1"},
+      std::string{"\xc2\xa0", 2},
+      std::string{"\xe0\xa0\x80", 3},
+      std::string{"\xed\x9f\xbf", 3},
+      std::string{"\xee\x80\x80", 3},
+      std::string{"\xf0\x90\x80\x80", 4},
+      std::string{"\xf4\x8f\xbf\xbf", 4},
+      std::string(128, 'a'),
+  };
+  for (const auto &version : valid) {
+    INFO("valid TOS version size: " << version.size());
+    const auto accepted =
+        store.has_tos_acceptance(*transaction, "alice", version);
+    REQUIRE(accepted.has_value());
+    CHECK_FALSE(*accepted);
+  }
+
+  const std::array invalid{
+      std::string{},
+      std::string(129, 'a'),
+      std::string{"bad\0version", 11},
+      std::string{"\x1f", 1},
+      std::string{"\x7f", 1},
+      std::string{"\xc2\x80", 2},
+      std::string{"\xc2\x9f", 2},
+      std::string{"\x80", 1},
+      std::string{"\xc0\x80", 2},
+      std::string{"\xc1\xbf", 2},
+      std::string{"\xc2", 1},
+      std::string{"\xc2\x20", 2},
+      std::string{"\xe0\x9f\xbf", 3},
+      std::string{"\xe1\x80", 2},
+      std::string{"\xe1\x80\x20", 3},
+      std::string{"\xed\xa0\x80", 3},
+      std::string{"\xf0\x8f\xbf\xbf", 4},
+      std::string{"\xf0\x90\x80", 3},
+      std::string{"\xf1\x80\x80\x20", 4},
+      std::string{"\xf4\x90\x80\x80", 4},
+      std::string{"\xf5\x80\x80\x80", 4},
+      std::string{"\xff", 1},
+  };
+  for (const auto &version : invalid) {
+    INFO("invalid TOS version size: " << version.size());
+    const auto rejected =
+        store.has_tos_acceptance(*transaction, "alice", version);
+    REQUIRE_FALSE(rejected.has_value());
+    CHECK(rejected.error().code == ErrorCode::invalid_data);
+    CHECK(rejected.error().detail ==
+          "TOS version must contain 1 to 128 bytes of valid UTF-8 and no "
+          "controls");
+  }
 }
 
 TEST_CASE("invite economics consume, cap, and regenerate atomic credits") {

@@ -248,11 +248,21 @@ TEST_CASE("every user text field has an enforced grapheme and byte cap") {
 TEST_CASE("ingest rejects every malformed UTF-8 class before sanitizing") {
   const std::array malformed{
       std::string{"\xc0\x9b", 2},
+      std::string{"\xc1\xbf", 2},
+      std::string{"\xc2", 1},
+      std::string{"\xc2\x20", 2},
+      std::string{"\xe0\x9f\xbf", 3},
+      std::string{"\xe1\x80", 2},
+      std::string{"\xe1\x80\x20", 3},
       std::string{"\xed\xa0\x80", 3},
+      std::string{"\xf0\x8f\xbf\xbf", 4},
+      std::string{"\xf0\x90\x80", 3},
+      std::string{"\xf1\x80\x80\x20", 4},
       std::string{"\xf4\x90\x80\x80", 4},
-      std::string{"\xe2\x82", 2},
+      std::string{"\xf5\x80\x80\x80", 4},
       std::string{"\x80", 1},
       std::string{"\xf8", 1},
+      std::string{"\xff", 1},
   };
 
   for (const auto &input : malformed) {
@@ -260,6 +270,23 @@ TEST_CASE("ingest rejects every malformed UTF-8 class before sanitizing") {
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == UserTextError::invalid_utf8);
   }
+}
+
+TEST_CASE("ingest validation preserves fail-closed error precedence") {
+  auto oversized_malformed = std::string(3'841, 'a');
+  oversized_malformed.front() = static_cast<char>(0xff);
+  const auto oversized = prepare(UserTextField::subject, oversized_malformed);
+  REQUIRE_FALSE(oversized.has_value());
+  CHECK(oversized.error() == UserTextError::too_many_bytes);
+
+  const auto malformed_handle =
+      prepare(UserTextField::handle, std::string{"\xff", 1});
+  REQUIRE_FALSE(malformed_handle.has_value());
+  CHECK(malformed_handle.error() == UserTextError::invalid_utf8);
+
+  const auto non_ascii_handle = prepare(UserTextField::handle, "caf\xc3\xa9");
+  REQUIRE_FALSE(non_ascii_handle.has_value());
+  CHECK(non_ascii_handle.error() == UserTextError::invalid_handle);
 }
 
 TEST_CASE("extended grapheme clusters, not scalars or bytes, own the cap") {

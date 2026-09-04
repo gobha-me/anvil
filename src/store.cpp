@@ -146,64 +146,75 @@ namespace {
   return {};
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity) -- strict allocation-free UTF-8 validation keeps every rejected byte class explicit
+[[nodiscard]] constexpr auto is_utf8_continuation(unsigned char value) -> bool {
+  return value >= 0x80U && value <= 0xbfU;
+}
+
+[[nodiscard]] auto valid_two_byte_sequence(std::string_view input,
+                                           std::size_t offset) -> bool {
+  if (offset + 1U >= input.size()) {
+    return false;
+  }
+  const auto first = static_cast<unsigned char>(input[offset]);
+  const auto second = static_cast<unsigned char>(input[offset + 1U]);
+  return is_utf8_continuation(second) && (first != 0xc2U || second > 0x9fU);
+}
+
+[[nodiscard]] auto valid_three_byte_sequence(std::string_view input,
+                                             std::size_t offset) -> bool {
+  if (offset + 2U >= input.size()) {
+    return false;
+  }
+  const auto first = static_cast<unsigned char>(input[offset]);
+  const auto second = static_cast<unsigned char>(input[offset + 1U]);
+  const auto third = static_cast<unsigned char>(input[offset + 2U]);
+  return is_utf8_continuation(second) && is_utf8_continuation(third) &&
+         (first != 0xe0U || second >= 0xa0U) &&
+         (first != 0xedU || second <= 0x9fU);
+}
+
+[[nodiscard]] auto valid_four_byte_sequence(std::string_view input,
+                                            std::size_t offset) -> bool {
+  if (offset + 3U >= input.size()) {
+    return false;
+  }
+  const auto first = static_cast<unsigned char>(input[offset]);
+  const auto second = static_cast<unsigned char>(input[offset + 1U]);
+  const auto third = static_cast<unsigned char>(input[offset + 2U]);
+  const auto fourth = static_cast<unsigned char>(input[offset + 3U]);
+  return is_utf8_continuation(second) && is_utf8_continuation(third) &&
+         is_utf8_continuation(fourth) && (first != 0xf0U || second >= 0x90U) &&
+         (first != 0xf4U || second <= 0x8fU);
+}
+
+[[nodiscard]] auto tos_sequence_width(std::string_view input,
+                                      std::size_t offset) -> std::size_t {
+  const auto first = static_cast<unsigned char>(input[offset]);
+  if (first <= 0x7fU) {
+    return first >= 0x20U && first != 0x7fU ? 1U : 0U;
+  }
+  if (first >= 0xc2U && first <= 0xdfU) {
+    return valid_two_byte_sequence(input, offset) ? 2U : 0U;
+  }
+  if (first >= 0xe0U && first <= 0xefU) {
+    return valid_three_byte_sequence(input, offset) ? 3U : 0U;
+  }
+  if (first >= 0xf0U && first <= 0xf4U) {
+    return valid_four_byte_sequence(input, offset) ? 4U : 0U;
+  }
+  return 0U;
+}
+
 [[nodiscard]] auto valid_tos_version(std::string_view version) -> bool {
   if (!valid_opaque_identifier(version, 128)) {
     return false;
   }
-  const auto continuation = [](unsigned char value) {
-    return value >= 0x80U && value <= 0xbfU;
-  };
   for (std::size_t offset = 0; offset < version.size();) {
-    const auto first = static_cast<unsigned char>(version[offset]);
-    if (first <= 0x7fU) {
-      if (first < 0x20U || first == 0x7fU) {
-        return false;
-      }
-      ++offset;
-      continue;
+    const auto width = tos_sequence_width(version, offset);
+    if (width == 0U) {
+      return false;
     }
-    if (first >= 0xc2U && first <= 0xdfU) {
-      if (offset + 1U >= version.size()) {
-        return false;
-      }
-      const auto second = static_cast<unsigned char>(version[offset + 1U]);
-      if (!continuation(second) || (first == 0xc2U && second <= 0x9fU)) {
-        return false;
-      }
-      offset += 2U;
-      continue;
-    }
-    if (first >= 0xe0U && first <= 0xefU) {
-      if (offset + 2U >= version.size()) {
-        return false;
-      }
-      const auto second = static_cast<unsigned char>(version[offset + 1U]);
-      const auto third = static_cast<unsigned char>(version[offset + 2U]);
-      if (!continuation(second) || !continuation(third) ||
-          (first == 0xe0U && second < 0xa0U) ||
-          (first == 0xedU && second > 0x9fU)) {
-        return false;
-      }
-      offset += 3U;
-      continue;
-    }
-    if (first >= 0xf0U && first <= 0xf4U) {
-      if (offset + 3U >= version.size()) {
-        return false;
-      }
-      const auto second = static_cast<unsigned char>(version[offset + 1U]);
-      const auto third = static_cast<unsigned char>(version[offset + 2U]);
-      const auto fourth = static_cast<unsigned char>(version[offset + 3U]);
-      if (!continuation(second) || !continuation(third) ||
-          !continuation(fourth) || (first == 0xf0U && second < 0x90U) ||
-          (first == 0xf4U && second > 0x8fU)) {
-        return false;
-      }
-      offset += 4U;
-      continue;
-    }
-    return false;
+    offset += width;
   }
   return true;
 }
